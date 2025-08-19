@@ -8,14 +8,13 @@
 using std::vector;
 
 /* Macro for checking CUDA errors */
-#define CHECK_HIP(call)                                                        \
-  do {                                                                         \
-    hipError_t _st = (call);                                                   \
-    if (_st != hipSuccess) {                                                   \
-      fprintf(stderr, "HIP error (%s:%d): %s\n", __FILE__, __LINE__,           \
-              hipGetErrorString(_st));                                         \
-      std::abort();                                                            \
-    }                                                                          \
+#define CHECK_HIP(call)                                                                            \
+  do {                                                                                             \
+    hipError_t _st = (call);                                                                       \
+    if (_st != hipSuccess) {                                                                       \
+      fprintf(stderr, "HIP error (%s:%d): %s\n", __FILE__, __LINE__, hipGetErrorString(_st));      \
+      std::abort();                                                                                \
+    }                                                                                              \
   } while (0)
 
 // #define FP16 /* [Advanced] Uncomment this line only for FP16 */
