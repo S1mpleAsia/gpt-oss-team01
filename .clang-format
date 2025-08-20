@@ -11,8 +11,8 @@ ContinuationIndentWidth: 2
 
 # --- pointers / references ---
 DerivePointerAlignment: false
-PointerAlignment: Right          # float *ptr
-ReferenceAlignment: Right        # Tensor &ref
+PointerAlignment: Right # float *ptr
+ReferenceAlignment: Right # Tensor &ref
 
 # --- braces & short statements ---
 BreakBeforeBraces: Attach
@@ -24,8 +24,8 @@ PenaltyReturnTypeOnItsOwnLine: 200
 
 # --- parameters & calls ---
 AlignAfterOpenBracket: Align
-BinPackParameters: false
-BinPackArguments: false
+BinPackParameters: true
+BinPackArguments: true
 
 # --- spaces ---
 SpaceBeforeParens: ControlStatements
@@ -37,9 +37,9 @@ SpaceBeforeAssignmentOperators: true
 
 # --- comments ---
 ReflowComments: false
-AlignTrailingComments: true        # <- forces trailing comments into the same column
-SpacesBeforeTrailingComments: 2    # <- minimum gap before the comment column
-CommentPragmas: '^ IWYU pragma:'   # leave IWYU pragmas alone
+AlignTrailingComments: true # <- forces trailing comments into the same column
+SpacesBeforeTrailingComments: 2 # <- minimum gap before the comment column
+CommentPragmas: "^ IWYU pragma:" # leave IWYU pragmas alone
 
 # --- includes / pp ---
 SortIncludes: false
