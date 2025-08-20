@@ -3,6 +3,9 @@
 !*/
 !*.*
 
+debug/*.txt
+run.sh
+
 # Virtual env
 .venv/
 
