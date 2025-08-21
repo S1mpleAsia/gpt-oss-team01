@@ -54,8 +54,8 @@ void device_alloc_run_state(DeviceRunState *rs_d, Config *config) {
   CHECK_HIP(hipMalloc(&rs_d->e_agg, hidden_dim_size));
   CHECK_HIP(hipMemset(rs_d->e_agg, 0, hidden_dim_size));
 
-  CHECK_HIP(hipMalloc(&rs_d->gate_up, intermediate_dim_size));
-  CHECK_HIP(hipMemset(rs_d->gate_up, 0, intermediate_dim_size));
+//   CHECK_HIP(hipMalloc(&rs_d->gate_up, intermediate_dim_size));
+//   CHECK_HIP(hipMemset(rs_d->gate_up, 0, intermediate_dim_size));
 
   CHECK_HIP(hipMalloc(&rs_d->qkv, qkv_size));
   CHECK_HIP(hipMemset(rs_d->qkv, 0, qkv_size));
@@ -319,8 +319,8 @@ float *hip_forward(DeviceTransformerWeights *w, DeviceRunState *rs, Config *conf
     // 11. Kết nối residual cuối cùng của layer
     // rs->x += rs->e_agg
     AddVectorGPU(rs->x, rs->e_agg, hidden_dim, stream);
-
-    // --- FINAL CLASSIFIER ---
+  }
+   // --- FINAL CLASSIFIER ---
 
     // 12. Final RMSNorm (in-place)
     RMSNormInplaceGPU(rs->x, w->rms_out_w, hidden_dim, 1e-5f, stream);
@@ -330,5 +330,4 @@ float *hip_forward(DeviceTransformerWeights *w, DeviceRunState *rs, Config *conf
 
     // Trả về con trỏ device tới logits
     return rs->logits;
-  }
 }
