@@ -247,6 +247,7 @@ float *hip_forward(DeviceTransformerWeights *w, DeviceRunState *rs, Config *conf
 
   // 1. Embedding lookup
   EmbeddingLookupGPU(w->token_embedding_table, token, rs->x, hidden_dim, stream);
+  // printf("Done step 1\n");
 
   for (int l = 0; l < config->n_layers; l++) {
     const float *w_rms_attn = w->rms_attn_w + (size_t)l * hidden_dim;
@@ -259,10 +260,13 @@ float *hip_forward(DeviceTransformerWeights *w, DeviceRunState *rs, Config *conf
 
     // 2. Pre-attention RMSNorm: Chuẩn hóa rs->x, kết quả lưu vào rs->t
     RMSNormGPU(rs->x, w_rms_attn, rs->t, hidden_dim, 1e-5f, stream);
+    // printf("Done step 2 - layer: %d\n", l);
 
     // 3. QKV GEMM: Nhân ma trận để có Q, K, V
     // rs->t (hidden_dim) @ w_qkv_layer -> rs->qkv
     QKVGemmGPU(w_qkv_layer, rs->t, rs->qkv, hidden_dim, head_dim, n_q_heads, n_kv_heads, stream);
+
+    // printf("Done step 3 - layer: %d\n", l);
 
     // 4. QKV Epilogue: Tách Q, K, V; áp dụng RoPE; và lưu K, V vào cache
     const size_t loff = (size_t)l * config->seq_len * kv_dim;  // Layer offset trong KV cache
@@ -275,6 +279,8 @@ float *hip_forward(DeviceTransformerWeights *w, DeviceRunState *rs, Config *conf
     QKVEpilogueSplitRoPECacheGPU(rs->qkv, b_qkv_layer, rs->q, k_pos, v_pos, rope_cos_pos,
                                  rope_sin_pos, head_dim, n_q_heads, n_kv_heads, stream);
 
+    // printf("Done step 4 - layer: %d\n", l);
+
     // 5. Multi-Head Attention
     const float *K_cache_layer = rs->key_cache + loff;
     const float *V_cache_layer = rs->value_cache + loff;
@@ -285,10 +291,14 @@ float *hip_forward(DeviceTransformerWeights *w, DeviceRunState *rs, Config *conf
                             head_dim, n_q_heads, n_q_heads / n_kv_heads, kv_dim, pos + 1, pos,
                             stream);
 
+    // printf("Done step 5 - layer: %d\n", l);
+
     // 6. Post-attention Linear layer và kết nối residual
     // rs->x += W_o * rs->tb + b_o
     LinearBiasResidualGPU(w_o_layer, rs->tb, b_o_layer, rs->x, head_dim * n_q_heads, hidden_dim,
                           stream);
+
+    // printf("Done step 6 - layer: %d\n", l);
 
     // --- MOE FFN BLOCK ---
 
@@ -304,29 +314,43 @@ float *hip_forward(DeviceTransformerWeights *w, DeviceRunState *rs, Config *conf
     // 7. Pre-FFN RMSNorm
     RMSNormGPU(rs->x, w_rms_ffn, rs->t, hidden_dim, 1e-5f, stream);
 
+    // printf("Done step 7 - layer: %d\n", l);
+
     // 8. Router GEMM: Tính điểm cho các expert
     RouterGemmGPU(w_router_layer, rs->t, b_router_layer, rs->router_score, hidden_dim, n_experts,
                   stream);
 
+    // printf("Done step 8 - layer: %d\n", l);
+
     // 9. Top-K + Softmax: Chọn ra các expert hàng đầu và tính trọng số của chúng
     TopKSoftmaxGPU(rs->router_score, n_experts, experts_per_token, rs->topk_v, rs->topk_i, stream);
+
+    // printf("Done step 9 - layer: %d\n", l);
 
     // 10. MoE Gating: Áp dụng các expert đã chọn
     MoEApplyTopKGPU(rs->t, w_mlp1_layer, b_mlp1_layer, w_mlp2_layer, b_mlp2_layer, rs->topk_i,
                     rs->topk_v, rs->mlp1_out, rs->e_agg, hidden_dim, intermediate_dim,
                     experts_per_token, config->swiglu_limit, stream);
 
+    // printf("Done step 10 - layer: %d\n", l);
+
     // 11. Kết nối residual cuối cùng của layer
     // rs->x += rs->e_agg
     AddVectorGPU(rs->x, rs->e_agg, hidden_dim, stream);
+
+    // printf("Done step 11 - layer: %d\n", l);
   }
   // --- FINAL CLASSIFIER ---
 
   // 12. Final RMSNorm (in-place)
   RMSNormInplaceGPU(rs->x, w->rms_out_w, hidden_dim, 1e-5f, stream);
 
+  // printf("Done step 12\n");
+
   // 13. Classifier GEMM: Tính toán logits cuối cùng
   ClassifierGemmGPU(w->out, rs->x, rs->logits, hidden_dim, config->vocab_size, stream);
+
+  // printf("Done step 13\n");
 
   // Trả về con trỏ device tới logits
   return rs->logits;

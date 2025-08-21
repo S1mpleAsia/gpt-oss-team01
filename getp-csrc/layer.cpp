@@ -409,8 +409,8 @@ __global__ void TopKSoftmax_kernel(const float *r, int n_experts, int k, float *
     return;
 
   // Tạm thời dùng mảng tĩnh, giả sử n_experts không quá lớn
-  float temp_vals[16];
-  int temp_idx[16];
+  float temp_vals[32];
+  int temp_idx[32];
 
   for (int i = 0; i < n_experts; ++i) {
     temp_vals[i] = r[i];
@@ -487,7 +487,6 @@ __global__ void WeightedAccumulate_kernel(const float *expert_out, float weight,
   }
 }
 
-// Cài đặt hoàn chỉnh cho MoEApplyTopKGPU
 void MoEApplyTopKGPU(const float *t, const float *W1, const float *b1, const float *W2,
                      const float *b2, const int *topk_idx, const float *topk_vals,
                      float *work_gate_up,  // scratch: [2*inter]
@@ -498,18 +497,23 @@ void MoEApplyTopKGPU(const float *t, const float *W1, const float *b1, const flo
   // Một cài đặt thực tế sẽ dùng các kernel phức tạp hơn để giữ mọi thứ trên GPU.
   int h_topk_idx[k];
   float h_topk_vals[k];
-  hipMemcpy(h_topk_idx, topk_idx, k * sizeof(int), hipMemcpyDeviceToHost);
-  hipMemcpy(h_topk_vals, topk_vals, k * sizeof(float), hipMemcpyDeviceToHost);
-  hipDeviceSynchronize();  // Đợi copy xong
+  CHECK_HIP(hipMemcpy(h_topk_idx, topk_idx, k * sizeof(int), hipMemcpyDeviceToHost));
+  CHECK_HIP(hipMemcpy(h_topk_vals, topk_vals, k * sizeof(float), hipMemcpyDeviceToHost));
+  CHECK_HIP(hipDeviceSynchronize());  // Đợi copy xong
+
+  // printf("DEBUG: Top-k expert indices:\n");
+  // for (int i = 0; i < k; ++i) {
+  //   printf("  idx[%d] = %d, val[%d] = %f\n", i, h_topk_idx[i], i, h_topk_vals[i]);
+  // }
 
   // Xóa bộ đệm tích lũy kết quả
-  hipMemsetAsync(e_agg_inout, 0, hidden_dim * sizeof(float), stream);
+  CHECK_HIP(hipMemsetAsync(e_agg_inout, 0, hidden_dim * sizeof(float), stream));
 
   // Cấp phát bộ nhớ tạm trên GPU cho kết quả của từng expert
   float *work_swiglu;    // scratch: [inter]
   float *expert_output;  // scratch: [hidden]
-  hipMalloc(&work_swiglu, inter_dim * sizeof(float));
-  hipMalloc(&expert_output, hidden_dim * sizeof(float));
+  CHECK_HIP(hipMalloc(&work_swiglu, inter_dim * sizeof(float)));
+  CHECK_HIP(hipMalloc(&expert_output, hidden_dim * sizeof(float)));
 
   for (int i = 0; i < k; i++) {
     int expert_idx = h_topk_idx[i];
@@ -551,8 +555,8 @@ void MoEApplyTopKGPU(const float *t, const float *W1, const float *b1, const flo
   }
 
   // Giải phóng bộ nhớ tạm
-  hipFree(work_swiglu);
-  hipFree(expert_output);
+  CHECK_HIP(hipFree(work_swiglu));
+  CHECK_HIP(hipFree(expert_output));
 }
 
 //================================================================================================
