@@ -1,0 +1,357 @@
+#include "model.hpp"
+
+void device_alloc_run_state(DeviceRunState *rs_d, Config *config) {
+  int kv_dim = config->head_dim * config->n_kv_heads;
+
+  size_t hidden_dim_size = (size_t)config->hidden_dim * sizeof(float);
+  size_t attn_heads_size = (size_t)config->head_dim * config->n_attn_heads * sizeof(float);
+  size_t n_experts_size = (size_t)config->n_experts * sizeof(float);
+  size_t experts_per_token_float_size = (size_t)config->experts_per_token * sizeof(float);
+  size_t experts_per_token_int_size = (size_t)config->experts_per_token * sizeof(int);
+  size_t intermediate_dim_size = (size_t)config->intermediate_dim * sizeof(float);
+  size_t qkv_size =
+    (size_t)config->head_dim * (config->n_attn_heads + 2 * config->n_kv_heads) * sizeof(float);
+  size_t q_size = (size_t)config->n_attn_heads * config->head_dim * sizeof(float);
+  size_t cache_size = (size_t)config->n_layers * config->seq_len * kv_dim *
+                      sizeof(float);  // Allocated for only 1 prompt
+  size_t att_size =
+    (size_t)config->n_attn_heads * config->seq_len * sizeof(float);  // buffer for attention score
+  size_t logit_size = (size_t)config->vocab_size * sizeof(float);
+
+  CHECK_HIP(hipMalloc(&rs_d->x, hidden_dim_size));
+  CHECK_HIP(hipMemset(rs_d->x, 0, hidden_dim_size));
+
+  CHECK_HIP(hipMalloc(&rs_d->t, hidden_dim_size));
+  CHECK_HIP(hipMemset(rs_d->t, 0, hidden_dim_size));
+
+  CHECK_HIP(hipMalloc(&rs_d->tb, attn_heads_size));
+  CHECK_HIP(hipMemset(rs_d->tb, 0, attn_heads_size));
+
+  CHECK_HIP(hipMalloc(&rs_d->tb2, hidden_dim_size));
+  CHECK_HIP(hipMemset(rs_d->tb2, 0, hidden_dim_size));
+
+  CHECK_HIP(hipMalloc(&rs_d->router_score, n_experts_size));
+  CHECK_HIP(hipMemset(rs_d->router_score, 0, n_experts_size));
+
+  CHECK_HIP(hipMalloc(&rs_d->topk_v, experts_per_token_float_size));
+  CHECK_HIP(hipMemset(rs_d->topk_v, 0, experts_per_token_float_size));
+
+  CHECK_HIP(hipMalloc(&rs_d->topk_i, experts_per_token_int_size));
+  CHECK_HIP(hipMemset(rs_d->topk_i, 0, experts_per_token_int_size));
+
+  CHECK_HIP(hipMalloc(&rs_d->mlp1_out, 2 * intermediate_dim_size));
+  CHECK_HIP(hipMemset(rs_d->mlp1_out, 0, 2 * intermediate_dim_size));
+
+  CHECK_HIP(hipMalloc(&rs_d->gate, intermediate_dim_size));
+  CHECK_HIP(hipMemset(rs_d->gate, 0, intermediate_dim_size));
+
+  CHECK_HIP(hipMalloc(&rs_d->up, intermediate_dim_size));
+  CHECK_HIP(hipMemset(rs_d->up, 0, intermediate_dim_size));
+
+  CHECK_HIP(hipMalloc(&rs_d->gate_up, intermediate_dim_size));
+  CHECK_HIP(hipMemset(rs_d->gate_up, 0, intermediate_dim_size));
+
+  CHECK_HIP(hipMalloc(&rs_d->e_agg, hidden_dim_size));
+  CHECK_HIP(hipMemset(rs_d->e_agg, 0, hidden_dim_size));
+
+  //   CHECK_HIP(hipMalloc(&rs_d->gate_up, intermediate_dim_size));
+  //   CHECK_HIP(hipMemset(rs_d->gate_up, 0, intermediate_dim_size));
+
+  CHECK_HIP(hipMalloc(&rs_d->qkv, qkv_size));
+  CHECK_HIP(hipMemset(rs_d->qkv, 0, qkv_size));
+
+  CHECK_HIP(hipMalloc(&rs_d->q, q_size));
+  CHECK_HIP(hipMemset(rs_d->q, 0, q_size));
+
+  CHECK_HIP(hipMalloc(&rs_d->key_cache, cache_size));
+  CHECK_HIP(hipMemset(rs_d->key_cache, 0, cache_size));
+
+  CHECK_HIP(hipMalloc(&rs_d->value_cache, cache_size));
+  CHECK_HIP(hipMemset(rs_d->value_cache, 0, cache_size));
+
+  CHECK_HIP(hipMalloc(&rs_d->att, att_size));
+  CHECK_HIP(hipMemset(rs_d->att, 0, att_size));
+
+  CHECK_HIP(hipMalloc(&rs_d->logits, logit_size));
+  CHECK_HIP(hipMemset(rs_d->logits, 0, logit_size));
+
+  if (config->sliding_window > 0) {
+    size_t mask_size = (size_t)config->seq_len * config->seq_len * sizeof(float);
+
+    float *h_mask = (float *)malloc(mask_size);
+    if (!h_mask) {
+      fprintf(stderr, "malloc failed for host mask.\n");
+      exit(EXIT_FAILURE);
+    }
+
+    memset(h_mask, 0, mask_size);
+
+    for (int i = 0; i < config->seq_len; i++) {
+      for (int j = 0; j < config->seq_len; j++) {
+        if (i - j >= config->sliding_window) {
+          h_mask[i * config->seq_len + j] = -INFINITY;
+        }
+      }
+    }
+
+    CHECK_HIP(hipMalloc(&rs_d->mask, mask_size));
+    CHECK_HIP(hipMemcpy(rs_d->mask, h_mask, mask_size, hipMemcpyHostToDevice));
+
+    free(h_mask);
+  } else {
+    rs_d->mask = nullptr;
+  }
+}
+
+void device_copy_model_weight(DeviceTransformerWeights *d_w, TransformerWeights *t,
+                              Config *config) {
+  // 1. Token embedding table
+  size_t token_embedding_size = (size_t)config->vocab_size * config->hidden_dim * sizeof(float);
+  CHECK_HIP(hipMalloc(&d_w->token_embedding_table, token_embedding_size));
+  CHECK_HIP(hipMemcpy(d_w->token_embedding_table, t->token_embedding_table, token_embedding_size,
+                      hipMemcpyHostToDevice));
+
+  // 2. Output (unembedding)
+  size_t out_size = (size_t)config->vocab_size * config->hidden_dim * sizeof(float);
+  CHECK_HIP(hipMalloc(&d_w->out, out_size));
+  CHECK_HIP(hipMemcpy(d_w->out, t->out, out_size, hipMemcpyHostToDevice));
+
+  // 3. RMSNorm weights
+  size_t rms_attn_size = (size_t)config->n_layers * config->hidden_dim * sizeof(float);
+  CHECK_HIP(hipMalloc(&d_w->rms_attn_w, rms_attn_size));
+  CHECK_HIP(hipMemcpy(d_w->rms_attn_w, t->rms_attn_w, rms_attn_size, hipMemcpyHostToDevice));
+
+  size_t rms_ffn_size = (size_t)config->n_layers * config->hidden_dim * sizeof(float);
+  CHECK_HIP(hipMalloc(&d_w->rms_ffn_w, rms_ffn_size));
+  CHECK_HIP(hipMemcpy(d_w->rms_ffn_w, t->rms_ffn_w, rms_ffn_size, hipMemcpyHostToDevice));
+
+  size_t rms_out_size = (size_t)config->hidden_dim * sizeof(float);
+  CHECK_HIP(hipMalloc(&d_w->rms_out_w, rms_out_size));
+  CHECK_HIP(hipMemcpy(d_w->rms_out_w, t->rms_out_w, rms_out_size, hipMemcpyHostToDevice));
+
+  // 4. Attention weights
+  size_t w_qkv_size =
+    (size_t)config->n_layers * config->hidden_dim *
+    (config->head_dim * config->n_attn_heads + 2 * config->head_dim * config->n_kv_heads) *
+    sizeof(float);
+  CHECK_HIP(hipMalloc(&d_w->w_qkv, w_qkv_size));
+  CHECK_HIP(hipMemcpy(d_w->w_qkv, t->w_qkv, w_qkv_size, hipMemcpyHostToDevice));
+
+  size_t b_qkv_size =
+    (size_t)config->n_layers *
+    (config->head_dim * config->n_attn_heads + 2 * config->head_dim * config->n_kv_heads) *
+    sizeof(float);
+  CHECK_HIP(hipMalloc(&d_w->b_qkv, b_qkv_size));
+  CHECK_HIP(hipMemcpy(d_w->b_qkv, t->b_qkv, b_qkv_size, hipMemcpyHostToDevice));
+
+  size_t w_o_size = (size_t)config->n_layers * (config->head_dim * config->n_attn_heads) *
+                    config->hidden_dim * sizeof(float);
+  CHECK_HIP(hipMalloc(&d_w->w_o, w_o_size));
+  CHECK_HIP(hipMemcpy(d_w->w_o, t->w_o, w_o_size, hipMemcpyHostToDevice));
+
+  size_t b_o_size = (size_t)config->n_layers * config->hidden_dim * sizeof(float);
+  CHECK_HIP(hipMalloc(&d_w->b_o, b_o_size));
+  CHECK_HIP(hipMemcpy(d_w->b_o, t->b_o, b_o_size, hipMemcpyHostToDevice));
+
+  size_t attn_sinks_size = (size_t)config->n_layers * config->n_attn_heads * sizeof(float);
+  CHECK_HIP(hipMalloc(&d_w->attn_sinks, attn_sinks_size));
+  CHECK_HIP(hipMemcpy(d_w->attn_sinks, t->attn_sinks, attn_sinks_size, hipMemcpyHostToDevice));
+
+  // 5. Router weights
+  size_t w_router_size =
+    (size_t)config->n_layers * config->hidden_dim * config->n_experts * sizeof(float);
+  CHECK_HIP(hipMalloc(&d_w->w_router, w_router_size));
+  CHECK_HIP(hipMemcpy(d_w->w_router, t->w_router, w_router_size, hipMemcpyHostToDevice));
+
+  size_t b_router_size = (size_t)config->n_layers * config->n_experts * sizeof(float);
+  CHECK_HIP(hipMalloc(&d_w->b_router, b_router_size));
+  CHECK_HIP(hipMemcpy(d_w->b_router, t->b_router, b_router_size, hipMemcpyHostToDevice));
+
+  // 6. MoE weights
+  size_t w_mlp1_size = (size_t)config->n_layers * config->n_experts * 2 * config->intermediate_dim *
+                       config->hidden_dim * sizeof(float);
+  CHECK_HIP(hipMalloc(&d_w->w_mlp1, w_mlp1_size));
+  CHECK_HIP(hipMemcpy(d_w->w_mlp1, t->w_mlp1, w_mlp1_size, hipMemcpyHostToDevice));
+
+  size_t b_mlp1_size =
+    (size_t)config->n_layers * config->n_experts * 2 * config->intermediate_dim * sizeof(float);
+  CHECK_HIP(hipMalloc(&d_w->b_mlp1, b_mlp1_size));
+  CHECK_HIP(hipMemcpy(d_w->b_mlp1, t->b_mlp1, b_mlp1_size, hipMemcpyHostToDevice));
+
+  size_t w_mlp2_size = (size_t)config->n_layers * config->n_experts * config->hidden_dim *
+                       config->intermediate_dim * sizeof(float);
+  CHECK_HIP(hipMalloc(&d_w->w_mlp2, w_mlp2_size));
+  CHECK_HIP(hipMemcpy(d_w->w_mlp2, t->w_mlp2, w_mlp2_size, hipMemcpyHostToDevice));
+
+  size_t b_mlp2_size =
+    (size_t)config->n_layers * config->n_experts * config->hidden_dim * sizeof(float);
+  CHECK_HIP(hipMalloc(&d_w->b_mlp2, b_mlp2_size));
+  CHECK_HIP(hipMemcpy(d_w->b_mlp2, t->b_mlp2, b_mlp2_size, hipMemcpyHostToDevice));
+}
+
+void free_device_run_state(DeviceRunState *rs) {
+  CHECK_HIP(hipFree(rs->x));
+  CHECK_HIP(hipFree(rs->t));
+  CHECK_HIP(hipFree(rs->tb));
+  CHECK_HIP(hipFree(rs->tb2));
+  CHECK_HIP(hipFree(rs->router_score));
+  CHECK_HIP(hipFree(rs->topk_v));
+  CHECK_HIP(hipFree(rs->topk_i));
+  CHECK_HIP(hipFree(rs->mlp1_out));
+  CHECK_HIP(hipFree(rs->gate));
+  CHECK_HIP(hipFree(rs->up));
+  CHECK_HIP(hipFree(rs->gate_up));
+  CHECK_HIP(hipFree(rs->e_agg));
+  CHECK_HIP(hipFree(rs->qkv));
+  CHECK_HIP(hipFree(rs->q));
+  CHECK_HIP(hipFree(rs->key_cache));
+  CHECK_HIP(hipFree(rs->value_cache));
+  CHECK_HIP(hipFree(rs->att));
+  CHECK_HIP(hipFree(rs->logits));
+
+  // Con trỏ mask chỉ được cấp phát có điều kiện, nên cần kiểm tra trước khi giải phóng
+  if (rs->mask != nullptr) {
+    CHECK_HIP(hipFree(rs->mask));
+  }
+}
+
+void free_model_weight(DeviceTransformerWeights *d_weights) {
+  CHECK_HIP(hipFree(d_weights->token_embedding_table));
+  CHECK_HIP(hipFree(d_weights->out));
+  CHECK_HIP(hipFree(d_weights->rms_attn_w));
+  CHECK_HIP(hipFree(d_weights->rms_ffn_w));
+  CHECK_HIP(hipFree(d_weights->rms_out_w));
+  CHECK_HIP(hipFree(d_weights->w_qkv));
+  CHECK_HIP(hipFree(d_weights->b_qkv));
+  CHECK_HIP(hipFree(d_weights->w_o));
+  CHECK_HIP(hipFree(d_weights->b_o));
+  CHECK_HIP(hipFree(d_weights->attn_sinks));
+  CHECK_HIP(hipFree(d_weights->w_router));
+  CHECK_HIP(hipFree(d_weights->b_router));
+  CHECK_HIP(hipFree(d_weights->w_mlp1));
+  CHECK_HIP(hipFree(d_weights->b_mlp1));
+  CHECK_HIP(hipFree(d_weights->w_mlp2));
+  CHECK_HIP(hipFree(d_weights->b_mlp2));
+}
+
+float *hip_forward(DeviceTransformerWeights *w, DeviceRunState *rs, Config *config, int token,
+                   int pos, hipStream_t stream, const float *d_rope_cos, const float *d_rope_sin) {
+  int head_dim = config->head_dim;
+  int hidden_dim = config->hidden_dim;
+  int kv_dim = head_dim * config->n_kv_heads;
+  int n_experts = config->n_experts;
+  int experts_per_token = config->experts_per_token;
+  int intermediate_dim = config->intermediate_dim;
+  int n_q_heads = config->n_attn_heads;
+  int n_kv_heads = config->n_kv_heads;
+
+  // 1. Embedding lookup
+  EmbeddingLookupGPU(w->token_embedding_table, token, rs->x, hidden_dim, stream);
+  // printf("Done step 1\n");
+
+  for (int l = 0; l < config->n_layers; l++) {
+    const float *w_rms_attn = w->rms_attn_w + (size_t)l * hidden_dim;
+    const float *w_qkv_layer =
+      w->w_qkv + (size_t)l * hidden_dim * (head_dim * (n_q_heads + 2 * n_kv_heads));
+    const float *b_qkv_layer = w->b_qkv + (size_t)l * (head_dim * (n_q_heads + 2 * n_kv_heads));
+    const float *w_o_layer = w->w_o + (size_t)l * (head_dim * n_q_heads) * hidden_dim;
+    const float *b_o_layer = w->b_o + (size_t)l * hidden_dim;
+    const float *attn_sinks_layer = w->attn_sinks + (size_t)l * n_q_heads;
+
+    // 2. Pre-attention RMSNorm: Chuẩn hóa rs->x, kết quả lưu vào rs->t
+    RMSNormGPU(rs->x, w_rms_attn, rs->t, hidden_dim, 1e-5f, stream);
+    // printf("Done step 2 - layer: %d\n", l);
+
+    // 3. QKV GEMM: Nhân ma trận để có Q, K, V
+    // rs->t (hidden_dim) @ w_qkv_layer -> rs->qkv
+    QKVGemmGPU(w_qkv_layer, rs->t, rs->qkv, hidden_dim, head_dim, n_q_heads, n_kv_heads, stream);
+
+    // printf("Done step 3 - layer: %d\n", l);
+
+    // 4. QKV Epilogue: Tách Q, K, V; áp dụng RoPE; và lưu K, V vào cache
+    const size_t loff = (size_t)l * config->seq_len * kv_dim;  // Layer offset trong KV cache
+    float *k_pos = rs->key_cache + loff + (size_t)pos * kv_dim;
+    float *v_pos = rs->value_cache + loff + (size_t)pos * kv_dim;
+
+    const float *rope_cos_pos = d_rope_cos + (size_t)pos * (head_dim / 2);
+    const float *rope_sin_pos = d_rope_sin + (size_t)pos * (head_dim / 2);
+
+    QKVEpilogueSplitRoPECacheGPU(rs->qkv, b_qkv_layer, rs->q, k_pos, v_pos, rope_cos_pos,
+                                 rope_sin_pos, head_dim, n_q_heads, n_kv_heads, stream);
+
+    // printf("Done step 4 - layer: %d\n", l);
+
+    // 5. Multi-Head Attention
+    const float *K_cache_layer = rs->key_cache + loff;
+    const float *V_cache_layer = rs->value_cache + loff;
+    const float *mask_row =
+      (config->sliding_window > 0) ? (rs->mask + (size_t)pos * config->seq_len) : nullptr;
+
+    SingleQueryAttentionGPU(rs->q, K_cache_layer, V_cache_layer, mask_row, attn_sinks_layer, rs->tb,
+                            head_dim, n_q_heads, n_q_heads / n_kv_heads, kv_dim, pos + 1, pos,
+                            stream);
+
+    // printf("Done step 5 - layer: %d\n", l);
+
+    // 6. Post-attention Linear layer và kết nối residual
+    // rs->x += W_o * rs->tb + b_o
+    LinearBiasResidualGPU(w_o_layer, rs->tb, b_o_layer, rs->x, head_dim * n_q_heads, hidden_dim,
+                          stream);
+
+    // printf("Done step 6 - layer: %d\n", l);
+
+    // --- MOE FFN BLOCK ---
+
+    // Tính toán con trỏ offset cho FFN/MoE của layer hiện tại (l)
+    const float *w_rms_ffn = w->rms_ffn_w + (size_t)l * hidden_dim;
+    const float *w_router_layer = w->w_router + (size_t)l * hidden_dim * n_experts;
+    const float *b_router_layer = w->b_router + (size_t)l * n_experts;
+    const float *w_mlp1_layer = w->w_mlp1;  // Base pointer, MoE kernel sẽ tự tính offset
+    const float *b_mlp1_layer = w->b_mlp1;
+    const float *w_mlp2_layer = w->w_mlp2;
+    const float *b_mlp2_layer = w->b_mlp2;
+
+    // 7. Pre-FFN RMSNorm
+    RMSNormGPU(rs->x, w_rms_ffn, rs->t, hidden_dim, 1e-5f, stream);
+
+    // printf("Done step 7 - layer: %d\n", l);
+
+    // 8. Router GEMM: Tính điểm cho các expert
+    RouterGemmGPU(w_router_layer, rs->t, b_router_layer, rs->router_score, hidden_dim, n_experts,
+                  stream);
+
+    // printf("Done step 8 - layer: %d\n", l);
+
+    // 9. Top-K + Softmax: Chọn ra các expert hàng đầu và tính trọng số của chúng
+    TopKSoftmaxGPU(rs->router_score, n_experts, experts_per_token, rs->topk_v, rs->topk_i, stream);
+
+    // printf("Done step 9 - layer: %d\n", l);
+
+    // 10. MoE Gating: Áp dụng các expert đã chọn
+    MoEApplyTopKGPU(rs->t, w_mlp1_layer, b_mlp1_layer, w_mlp2_layer, b_mlp2_layer, rs->topk_i,
+                    rs->topk_v, rs->mlp1_out, rs->e_agg, hidden_dim, intermediate_dim,
+                    experts_per_token, config->swiglu_limit, stream);
+
+    // printf("Done step 10 - layer: %d\n", l);
+
+    // 11. Kết nối residual cuối cùng của layer
+    // rs->x += rs->e_agg
+    AddVectorGPU(rs->x, rs->e_agg, hidden_dim, stream);
+
+    // printf("Done step 11 - layer: %d\n", l);
+  }
+  // --- FINAL CLASSIFIER ---
+
+  // 12. Final RMSNorm (in-place)
+  RMSNormInplaceGPU(rs->x, w->rms_out_w, hidden_dim, 1e-5f, stream);
+
+  // printf("Done step 12\n");
+
+  // 13. Classifier GEMM: Tính toán logits cuối cùng
+  ClassifierGemmGPU(w->out, rs->x, rs->logits, hidden_dim, config->vocab_size, stream);
+
+  // printf("Done step 13\n");
+
+  // Trả về con trỏ device tới logits
+  return rs->logits;
+}

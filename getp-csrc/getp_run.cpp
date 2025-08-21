@@ -1,8 +1,11 @@
 // TODO: Modify this file to optimize end-to-end throughput
 #include "getp_eval.cpp"
+#include "device_context.hpp"
 
 #ifndef GETP_RUN
 #define GETP_RUN
+
+static DeviceContext ctx;
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // Do not inference here
@@ -11,6 +14,9 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // - Memory allocation
   // - Load model
   // - ...
+
+  printf("Starting GPU warm-up...\n");
+  device_init_context(&ctx, &transformer->weights, &transformer->config, 0);
 }
 
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
@@ -20,12 +26,86 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
   // - Memory deallocation
   // - Unload model
   // - ...
+  printf("Starting GPU finish process...\n");
+  device_free_context(&ctx);
 }
 
-long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
-                               Sampler *sampler, const char *input_seq,
-                               int *output_tokens, int steps) {
+// ======================== CPU version =============================
+
+// long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
+//                                const char *input_seq, int *output_tokens, int steps) {
+//   // Inference here
+
+//   const char *empty_prompt = "";
+//   if (input_seq == NULL) {
+//     input_seq = empty_prompt;
+//   }
+
+//   // encode the (string) prompt into tokens sequence
+//   int num_prompt_tokens = 0;
+//   int *prompt_tokens =
+//     (int *)malloc((strlen(input_seq) + 3) * sizeof(int));  // +3 for '\0', ?BOS, ?EOS
+//   encode(tokenizer, input_seq, 1, 0, prompt_tokens, &num_prompt_tokens,
+//          transformer->config.initial_context_length);
+//   if (num_prompt_tokens < 1) {
+//     fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
+//     exit(EXIT_FAILURE);
+//   }
+
+//   // start the main loop
+//   int next;                      // will store the next token in the sequence
+//   int token = prompt_tokens[0];  // kick off with the first token in the prompt
+//   int pos = 0;                   // position in the sequence
+//   while (pos < steps) {
+//     // forward the transformer to get logits for the next token
+//     float *logits = forward(transformer, token, pos);
+
+//     // advance the state machine
+//     if (pos < num_prompt_tokens - 1) {
+//       // if we are still processing the input prompt, force the next prompt
+//       // token
+//       next = prompt_tokens[pos + 1];
+//     } else {
+//       // otherwise sample the next token from the logits
+//       next = sample(sampler, logits);
+//       // save the output token, it will be printed to file
+//       output_tokens[pos - num_prompt_tokens - 1] = next;
+//     }
+//     pos++;
+
+//     // data-dependent terminating condition: the BOS (=1) token delimits
+//     // sequences
+//     if (next == 1) {
+//       break;
+//     }
+
+//     // print the token as string, decode it with the Tokenizer object
+//     // should be removed
+//     const char *piece = decode_piece(tokenizer, token, next);
+//     safe_printf(piece);  // same as printf("%s", piece), but skips "unsafe" bytes
+//     fflush(stdout);
+
+//     token = next;
+//   }
+
+//   // should be removed
+//   printf("\n");
+
+//   // Marker for end of sequence
+//   output_tokens[pos - num_prompt_tokens] = -1;
+
+//   free(prompt_tokens);
+
+//   return pos - num_prompt_tokens;
+// }
+
+// ======================== GPU version =============================
+long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
+                               const char *input_seq, int *output_tokens, int steps) {
   // Inference here
+
+  Config *config = &transformer->config;
+  float *h_logits = (float *)malloc((size_t)config->vocab_size * sizeof(float));
 
   const char *empty_prompt = "";
   if (input_seq == NULL) {
@@ -34,8 +114,8 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
 
   // encode the (string) prompt into tokens sequence
   int num_prompt_tokens = 0;
-  int *prompt_tokens = (int *)malloc((strlen(input_seq) + 3) *
-                                     sizeof(int)); // +3 for '\0', ?BOS, ?EOS
+  int *prompt_tokens =
+    (int *)malloc((strlen(input_seq) + 3) * sizeof(int));  // +3 for '\0', ?BOS, ?EOS
   encode(tokenizer, input_seq, 1, 0, prompt_tokens, &num_prompt_tokens,
          transformer->config.initial_context_length);
   if (num_prompt_tokens < 1) {
@@ -44,26 +124,32 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   }
 
   // start the main loop
-  int next;                     // will store the next token in the sequence
-  int token = prompt_tokens[0]; // kick off with the first token in the prompt
-  int pos = 0;                  // position in the sequence
+  int next;                      // will store the next token in the sequence
+  int token = prompt_tokens[0];  // kick off with the first token in the prompt
+  int pos = 0;                   // position in the sequence
   while (pos < steps) {
-
     // forward the transformer to get logits for the next token
-    float *logits = forward(transformer, token, pos);
+    // float *logits = forward(transformer, token, pos);
+
+    float *d_logits = hip_forward(&ctx.d_weights, &ctx.d_state, config, token, pos, ctx.stream,
+                                  ctx.d_rope_cos, ctx.d_rope_sin);
+
+    CHECK_HIP(hipMemcpyAsync(h_logits, d_logits, (size_t)config->vocab_size * sizeof(float),
+                             hipMemcpyDeviceToHost, ctx.stream));
+    CHECK_HIP(hipStreamSynchronize(ctx.stream));
 
     // advance the state machine
-    if (pos < num_prompt_tokens - 1) {
+    pos++;
+    if (pos < num_prompt_tokens) {
       // if we are still processing the input prompt, force the next prompt
       // token
-      next = prompt_tokens[pos + 1];
+      next = prompt_tokens[pos];
     } else {
       // otherwise sample the next token from the logits
-      next = sample(sampler, logits);
+      next = sample(sampler, h_logits);
       // save the output token, it will be printed to file
-      output_tokens[pos - num_prompt_tokens - 1] = next;
+      output_tokens[pos - num_prompt_tokens] = next;
     }
-    pos++;
 
     // data-dependent terminating condition: the BOS (=1) token delimits
     // sequences
@@ -74,7 +160,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
     // print the token as string, decode it with the Tokenizer object
     // should be removed
     const char *piece = decode_piece(tokenizer, token, next);
-    safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
+    safe_printf(piece);  // same as printf("%s", piece), but skips "unsafe" bytes
     fflush(stdout);
 
     token = next;
@@ -84,24 +170,28 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   printf("\n");
 
   // Marker for end of sequence
-  output_tokens[pos - num_prompt_tokens] = -1;
+  output_tokens[pos - num_prompt_tokens + 1] = -1;
 
   free(prompt_tokens);
+  free(h_logits);
 
-  return pos - num_prompt_tokens;
+  return pos - num_prompt_tokens + 1;
 }
 
-long long inference(Transformer *transformer, Tokenizer *tokenizer,
-                    Sampler *sampler, Requests *requests) {
+long long inference(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
+                    Requests *requests) {
   long long num_token_out = 0;
   for (int idx = 0; idx < requests->num_reqs; ++idx) {
     const char *input_seq = get_str_req_ptr(requests, idx);
     int *output_tokens = get_tok_gen_ptr(requests, idx);
-    num_token_out +=
-        simple_getp_generate(transformer, tokenizer, sampler, input_seq,
-                             output_tokens, requests->max_seq_len);
+    num_token_out += simple_getp_generate(transformer, tokenizer, sampler, input_seq, output_tokens,
+                                          requests->max_seq_len);
   }
   return num_token_out;
 }
 
-#endif // GETP_RUN
+#include "layer.cpp"
+#include "model.cpp"
+#include "device_context.cpp"
+
+#endif  // GETP_RUN

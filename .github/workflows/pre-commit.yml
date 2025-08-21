@@ -5,6 +5,9 @@ on:
   push:
     branches:
       - main
+      - staging
+      - dev/duongvt
+      - dev/mdung
 
 jobs:
   pre-commit:

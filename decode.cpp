@@ -32,13 +32,13 @@ int main(int argc, char **argv) {
     // do some basic validation
     if (i + 1 >= argc) {
       error_usage();
-    } // must have arg after flag
+    }  // must have arg after flag
     if (argv[i][0] != '-') {
       error_usage();
-    } // must start with dash
+    }  // must start with dash
     if (strlen(argv[i]) != 2) {
       error_usage();
-    } // must be -x (one dash, one letter)
+    }  // must be -x (one dash, one letter)
     // read in the args
     if (strcmp(argv[i], "-i") == 0) {
       input_path = argv[i + 1];
@@ -62,8 +62,7 @@ int main(int argc, char **argv) {
       int token;
       while (iss >> token) {
         const char *piece = decode_piece(&tokenizer, -1, token);
-        safe_printf(
-            piece); // same as printf("%s", piece), but skips "unsafe" bytes
+        safe_printf(piece);  // same as printf("%s", piece), but skips "unsafe" bytes
       }
       std::cout << std::endl;
     }

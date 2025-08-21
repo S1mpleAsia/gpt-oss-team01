@@ -16,8 +16,8 @@ int compare_tokens(const void *a, const void *b) {
 
 int find_token_id(Tokenizer *t, const char *s, int len) {
   TokenIndex key = {.str = s, .len = len, .id = -1};
-  TokenIndex *res = (TokenIndex *)bsearch(&key, t->sorted_vocab, t->vocab_size,
-                                          sizeof(TokenIndex), compare_tokens);
+  TokenIndex *res =
+    (TokenIndex *)bsearch(&key, t->sorted_vocab, t->vocab_size, sizeof(TokenIndex), compare_tokens);
   return res ? res->id : -1;
 }
 
@@ -33,7 +33,7 @@ int hex_nibble(int c) {
 
 int parse_hex_byte_token(const char *s, int len, unsigned char *out) {
   if (len != 6)
-    return 0; // expects exactly "<0xHH>"
+    return 0;  // expects exactly "<0xHH>"
   if (s[0] != '<' || s[1] != '0' || s[2] != 'x' || s[5] != '>')
     return 0;
 
@@ -135,13 +135,13 @@ void free_tokenizer(Tokenizer *t) {
 
 int find_token_bytes(Tokenizer *t, const unsigned char *p, int len) {
   TokenIndex key = {.str = (const char *)p, .len = len, .id = -1};
-  TokenIndex *res = (TokenIndex *)bsearch(&key, t->sorted_vocab, t->vocab_size,
-                                          sizeof(TokenIndex), compare_tokens);
+  TokenIndex *res =
+    (TokenIndex *)bsearch(&key, t->sorted_vocab, t->vocab_size, sizeof(TokenIndex), compare_tokens);
   return res ? res->id : -1;
 }
 
-unsigned get_merge_rank(Tokenizer *t, const unsigned char *piece, int piece_len,
-                        const int *parts, int n_parts, int i) {
+unsigned get_merge_rank(Tokenizer *t, const unsigned char *piece, int piece_len, const int *parts,
+                        int n_parts, int i) {
   const unsigned RANK_MAX = 0xFFFFFFFFu;
   if (i + 2 >= n_parts)
     return RANK_MAX;
@@ -163,8 +163,8 @@ unsigned get_merge_rank(Tokenizer *t, const unsigned char *piece, int piece_len,
   return (unsigned)id;
 }
 
-int encode_piece_bytes_bpe(Tokenizer *t, const unsigned char *piece,
-                           int piece_len, int *out, int out_cap) {
+int encode_piece_bytes_bpe(Tokenizer *t, const unsigned char *piece, int piece_len, int *out,
+                           int out_cap) {
   if (piece_len <= 0)
     return 0;
 
@@ -228,8 +228,8 @@ int encode_piece_bytes_bpe(Tokenizer *t, const unsigned char *piece,
   return n_out;
 }
 
-int encode_with_simple_splits(Tokenizer *t, const unsigned char *bytes, int len,
-                              int *out, int out_cap) {
+int encode_with_simple_splits(Tokenizer *t, const unsigned char *bytes, int len, int *out,
+                              int out_cap) {
   int n_out = 0;
   int i = 0;
 
@@ -243,8 +243,7 @@ int encode_with_simple_splits(Tokenizer *t, const unsigned char *bytes, int len,
       while (run_len > 0) {
         int chunk = run_len >= 3 ? 3 : run_len;
         if (n_out < out_cap)
-          n_out += encode_piece_bytes_bpe(t, bytes + k, chunk, out + n_out,
-                                          out_cap - n_out);
+          n_out += encode_piece_bytes_bpe(t, bytes + k, chunk, out + n_out, out_cap - n_out);
         else
           n_out += encode_piece_bytes_bpe(t, bytes + k, chunk, NULL, 0);
         k += chunk;
@@ -257,8 +256,7 @@ int encode_with_simple_splits(Tokenizer *t, const unsigned char *bytes, int len,
         j++;
       int span = j - i;
       if (n_out < out_cap)
-        n_out += encode_piece_bytes_bpe(t, bytes + i, span, out + n_out,
-                                        out_cap - n_out);
+        n_out += encode_piece_bytes_bpe(t, bytes + i, span, out + n_out, out_cap - n_out);
       else
         n_out += encode_piece_bytes_bpe(t, bytes + i, span, NULL, 0);
       i = j;
@@ -267,8 +265,8 @@ int encode_with_simple_splits(Tokenizer *t, const unsigned char *bytes, int len,
   return n_out;
 }
 
-void encode(Tokenizer *t, const char *text, int bos_id, int eos_id, int *out,
-            int *n_out, int max_tokens) {
+void encode(Tokenizer *t, const char *text, int bos_id, int eos_id, int *out, int *n_out,
+            int max_tokens) {
   const unsigned char *bytes = (const unsigned char *)text;
   const int len = (int)strlen((const char *)bytes);
 
@@ -277,8 +275,7 @@ void encode(Tokenizer *t, const char *text, int bos_id, int eos_id, int *out,
     out[ntok++] = bos_id;
 
   if (ntok < max_tokens) {
-    ntok +=
-        encode_with_simple_splits(t, bytes, len, out + ntok, max_tokens - ntok);
+    ntok += encode_with_simple_splits(t, bytes, len, out + ntok, max_tokens - ntok);
     if (ntok > max_tokens)
       ntok = max_tokens;
   }
