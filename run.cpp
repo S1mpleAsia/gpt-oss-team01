@@ -522,6 +522,10 @@ float *forward(Transformer *transformer, int token, int pos) {
     // s->t (hidden_dim, )
     rmsnorm(s->t, x, w->rms_attn_w + 1ll * l * hidden_dim, hidden_dim);
 
+    // for (int i = 0; i < 10; i++) {
+    //   printf("t[%d] = %f\n", i, s->t[i]);
+    // }
+
     // key and value point to the kv cache
     int loff = l * p->seq_len * kv_dim;  // kv cache layer offset for convenience
     s->k = s->key_cache + loff + pos * kv_dim;
@@ -559,6 +563,21 @@ float *forward(Transformer *transformer, int token, int pos) {
 
     free(cos_vals);
     free(sin_vals);
+
+    // printf("Q vector (10 elements):\n");
+    // for (int i = 0; i < 10; i++) {
+    //   printf("\tq[%d] = %f\n", i, s->q[i]);
+    // }
+
+    // printf("K vector (10 elements):\n");
+    // for (int i = 0; i < 10; i++) {
+    //   printf("\tk[%d] = %f\n", i, s->k[i]);
+    // }
+
+    // printf("V vector (10 elements):\n");
+    // for (int i = 0; i < 10; i++) {
+    //   printf("\tv[%d] = %f\n", i, s->v[i]);
+    // }
 
     // multihead attention. iterate over all heads
     int h;
@@ -622,6 +641,10 @@ float *forward(Transformer *transformer, int token, int pos) {
 
     // ffn rmsnorm
     rmsnorm(s->t, x, w->rms_ffn_w + 1ll * l * hidden_dim, hidden_dim);
+
+    // for (int i = 0; i < 10; i++) {
+    //   printf("t[%d] = %f\n", i, s->t[i]);
+    // }
 
     // MoE
     // Compute router_score

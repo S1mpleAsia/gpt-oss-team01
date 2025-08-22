@@ -25,7 +25,7 @@ void device_init_context(DeviceContext *ctx, TransformerWeights *cpu_weights, Co
 void device_free_context(DeviceContext *ctx) {
   CHECK_HIP(hipSetDevice(ctx->device_id));
 
-  free_run_state(&ctx->d_state);
+  free_device_run_state(&ctx->d_state);
   free_model_weight(&ctx->d_weights);
 
   CHECK_HIP(hipFree(ctx->d_rope_cos));

@@ -57,6 +57,56 @@ __global__ void RMSNorm_kernel(const float *x, const float *w, float *out, int n
   }
 }
 
+__global__ void rmsnorm_kernel_double_precision(const float *x, const float *w, float *out,
+                                                int hidden_dim, float eps) {
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int block_size = blockDim.x;
+
+  const float *x_row = x + row * hidden_dim;
+  const float *w_row = w + row * hidden_dim;
+  float *o_row = out + row * hidden_dim;
+
+  // --- THAY ĐỔI 1: Sử dụng 'double' cho biến tích lũy ---
+  double acc = 0.0;
+
+  // Vòng lặp tính tổng bình phương của mỗi thread
+  for (int j = tid; j < hidden_dim; j += block_size) {
+    float v = x_row[j];
+    acc += (double)v * v;  // Ép kiểu để phép nhân và cộng thực hiện ở double
+  }
+
+  // --- THAY ĐỔI 2: Dùng shared memory cho toàn bộ quá trình reduction ---
+  // (Thay thế cho warp shuffle và logic warp_sum phức tạp)
+  extern __shared__ double s_partials[];  // Khai báo dynamic shared memory
+  s_partials[tid] = acc;
+  __syncthreads();  // Đảm bảo mọi thread đã ghi xong tổng cục bộ của mình
+
+  // Thực hiện reduction song song trong shared memory
+  for (int s = block_size / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      s_partials[tid] += s_partials[tid + s];
+    }
+    __syncthreads();  // Đồng bộ sau mỗi vòng lặp reduction
+  }
+
+  // --- THAY ĐỔI 3: Chỉ thread 0 tính toán kết quả cuối cùng ---
+  // Tạo một biến shared để lưu kết quả và chia sẻ cho các thread khác
+  __shared__ float final_inv_rms;
+  if (tid == 0) {
+    double block_sum = s_partials[0];
+    double mean = block_sum / hidden_dim;
+    final_inv_rms = rsqrtf((float)mean + eps);
+  }
+  __syncthreads();  // Đảm bảo mọi thread đều thấy giá trị final_inv_rms
+
+  // --- THAY ĐỔI 4: Tất cả các thread áp dụng chuẩn hóa ---
+  // Mỗi thread đọc giá trị inv_rms từ shared memory và thực hiện phép tính
+  for (int j = tid; j < hidden_dim; j += block_size) {
+    o_row[j] = w_row[j] * (x_row[j] * final_inv_rms);
+  }
+}
+
 __global__ void rmsnorm_kernel(const float *x, const float *w, float *out, int hidden_dim,
                                float eps) {
   const int row = blockIdx.x;
@@ -127,7 +177,10 @@ void RMSNormGPU(const float *x, const float *w, float *out, int hidden_dim, floa
   constexpr int num_threads = 256;
   const dim3 block_dim(num_threads), grid_dim(batch_size);
 
-  rmsnorm_kernel<<<grid_dim, block_dim>>>(x, w, out, hidden_dim, eps);
+  size_t shared_mem_size = num_threads * sizeof(double);
+
+  rmsnorm_kernel_double_precision<<<grid_dim, block_dim, shared_mem_size, stream>>>(
+    x, w, out, hidden_dim, eps);
   CHECK_HIP(hipGetLastError());
   // RMSNorm_kernel<<<grid_dim, block_dim, 0, stream>>>(x, w, out, hidden_dim, eps);
 }
@@ -600,8 +653,30 @@ __global__ void WeightedAccumulate_kernel(const float *expert_out, float weight,
   }
 }
 
-void MoEApplyTopKGPU(const float *t, const float *W1, const float *b1, const float *W2,
-                     const float *b2, const int *topk_idx, const float *topk_vals,
+__global__ void matmul_kernel_bf16_weights(const bf16 *W, const float *x, const bf16 *bias,
+                                           float *out, int out_features, int in_features) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (row < out_features) {
+    double sum = 0.0;  // Vẫn dùng double để tích lũy cho chính xác
+    const bf16 *W_row = W + (size_t)row * in_features;
+
+    for (int i = 0; i < in_features; i++) {
+      // Chuyển đổi trọng số bfloat16 sang float để tính toán
+      float w_val = static_cast<float>(W_row[i]);
+      sum += (double)w_val * x[i];
+    }
+
+    if (bias != nullptr) {
+      // Chuyển đổi bias bfloat16 sang float để cộng
+      sum += static_cast<float>(bias[row]);
+    }
+    out[row] = (float)sum;
+  }
+}
+
+void MoEApplyTopKGPU(const float *t, const bf16 *W1, const bf16 *b1, const bf16 *W2, const bf16 *b2,
+                     const int *topk_idx, const float *topk_vals,
                      float *work_gate_up,  // scratch: [2*inter]
                      float *e_agg_inout,   // out: [hidden]
                      int hidden_dim, int inter_dim, int k, float clamp_limit, hipStream_t stream) {
@@ -633,16 +708,16 @@ void MoEApplyTopKGPU(const float *t, const float *W1, const float *b1, const flo
     size_t w2_offset = (size_t)expert_idx * hidden_dim * inter_dim;
     size_t b2_offset = (size_t)expert_idx * hidden_dim;
 
-    const float *W1_expert = W1 + w1_offset;
-    const float *b1_expert = b1 + b1_offset;
-    const float *W2_expert = W2 + w2_offset;
-    const float *b2_expert = b2 + b2_offset;
+    const bf16 *W1_expert = W1 + w1_offset;
+    const bf16 *b1_expert = b1 + b1_offset;
+    const bf16 *W2_expert = W2 + w2_offset;
+    const bf16 *b2_expert = b2 + b2_offset;
 
     // --- Bước 1: GEMM đầu tiên ---
     // z = W1 * t + b1 -> ghi vào work_gate_up
-    matmul_kernel<<<(2 * inter_dim + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE,
-                    DEFAULT_BLOCK_SIZE, 0, stream>>>(W1_expert, t, b1_expert, work_gate_up,
-                                                     2 * inter_dim, hidden_dim);
+    matmul_kernel_bf16_weights<<<(2 * inter_dim + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE,
+                                 DEFAULT_BLOCK_SIZE, 0, stream>>>(
+      W1_expert, t, b1_expert, work_gate_up, 2 * inter_dim, hidden_dim);
 
     // --- Bước 2: Kích hoạt SwiGLU ---
     // swiglu = silu(gate) * up -> ghi vào work_swiglu
@@ -651,9 +726,9 @@ void MoEApplyTopKGPU(const float *t, const float *W1, const float *b1, const flo
 
     // --- Bước 3: GEMM thứ hai ---
     // y = W2 * swiglu + b2 -> ghi vào expert_output
-    matmul_kernel<<<(hidden_dim + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE, DEFAULT_BLOCK_SIZE,
-                    0, stream>>>(W2_expert, work_swiglu, b2_expert, expert_output, hidden_dim,
-                                 inter_dim);
+    matmul_kernel_bf16_weights<<<(hidden_dim + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE,
+                                 DEFAULT_BLOCK_SIZE, 0, stream>>>(
+      W2_expert, work_swiglu, b2_expert, expert_output, hidden_dim, inter_dim);
 
     // --- Bước 4: Cộng dồn kết quả theo trọng số ---
     // e_agg_inout += weight * y

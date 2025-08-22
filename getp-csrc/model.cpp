@@ -1,6 +1,21 @@
 #include "model.hpp"
 #include <vector>
 
+void convert_and_copy_fp32_to_bf16(bf16 **d_ptr, const float *h_ptr, size_t num_elements) {
+  size_t bf16_size = num_elements * sizeof(bf16);
+
+  bf16 *h_bf16_buffer = (bf16 *)malloc(bf16_size);
+
+  for (size_t i = 0; i < num_elements; i++) {
+    h_bf16_buffer[i] = hip_bfloat16(h_ptr[i]);
+  }
+
+  CHECK_HIP(hipMalloc(d_ptr, bf16_size));
+  CHECK_HIP(hipMemcpy(*d_ptr, h_bf16_buffer, bf16_size, hipMemcpyHostToDevice));
+
+  free(h_bf16_buffer);
+}
+
 void device_alloc_run_state(DeviceRunState *rs_d, Config *config) {
   int kv_dim = config->head_dim * config->n_kv_heads;
 
@@ -170,24 +185,26 @@ void device_copy_model_weight(DeviceTransformerWeights *d_w, TransformerWeights 
 
   // 6. MoE weights
   size_t w_mlp1_size = (size_t)config->n_layers * config->n_experts * 2 * config->intermediate_dim *
-                       config->hidden_dim * sizeof(float);
-  CHECK_HIP(hipMalloc(&d_w->w_mlp1, w_mlp1_size));
-  CHECK_HIP(hipMemcpy(d_w->w_mlp1, t->w_mlp1, w_mlp1_size, hipMemcpyHostToDevice));
+                       config->hidden_dim;
+  convert_and_copy_fp32_to_bf16(&d_w->w_mlp1, t->w_mlp1, w_mlp1_size);
+  // CHECK_HIP(hipMalloc(&d_w->w_mlp1, w_mlp1_size));
+  // CHECK_HIP(hipMemcpy(d_w->w_mlp1, t->w_mlp1, w_mlp1_size, hipMemcpyHostToDevice));
 
-  size_t b_mlp1_size =
-    (size_t)config->n_layers * config->n_experts * 2 * config->intermediate_dim * sizeof(float);
-  CHECK_HIP(hipMalloc(&d_w->b_mlp1, b_mlp1_size));
-  CHECK_HIP(hipMemcpy(d_w->b_mlp1, t->b_mlp1, b_mlp1_size, hipMemcpyHostToDevice));
+  size_t b_mlp1_size = (size_t)config->n_layers * config->n_experts * 2 * config->intermediate_dim;
+  convert_and_copy_fp32_to_bf16(&d_w->b_mlp1, t->b_mlp1, b_mlp1_size);
+  // CHECK_HIP(hipMalloc(&d_w->b_mlp1, b_mlp1_size));
+  // CHECK_HIP(hipMemcpy(d_w->b_mlp1, t->b_mlp1, b_mlp1_size, hipMemcpyHostToDevice));
 
-  size_t w_mlp2_size = (size_t)config->n_layers * config->n_experts * config->hidden_dim *
-                       config->intermediate_dim * sizeof(float);
-  CHECK_HIP(hipMalloc(&d_w->w_mlp2, w_mlp2_size));
-  CHECK_HIP(hipMemcpy(d_w->w_mlp2, t->w_mlp2, w_mlp2_size, hipMemcpyHostToDevice));
+  size_t w_mlp2_size =
+    (size_t)config->n_layers * config->n_experts * config->hidden_dim * config->intermediate_dim;
+  convert_and_copy_fp32_to_bf16(&d_w->w_mlp2, t->w_mlp2, w_mlp2_size);
+  // CHECK_HIP(hipMalloc(&d_w->w_mlp2, w_mlp2_size));
+  // CHECK_HIP(hipMemcpy(d_w->w_mlp2, t->w_mlp2, w_mlp2_size, hipMemcpyHostToDevice));
 
-  size_t b_mlp2_size =
-    (size_t)config->n_layers * config->n_experts * config->hidden_dim * sizeof(float);
-  CHECK_HIP(hipMalloc(&d_w->b_mlp2, b_mlp2_size));
-  CHECK_HIP(hipMemcpy(d_w->b_mlp2, t->b_mlp2, b_mlp2_size, hipMemcpyHostToDevice));
+  size_t b_mlp2_size = (size_t)config->n_layers * config->n_experts * config->hidden_dim;
+  convert_and_copy_fp32_to_bf16(&d_w->b_mlp2, t->b_mlp2, b_mlp2_size);
+  // CHECK_HIP(hipMalloc(&d_w->b_mlp2, b_mlp2_size));
+  // CHECK_HIP(hipMemcpy(d_w->b_mlp2, t->b_mlp2, b_mlp2_size, hipMemcpyHostToDevice));
 }
 
 void free_device_run_state(DeviceRunState *rs) {
@@ -263,10 +280,27 @@ float *hip_forward(DeviceTransformerWeights *w, DeviceRunState *rs, Config *conf
     RMSNormGPU(rs->x, w_rms_attn, rs->t, hidden_dim, 1e-5f, stream);
     // printf("Done step 2 - layer: %d\n", l);
 
+    // CHECK_HIP(hipStreamSynchronize(stream));
+    // float *h_buffer = (float *)malloc(hidden_dim * sizeof(float));
+    // CHECK_HIP(hipMemcpy(h_buffer, rs->t, hidden_dim * sizeof(float), hipMemcpyDeviceToHost));
+
+    // for (int i = 0; i < 10; i++) {
+    //   printf("t[%d] = %f\n", i, h_buffer[i]);
+    // }
+
     // 3. Compute Q, K, V
     // w_qkv (head_dim * (n_attn_head + 2 * n_kv_head), hidden_dim) @ rs->t (hidden_dim, ) + b_qkv => rs->qkv
     QKVGemmGPU(w_qkv, b_qkv, rs->t, rs->qkv, hidden_dim, head_dim, hidden_dim,
                head_dim * (n_q_heads + 2 * n_kv_heads), stream);
+
+    // int qkv_dim = head_dim * (n_q_heads + 2 * n_kv_heads);
+    // CHECK_HIP(hipStreamSynchronize(stream));
+    // float *h_buffer = (float *)malloc(qkv_dim * sizeof(float));
+    // CHECK_HIP(hipMemcpy(h_buffer, rs->qkv, qkv_dim * sizeof(float), hipMemcpyDeviceToHost));
+
+    // for (int i = 0; i < 10; i++) {
+    //   printf("qkv[%d] = %f\n", i, h_buffer[i]);
+    // }
 
     // printf("Done step 3 - layer: %d\n", l);
 
@@ -280,6 +314,31 @@ float *hip_forward(DeviceTransformerWeights *w, DeviceRunState *rs, Config *conf
 
     QKVEpilogueSplitRoPECacheGPU(rs->qkv, rs->q, k_pos, v_pos, rope_cos_pos, rope_sin_pos, head_dim,
                                  n_q_heads, n_kv_heads, stream);
+
+    int q_dim = n_q_heads * head_dim;
+    CHECK_HIP(hipStreamSynchronize(stream));
+    float *q_buffer = (float *)malloc(q_dim * sizeof(float));
+    float *k_buffer = (float *)malloc(kv_dim * sizeof(float));
+    float *v_buffer = (float *)malloc(kv_dim * sizeof(float));
+
+    CHECK_HIP(hipMemcpy(q_buffer, rs->q, q_dim * sizeof(float), hipMemcpyDeviceToHost));
+    CHECK_HIP(hipMemcpy(k_buffer, k_pos, kv_dim * sizeof(float), hipMemcpyDeviceToHost));
+    CHECK_HIP(hipMemcpy(v_buffer, v_pos, kv_dim * sizeof(float), hipMemcpyDeviceToHost));
+
+    printf("Q vector (10 elements):\n");
+    for (int i = 0; i < 10; i++) {
+      printf("\tq[%d] = %f\n", i, q_buffer[i]);
+    }
+
+    printf("K vector (10 elements):\n");
+    for (int i = 0; i < 10; i++) {
+      printf("\tk[%d] = %f\n", i, k_buffer[i]);
+    }
+
+    printf("V vector (10 elements):\n");
+    for (int i = 0; i < 10; i++) {
+      printf("\tv[%d] = %f\n", i, v_buffer[i]);
+    }
 
     // printf("Done step 4 - layer: %d\n", l);
 
@@ -306,13 +365,21 @@ float *hip_forward(DeviceTransformerWeights *w, DeviceRunState *rs, Config *conf
     const float *w_rms_ffn = w->rms_ffn_w + (size_t)l * hidden_dim;
     const float *w_router = w->w_router + (size_t)l * hidden_dim * n_experts;
     const float *b_router = w->b_router + (size_t)l * n_experts;
-    const float *w_mlp1 = w->w_mlp1;  // Base pointer, MoE kernel sẽ tự tính offset
-    const float *b_mlp1 = w->b_mlp1;
-    const float *w_mlp2 = w->w_mlp2;
-    const float *b_mlp2 = w->b_mlp2;
+    const bf16 *w_mlp1 = w->w_mlp1;  // Base pointer, MoE kernel sẽ tự tính offset
+    const bf16 *b_mlp1 = w->b_mlp1;
+    const bf16 *w_mlp2 = w->w_mlp2;
+    const bf16 *b_mlp2 = w->b_mlp2;
 
     // 7. Pre-FFN RMSNorm
     RMSNormGPU(rs->x, w_rms_ffn, rs->t, hidden_dim, 1e-5f, stream);
+    // CHECK_HIP(hipStreamSynchronize(stream));
+
+    // float *h_buffer = (float *)malloc(hidden_dim * sizeof(float));
+    // CHECK_HIP(hipMemcpy(h_buffer, rs->t, hidden_dim * sizeof(float), hipMemcpyDeviceToHost));
+
+    // for (int i = 0; i < 10; i++) {
+    //   printf("t[%d] = %f\n", i, h_buffer[i]);
+    // }
 
     // printf("Done step 7 - layer: %d\n", l);
 
@@ -332,10 +399,10 @@ float *hip_forward(DeviceTransformerWeights *w, DeviceRunState *rs, Config *conf
     size_t layer_b2_offset = 1ll * l * n_experts * hidden_dim;
 
     // Lấy con trỏ trên GPU cho layer hiện tại (w_mlp1 là con trỏ gốc của DeviceTransformerWeights)
-    const float *d_w_mlp1_layer = w_mlp1 + layer_w1_offset;
-    const float *d_b_mlp1_layer = b_mlp1 + layer_b1_offset;
-    const float *d_w_mlp2_layer = w_mlp2 + layer_w2_offset;
-    const float *d_b_mlp2_layer = b_mlp2 + layer_b2_offset;
+    const bf16 *d_w_mlp1_layer = w_mlp1 + layer_w1_offset;
+    const bf16 *d_b_mlp1_layer = b_mlp1 + layer_b1_offset;
+    const bf16 *d_w_mlp2_layer = w_mlp2 + layer_w2_offset;
+    const bf16 *d_b_mlp2_layer = b_mlp2 + layer_b2_offset;
 
     MoEApplyTopKGPU(rs->t, d_w_mlp1_layer, d_b_mlp1_layer,  // Truyền con trỏ của layer 'l'
                     d_w_mlp2_layer, d_b_mlp2_layer,         // Truyền con trỏ của layer 'l'
