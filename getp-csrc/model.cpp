@@ -2,36 +2,109 @@
 #include <cmath>
 #include <cstring>
 
-float *our_forward(Transformer *transformer, int token, int pos) {
+Tensor *x_tensor, *t_tensor, *tb_tensor, *tb2_tensor, *router_score_tensor, *topk_v_tensor;
+TensorI32 *topk_i_tensor;
+Tensor *mlp1_out_tensor, *gate_tensor, *up_tensor, *gate_up_tensor, *e_agg_tensor;
+Tensor *qkv_tensor, *q_tensor, *k_tensor, *v_tensor, *att_tensor, *logits_tensor, *token_embedding_tensor;
+
+Tensor *cos_tensor, *sin_tensor, *rms_attn_w_tensor, *w_qkv_tensor, *b_qkv_tensor;
+Tensor *w_o_tensor, *b_o_tensor, *rms_ffn_w_tensor;
+Tensor *w_router_tensor, *b_router_tensor;
+Tensor *w_mlp1_tensor, *b_mlp1_tensor, *w_mlp2_tensor, *b_mlp2_tensor;
+Tensor *k_cache_tensor, *v_cache_tensor;
+Tensor *rms_out_w_tensor, *w_out_tensor;
+
+void our_init(Transformer *transformer) {
     Config *p = &transformer->config;
     TransformerWeights *w = &transformer->weights;
     RunState *s = &transformer->state;
 
     // Create Tensor wrappers for state buffers
-    Tensor *x_tensor = new Tensor({(size_t)p->hidden_dim}, s->x);
-    Tensor *t_tensor = new Tensor({(size_t)p->hidden_dim}, s->t);
-    Tensor *tb_tensor = new Tensor({(size_t)p->head_dim * p->n_attn_heads}, s->tb);
-    Tensor *tb2_tensor = new Tensor({(size_t)p->hidden_dim}, s->tb2);
+    x_tensor = new Tensor({(size_t)p->hidden_dim}, s->x, true);
+    t_tensor = new Tensor({(size_t)p->hidden_dim}, s->t, true);
+    tb_tensor = new Tensor({(size_t)p->head_dim * p->n_attn_heads}, s->tb, true);
+    tb2_tensor = new Tensor({(size_t)p->hidden_dim}, s->tb2, true);
 
-    Tensor *router_score_tensor = new Tensor({(size_t)p->n_experts}, s->router_score);
-    Tensor *topk_v_tensor = new Tensor({(size_t)p->experts_per_token}, s->topk_v);
-    TensorI32 *topk_i_tensor = new TensorI32({(size_t)p->experts_per_token}, s->topk_i);
+    router_score_tensor = new Tensor({(size_t)p->n_experts}, s->router_score, true);
+    topk_v_tensor = new Tensor({(size_t)p->experts_per_token}, s->topk_v, true);
+    topk_i_tensor = new TensorI32({(size_t)p->experts_per_token}, s->topk_i);
 
-    Tensor *mlp1_out_tensor = new Tensor({2 * (size_t)p->intermediate_dim}, s->mlp1_out);
-    Tensor *gate_tensor = new Tensor({(size_t)p->intermediate_dim}, s->gate);
-    Tensor *up_tensor = new Tensor({(size_t)p->intermediate_dim}, s->up);
-    Tensor *gate_up_tensor = new Tensor({(size_t)p->intermediate_dim}, s->gate_up);
-    Tensor *e_agg_tensor = new Tensor({(size_t)p->hidden_dim}, s->e_agg);
-    Tensor *qkv_tensor = new Tensor({((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim}, s->qkv);
-    Tensor *q_tensor = new Tensor({(size_t)p->n_attn_heads * p->head_dim}, s->q);
-    Tensor *k_tensor = new Tensor({(size_t)p->n_kv_heads * p->head_dim});
-    Tensor *v_tensor = new Tensor({(size_t)p->n_kv_heads * p->head_dim});
-    Tensor *att_tensor = new Tensor({(size_t)p->n_attn_heads, (size_t)p->seq_len}, s->att);
-    Tensor *logits_tensor = new Tensor({(size_t)p->vocab_size}, s->logits);
+    mlp1_out_tensor = new Tensor({2 * (size_t)p->intermediate_dim}, s->mlp1_out, true);
+    gate_tensor = new Tensor({(size_t)p->intermediate_dim}, s->gate, true);
+    up_tensor = new Tensor({(size_t)p->intermediate_dim}, s->up, true);
+    gate_up_tensor = new Tensor({(size_t)p->intermediate_dim}, s->gate_up, true);
+    e_agg_tensor = new Tensor({(size_t)p->hidden_dim}, s->e_agg, true);
+    qkv_tensor = new Tensor({((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim}, s->qkv, true);
+    q_tensor = new Tensor({(size_t)p->n_attn_heads * p->head_dim}, s->q, true);
+    k_tensor = new Tensor({(size_t)p->n_kv_heads * p->head_dim});
+    v_tensor = new Tensor({(size_t)p->n_kv_heads * p->head_dim});
+    att_tensor = new Tensor({(size_t)p->n_attn_heads, (size_t)p->seq_len}, s->att, true);
+    logits_tensor = new Tensor({(size_t)p->vocab_size}, s->logits, true);
 
     // Create Tensor wrappers for weight matrices
-    Tensor *token_embedding_tensor = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->token_embedding_table);
+    token_embedding_tensor = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->token_embedding_table, false);
+
+    cos_tensor = new Tensor({(size_t)p->head_dim / 2});
+    sin_tensor = new Tensor({(size_t)p->head_dim / 2});
+    rms_attn_w_tensor = new Tensor({(size_t)p->n_layers * p->hidden_dim}, w->rms_attn_w, false);
+
+    w_qkv_tensor = new Tensor({(size_t)p->n_layers, ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * (size_t)p->head_dim, (size_t)p->hidden_dim}, w->w_qkv, false);
+    b_qkv_tensor = new Tensor({(size_t)p->n_layers, ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim}, w->b_qkv, false);
+
+    w_o_tensor = new Tensor({(size_t)p->n_layers, (size_t)p->hidden_dim, (size_t)p->n_attn_heads * p->head_dim}, w->w_o, false);
+    b_o_tensor = new Tensor({(size_t)p->n_layers, (size_t)p->hidden_dim}, w->b_o, false);
+    rms_ffn_w_tensor = new Tensor({(size_t)p->n_layers * p->hidden_dim}, w->rms_ffn_w, false);
+
+    w_router_tensor = new Tensor({(size_t)p->n_layers, (size_t)p->n_experts, (size_t)p->hidden_dim}, w->w_router, false);
+    b_router_tensor = new Tensor({(size_t)p->n_layers, (size_t)p->n_experts}, w->b_router, false);
     
+    w_mlp1_tensor = new Tensor({(size_t)p->n_layers, (size_t)p->n_experts, 2 * (size_t)p->intermediate_dim, (size_t)p->hidden_dim}, w->w_mlp1, false);
+    b_mlp1_tensor = new Tensor({(size_t)p->n_layers, (size_t)p->n_experts, 2 * (size_t)p->intermediate_dim}, w->b_mlp1, false);
+    
+    w_mlp2_tensor = new Tensor({(size_t)p->n_layers, (size_t)p->n_experts, (size_t)p->hidden_dim, (size_t)p->intermediate_dim}, w->w_mlp2, false);
+    b_mlp2_tensor = new Tensor({(size_t)p->n_layers, (size_t)p->n_experts, (size_t)p->hidden_dim}, w->b_mlp2, false);
+    
+    k_cache_tensor = new Tensor({(size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim}, s->key_cache, false);
+    v_cache_tensor = new Tensor({(size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim}, s->value_cache, false);
+    
+    rms_out_w_tensor = new Tensor({(size_t)p->hidden_dim}, w->rms_out_w, false);
+    w_out_tensor = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->out, false);
+}
+
+void our_free() {
+    // Clean up all allocated tensors
+    delete x_tensor; delete t_tensor;
+    delete tb_tensor; delete tb2_tensor;
+    delete router_score_tensor; delete topk_v_tensor;
+    delete topk_i_tensor; delete mlp1_out_tensor;
+    delete gate_tensor; delete up_tensor;
+    delete gate_up_tensor; delete e_agg_tensor;
+    delete qkv_tensor; delete q_tensor;
+    delete k_tensor; delete v_tensor;
+    delete att_tensor; delete logits_tensor;
+    delete token_embedding_tensor;
+    
+    delete cos_tensor; delete sin_tensor;
+    
+    delete rms_attn_w_tensor; delete w_qkv_tensor;
+    delete b_qkv_tensor;
+
+    delete w_o_tensor; delete b_o_tensor;
+    delete rms_ffn_w_tensor;
+
+    delete w_router_tensor; delete b_router_tensor;
+
+    delete w_mlp1_tensor; delete b_mlp1_tensor;
+    delete w_mlp2_tensor; delete b_mlp2_tensor;
+    delete k_cache_tensor; delete v_cache_tensor;
+    delete rms_out_w_tensor; delete w_out_tensor;
+}
+
+float *our_forward(Transformer *transformer, int token, int pos) {
+    Config *p = &transformer->config;
+    TransformerWeights *w = &transformer->weights;
+    RunState *s = &transformer->state;
+
     // copy the token embedding into x
     EmbeddingLookup(token_embedding_tensor, token, x_tensor);
 
@@ -39,35 +112,16 @@ float *our_forward(Transformer *transformer, int token, int pos) {
     for (int l = 0; l < p->n_layers; l++) {
         // printf("Layer %d\n", l);
         // attention rmsnorm
-        Tensor *rms_attn_w_tensor = new Tensor({(size_t)p->hidden_dim}, w->rms_attn_w + l * p->hidden_dim);
-        RMSNorm(x_tensor, rms_attn_w_tensor, t_tensor);
-        delete rms_attn_w_tensor;
+        RMSNorm(x_tensor, rms_attn_w_tensor, t_tensor, 1ll * l);
 
         // key and value point to the kv cache
         long long loff = 1ll * l * p->seq_len * p->head_dim * p->n_kv_heads; // kv cache layer offset
-        Tensor *k_cache_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim}, s->key_cache + loff);
-        Tensor *v_cache_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim}, s->value_cache + loff);
 
-        // QKV projection
-        Tensor *w_qkv_tensor = new Tensor({((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * (size_t)p->head_dim, (size_t)p->hidden_dim}, 
-                           w->w_qkv + 1ll * l * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim * p->hidden_dim);
-        Tensor *b_qkv_tensor = new Tensor({((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim}, 
-                           w->b_qkv + 1ll * l * (p->n_attn_heads + 2 * p->n_kv_heads) * p->head_dim);
-        QKVProject(t_tensor, w_qkv_tensor, b_qkv_tensor, qkv_tensor);
-        delete w_qkv_tensor;
-        delete b_qkv_tensor;
+        // QKV projection 
+        QKVProject(t_tensor, w_qkv_tensor, b_qkv_tensor, qkv_tensor, 1ll * l);
 
         // Separate q, k, v
         SplitQKV(qkv_tensor, p->head_dim, p->n_attn_heads, p->n_kv_heads, q_tensor, k_tensor, v_tensor);
-
-        // Store k, v in cache
-        /*
-        memcpy(s->key_cache + loff + pos * p->n_kv_heads * p->head_dim, 
-               k_tensor->buf, p->n_kv_heads * p->head_dim * sizeof(float));
-        memcpy(s->value_cache + loff + pos * p->n_kv_heads * p->head_dim, 
-               v_tensor->buf, p->n_kv_heads * p->head_dim * sizeof(float));
-        */
-
         /*
         printf("CUSTOM\n");
         printf("q_tensor: ");
@@ -88,20 +142,15 @@ float *our_forward(Transformer *transformer, int token, int pos) {
         */
 
         // RoPE relative positional encoding
-        Tensor *cos_tensor = new Tensor({(size_t)p->head_dim / 2});
-        Tensor *sin_tensor = new Tensor({(size_t)p->head_dim / 2});
         RopeComputeCS(pos, *p, cos_tensor, sin_tensor);
         ApplyRotary(q_tensor, cos_tensor, sin_tensor, p->n_attn_heads, p->head_dim);
         ApplyRotary(k_tensor, cos_tensor, sin_tensor, p->n_kv_heads, p->head_dim);
-        delete cos_tensor;
-        delete sin_tensor;
 
         // printf("p->n_kv_heads: %d, p->head_dim: %d\n", p->n_kv_heads, p->head_dim);
 
-        memcpy(k_cache_tensor->buf + 1ll * pos * p->n_kv_heads * p->head_dim, 
-               k_tensor->buf, p->n_kv_heads * p->head_dim * sizeof(float));
-        memcpy(v_cache_tensor->buf + 1ll * pos * p->n_kv_heads * p->head_dim, 
-               v_tensor->buf, p->n_kv_heads * p->head_dim * sizeof(float));
+        // Store k, v in cache
+        memcpy(k_cache_tensor->buf + loff + 1ll * pos * p->n_kv_heads * p->head_dim, k_tensor->buf, p->n_kv_heads * p->head_dim * sizeof(float));
+        memcpy(v_cache_tensor->buf + loff + 1ll * pos * p->n_kv_heads * p->head_dim, v_tensor->buf, p->n_kv_heads * p->head_dim * sizeof(float));
 
         // multihead attention
         int kv_mul = p->n_attn_heads / p->n_kv_heads; // integer multiplier for GQA
@@ -116,7 +165,6 @@ float *our_forward(Transformer *transformer, int token, int pos) {
             
             // Get the key cache for this head group (GQA)
             int kv_head_idx = h / kv_mul;
-            // float *k_cache_head = s->key_cache + loff + kv_head_idx * p->head_dim;
             
             // Create mask if needed
             float *mask_row = nullptr;
@@ -147,7 +195,7 @@ float *our_forward(Transformer *transformer, int token, int pos) {
             */
             
             // Compute attention scores
-            AttnScoresOneHead(q_head, k_cache_tensor->buf, kv_head_idx, p->head_dim, p->head_dim * p->n_kv_heads, p->seq_len, pos, mask_row, att_head);
+            AttnScoresOneHead(q_head, k_cache_tensor->buf + loff, kv_head_idx, p->head_dim, p->head_dim * p->n_kv_heads, p->seq_len, pos, mask_row, att_head);
             
             // Add attention sink score
             att_head[pos + 1] = w->attn_sinks[l * p->n_attn_heads + h];
@@ -164,10 +212,7 @@ float *our_forward(Transformer *transformer, int token, int pos) {
             */
             
             // softmax the scores to get attention weights
-            Tensor *att_head_tensor = new Tensor({(size_t)pos + 2}, att_head);
-            Softmax(att_head_tensor);
-            memcpy(att_head, att_head_tensor->buf, (pos+2) * sizeof(float));
-            delete att_head_tensor;
+            Softmax(att_head, (size_t)pos + 2);
 
             /*
             if (h < 3) {
@@ -181,12 +226,11 @@ float *our_forward(Transformer *transformer, int token, int pos) {
             */    
             
             // Get the value cache for this head group (GQA)
-            float *v_cache_head = v_cache_tensor->buf + 1ll * kv_head_idx * p->head_dim;
             
             // weighted sum of the values
             float *tb_head = tb_tensor->buf + h * p->head_dim;
             // AttnWeightedSumOneHead(att_head, v_cache_head, 0, p->head_dim, pos, tb_head);
-            AttnWeightedSumOneHead(att_head, v_cache_tensor->buf, kv_head_idx, p->head_dim, p->head_dim * p->n_kv_heads, pos, tb_head); 
+            AttnWeightedSumOneHead(att_head, v_cache_tensor->buf + loff, kv_head_idx, p->head_dim, p->head_dim * p->n_kv_heads, pos, tb_head); 
 
             // Debug output for first few heads
             /*
@@ -212,20 +256,13 @@ float *our_forward(Transformer *transformer, int token, int pos) {
         }
 
         // final matmul to get the output of the attention
-        Tensor *w_o_tensor = new Tensor({(size_t)p->hidden_dim, (size_t)p->n_attn_heads * p->head_dim}, 
-                         w->w_o + 1ll * l * p->hidden_dim * p->n_attn_heads * p->head_dim);
-        Tensor *b_o_tensor = new Tensor({(size_t)p->hidden_dim}, w->b_o + 1ll * l * p->hidden_dim);
-        AttnOutProject(tb_tensor, w_o_tensor, b_o_tensor, tb2_tensor);
-        delete w_o_tensor;
-        delete b_o_tensor;
+        AttnOutProject(tb_tensor, w_o_tensor, b_o_tensor, tb2_tensor, 1ll * l);
 
         // residual connection back into x
         ResidualAdd(x_tensor, tb2_tensor);
 
         // ffn rmsnorm
-        Tensor *rms_ffn_w_tensor = new Tensor({(size_t)p->hidden_dim}, w->rms_ffn_w + 1ll * l * p->hidden_dim);
-        RMSNorm(x_tensor, rms_ffn_w_tensor, t_tensor);
-        delete rms_ffn_w_tensor;
+        RMSNorm(x_tensor, rms_ffn_w_tensor, t_tensor, 1ll * l);
 
         /*
         if (l < 3) {
@@ -244,18 +281,13 @@ float *our_forward(Transformer *transformer, int token, int pos) {
         */
 
         // MoE routing
-        Tensor *w_router_tensor = new Tensor({(size_t)p->n_experts, (size_t)p->hidden_dim}, 
-                              w->w_router + l * p->n_experts * p->hidden_dim);
-        Tensor *b_router_tensor = new Tensor({(size_t)p->n_experts}, w->b_router + l * p->n_experts);
-        RouterScores(t_tensor, w_router_tensor, b_router_tensor, router_score_tensor);
-        delete w_router_tensor;
-        delete b_router_tensor;
+        RouterScores(t_tensor, w_router_tensor, b_router_tensor, router_score_tensor, 1ll * l);
         
         // Select top-k experts
         TopK(router_score_tensor, p->experts_per_token, topk_v_tensor, topk_i_tensor);
         
         // Normalize selected experts using softmax
-        Softmax(topk_v_tensor);
+        Softmax(topk_v_tensor->buf, topk_v_tensor->num_elem());
 
         // Route the tokens to their corresponding top-k experts
         memset(e_agg_tensor->buf, 0, p->hidden_dim * sizeof(float));
@@ -269,12 +301,7 @@ float *our_forward(Transformer *transformer, int token, int pos) {
             float *wmlp1_check = w->w_mlp1 + 1ll * (l * p->n_experts + e) * 2 * p->intermediate_dim * p->hidden_dim;
             
             // Expert FFN 1: gate_up = W1 * t + b1
-            Tensor *w_mlp1_tensor = new Tensor({2 * (size_t)p->intermediate_dim, (size_t)p->hidden_dim}, 
-                                w->w_mlp1 + 1ll * (l * p->n_experts + e) * 2 * p->intermediate_dim * p->hidden_dim);
-            Tensor *b_mlp1_tensor = new Tensor({2 * (size_t)p->intermediate_dim}, 
-                                w->b_mlp1 + 1ll *  (l * p->n_experts + e) * 2 * p->intermediate_dim);
-    
-            ExpertFFN1(t_tensor, w_mlp1_tensor, b_mlp1_tensor, mlp1_out_tensor);
+            ExpertFFN1(t_tensor, w_mlp1_tensor, b_mlp1_tensor, mlp1_out_tensor, 1ll * l, 1ll * e);
 
             /*
             printf("t_tensor: ");
@@ -293,9 +320,6 @@ float *our_forward(Transformer *transformer, int token, int pos) {
             }
             printf("\n");
             */
-
-            delete w_mlp1_tensor;
-            delete b_mlp1_tensor;
             
             // Split into gate and up
             for (int j = 0; j < p->intermediate_dim; j++) {
@@ -328,13 +352,7 @@ float *our_forward(Transformer *transformer, int token, int pos) {
             */
             
             // Expert FFN 2: y = W2 * swiglu + b2
-            Tensor *w_mlp2_tensor = new Tensor({(size_t)p->hidden_dim, (size_t)p->intermediate_dim}, 
-                                w->w_mlp2 + 1ll * (l * p->n_experts + e) * p->hidden_dim * p->intermediate_dim);
-            Tensor *b_mlp2_tensor = new Tensor({(size_t)p->hidden_dim}, 
-                                w->b_mlp2 + 1ll * (l * p->n_experts + e) * p->hidden_dim);
-            ExpertFFN2(gate_up_tensor, w_mlp2_tensor, b_mlp2_tensor, tb2_tensor);
-            delete w_mlp2_tensor;
-            delete b_mlp2_tensor;
+            ExpertFFN2(gate_up_tensor, w_mlp2_tensor, b_mlp2_tensor, tb2_tensor, 1ll * l, 1ll * e);
         
             /*
             printf("tb2_tensor: ");
@@ -378,48 +396,14 @@ float *our_forward(Transformer *transformer, int token, int pos) {
         */
 
         // if (l > 10) exit(1);
-
-        memcpy(s->key_cache + loff, k_cache_tensor->buf, (size_t)p->seq_len * (size_t)p->n_kv_heads * p->head_dim * sizeof(float)); // k_cache
-        memcpy(s->value_cache + loff, v_cache_tensor->buf, (size_t)p->seq_len * (size_t)p->n_kv_heads * p->head_dim * sizeof(float)); // v_cache
-
-        delete k_cache_tensor;
-        delete v_cache_tensor;
     }
     
     // final rmsnorm
-    Tensor *rms_out_w_tensor = new Tensor({(size_t)p->hidden_dim}, w->rms_out_w);
-    RMSNorm(x_tensor, rms_out_w_tensor, x_tensor);
-    delete rms_out_w_tensor;
+    RMSNorm(x_tensor, rms_out_w_tensor, x_tensor, 0ll);
 
     // classifier into logits
-    Tensor *w_out_tensor = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->out);
     Classifier(x_tensor, w_out_tensor, logits_tensor);
-    delete w_out_tensor;
-
-    memcpy(s->att, att_tensor->buf, (size_t)p->n_attn_heads * p->seq_len * sizeof(float)); // att_head
-    memcpy(s->logits, logits_tensor->buf, (size_t)p->vocab_size * sizeof(float)); // s_logits
-    memcpy(s->tb, tb_tensor->buf, (size_t)p->head_dim * p->n_attn_heads * sizeof(float)); // s->tb
-
-    // Clean up all allocated tensors
-    delete x_tensor;
-    delete t_tensor;
-    delete tb_tensor;
-    delete tb2_tensor;
-    delete router_score_tensor;
-    delete topk_v_tensor;
-    delete topk_i_tensor;
-    delete mlp1_out_tensor;
-    delete gate_tensor;
-    delete up_tensor;
-    delete gate_up_tensor;
-    delete e_agg_tensor;
-    delete qkv_tensor;
-    delete q_tensor;
-    delete k_tensor;
-    delete v_tensor;
-    delete att_tensor;
-    delete logits_tensor;
-    delete token_embedding_tensor;
     
-    return s->logits;
+    return logits_tensor->buf;
 }
+

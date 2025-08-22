@@ -1,12 +1,12 @@
 // TODO: Modify this file to optimize end-to-end throughput
 #include "getp_eval.cpp"
 
+#include "tensor.cpp"
+#include "tensor.hpp"
 #include "layer.cpp"
 #include "layer.hpp"
 #include "model.cpp"
 #include "model.hpp"
-#include "tensor.cpp"
-#include "tensor.hpp"
 
 #ifndef GETP_RUN
 #define GETP_RUN
@@ -18,6 +18,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // - Memory allocation
   // - Load model
   // - ...
+  our_init(transformer);
 }
 
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
@@ -27,11 +28,20 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
   // - Memory deallocation
   // - Unload model
   // - ...
+  our_free();
 }
 
 long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
                                Sampler *sampler, const char *input_seq,
                                int *output_tokens, int steps) {
+  // <|start|>: 200006
+  // <|end|>: 200007
+  // <|return|>: 200002
+  // <|message|>: 200008
+  // <|channel|>: 200005
+  // <|constrain|>: 200003
+  // <|endoftext|>: 199999
+
   // Inference here
 
   const char *empty_prompt = "";
@@ -54,36 +64,33 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   int next;                     // will store the next token in the sequence
   int token = prompt_tokens[0]; // kick off with the first token in the prompt
   int pos = 0;                  // position in the sequence
-
   while (pos < steps) {
 
     // forward the transformer to get logits for the next token
     float *logits = our_forward(transformer, token, pos);
 
-    /*
     printf("logits: ");
     for (int i=0; i<5; i++) {
       printf("%.6f ", logits[i]);
     }
     printf("\n");
-    */
 
     // advance the state machine
-    if (pos < num_prompt_tokens - 1) {
+    pos++;
+    if (pos < num_prompt_tokens) {
       // if we are still processing the input prompt, force the next prompt
       // token
-      next = prompt_tokens[pos + 1];
+      next = prompt_tokens[pos];
     } else {
       // otherwise sample the next token from the logits
       next = sample(sampler, logits);
       // save the output token, it will be printed to file
-      output_tokens[pos - num_prompt_tokens - 1] = next;
+      output_tokens[pos - num_prompt_tokens] = next;
     }
-    pos++;
 
-    // data-dependent terminating condition: the BOS (=1) token delimits
-    // sequences
-    if (next == 1) {
+    // data-dependent terminating condition: the EOS (=199999 or =200002) token
+    // delimits sequences
+    if (next == 199999 || next == 200002) {
       break;
     }
 
@@ -100,11 +107,11 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   printf("\n");
 
   // Marker for end of sequence
-  output_tokens[pos - num_prompt_tokens] = -1;
+  output_tokens[pos - num_prompt_tokens + 1] = -1;
 
   free(prompt_tokens);
 
-  return pos - num_prompt_tokens;
+  return pos - num_prompt_tokens + 1;
 }
 
 long long inference(Transformer *transformer, Tokenizer *tokenizer,

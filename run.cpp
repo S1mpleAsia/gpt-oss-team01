@@ -343,13 +343,9 @@ void softmax(float *x, int size) {
   // exp and sum
   double sum = 0.0f;
   for (int i = 0; i < size; i++) {
-    // printf("x[%d] before: %.6f\n", i, x[i]);
     x[i] = expf(x[i] - max_val);
-    // printf("x[%d] after: %.6f\n", i, x[i]);
     sum += x[i];
   }
-  // printf("sum: %.6f\n", sum);
-  // printf("max_val: %.6f\n", max_val);
   // normalize
   for (int i = 0; i < size; i++) {
     x[i] /= sum;
@@ -550,7 +546,6 @@ float *forward(Transformer *transformer, int token, int pos) {
 
   // forward all the layers
   for (unsigned long long l = 0; l < p->n_layers; l++) {
-    // printf("Layer %lld\n", l);
     // s->t (hidden_dim, )
     rmsnorm(s->t, x, w->rms_attn_w + 1ll * l * hidden_dim, hidden_dim);
 
@@ -580,25 +575,6 @@ float *forward(Transformer *transformer, int token, int pos) {
     memcpy(s->v, s->qkv + head_dim * p->n_attn_heads + head_dim * p->n_kv_heads,
            head_dim * p->n_kv_heads * sizeof(float)); // gate
 
-    /*
-    printf("REAL\n");
-    printf("q_tensor: ");
-    for (int i = 0; i < 5; i++) {
-        printf("%.6f ", s->q[i]);
-    }
-    printf("\n");
-    printf("k_tensor: ");
-    for (int i = 0; i < 5; i++) {
-        printf("%.6f ", s->k[i]);
-    }
-    printf("\n");
-    printf("v_tensor: ");
-    for (int i = 0; i < 5; i++) {
-        printf("%.6f ", s->v[i]);
-    }
-    printf("\n");
-    */
-
     // RoPE relative positional encoding: complex-valued rotate q and k in each
     // head Adapted from
     // https://github.com/openai/gpt-oss/blob/main/gpt_oss/torch/model.py#L85
@@ -620,34 +596,12 @@ float *forward(Transformer *transformer, int token, int pos) {
 
     // multihead attention. iterate over all heads
     int h;
-//#pragma omp parallel for private(h)
+#pragma omp parallel for private(h)
     for (h = 0; h < p->n_attn_heads; h++) {
       // get the query vector for this head
       float *q = s->q + h * head_dim;
       // attention scores for this head
       float *att = s->att + h * p->seq_len;
-      /*
-      if (h < 3) {
-        printf("REAL head %d\n", h);
-        printf("q: ");
-        for (int i = 0; i < 5; i++) {
-          printf("%.6f ", q[i]);
-        }
-        printf("\n");
-        printf("att: ");
-        for (int i = 0; i < 5; i++) {
-          printf("%.6f ", att[i]);
-        }
-        printf("\n");
-        float *skeycache = s->key_cache + loff;
-        printf("s->key_cache: ");
-        for (int i = 0; i < 5; i++) {
-            printf("%.6f ", skeycache[i]);
-        }
-        printf("\n");
-      }
-      */
-
       // iterate over all timesteps, including the current one
       for (int t = 0; t <= pos; t++) {
         // get the key vector for this head and at this timestep
@@ -668,29 +622,8 @@ float *forward(Transformer *transformer, int token, int pos) {
       }
       // Add attention sink score
       att[pos + 1] = w->attn_sinks[l * p->n_attn_heads + h];
-      /*
-      if (h < 3) {
-        printf("REAL\n");
-        printf("att: ");
-        for (int i=0; i<min(pos+2, 5); i++) {
-          printf("%.6f ", att[i]);
-        }
-        printf("\n");
-      }
-      */
       // softmax the scores to get attention weights, from 0..pos inclusively
       softmax(att, pos + 2);
-
-      /*
-      if (h < 3) {
-        printf("REAL\n");
-        printf("att: ");
-        for (int i=0; i<min(pos+2, 5); i++) {
-          printf("%.6f ", att[i]);
-        }
-        printf("\n");
-      }
-      */
 
       // weighted sum of the values
       float *tb = s->tb + h * head_dim;
@@ -699,13 +632,6 @@ float *forward(Transformer *transformer, int token, int pos) {
         // get the value vector for this head and at this timestep
         // GQA
         float *v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_dim;
-        /*
-        printf("v_cache current: ");
-        for (int i = 0; i < min(pos+2, 5); i++) {
-          printf("%.6f ", v[i]);
-        }
-        printf("\n");
-        */
         // get the attention weight for this timestep
         float a = att[t];
         // accumulate the weighted value into xb
@@ -713,28 +639,6 @@ float *forward(Transformer *transformer, int token, int pos) {
           tb[i] += a * v[i];
         }
       }
-    
-      /*
-      if (h < 3) {
-        printf("REAL\n");
-        printf("att: ");
-        for (int i=0; i<min(pos+2, 5); i++) {
-          printf("%.6f ", att[i]);
-        }
-        printf("\n");
-        float *v_cache_head = s->value_cache + 1ll * (h / kv_mul) * p->head_dim;
-        printf("v_cache_head: ");
-        for (int i = 0; i < min(pos+2, 5); i++) {
-          printf("%.6f ", v_cache_head[i]);
-        }
-        printf("\n");
-        printf("tb: ");
-        for (int i=0; i<min(head_dim, 5); i++) {
-          printf("%.6f ", tb[i]);
-        }
-        printf("\n");
-      }
-      */
     }
     // final matmul to get the output of the attention
     float *w_o = w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
@@ -752,23 +656,6 @@ float *forward(Transformer *transformer, int token, int pos) {
 
     // ffn rmsnorm
     rmsnorm(s->t, x, w->rms_ffn_w + 1ll * l * hidden_dim, hidden_dim);
-
-    /*
-    if (l < 3) {
-        printf("REAL:\n");
-        printf("x_tensor: ");
-        for (int i=0; i<5; i++) {
-            printf("%.6f ", x[i]);
-        }
-        printf("\n");
-        printf("t_tensor: ");
-        for (int i=0; i<5; i++) {
-            printf("%.6f ", s->t[i]);
-        }
-        printf("\n");
-    }
-    */
-
 
     // MoE
     // Compute router_score
@@ -801,7 +688,6 @@ float *forward(Transformer *transformer, int token, int pos) {
       }
 
       if (in_topk) {
-        // printf("e: %d\n", e);
         float *w_mlp1 = w->w_mlp1 + 1ll * (l * n_experts + e) *
                                         (2 * p->intermediate_dim) * hidden_dim;
         float *b_mlp1 =
@@ -816,35 +702,6 @@ float *forward(Transformer *transformer, int token, int pos) {
           s->gate[j] = s->mlp1_out[2 * j];
           s->up[j] = s->mlp1_out[2 * j + 1];
         }
-
-        /*
-        printf("s->t: ");
-        for (int i=0; i<5; i++) {
-            printf("%.6f ", s->t[i]);
-        }
-        printf("\n");
-        printf("w_mlp1_tensor: ");
-        for (int i=0; i<5; i++) {
-            printf("%.6f ", w_mlp1[i]);
-        }
-        printf("\n");
-        printf("b_mlp1_tensor: ");
-        for (int i=0; i<5; i++) {
-            printf("%.6f ", b_mlp1[i]);
-        }
-        printf("\n");
-
-        printf("gate: ");
-        for (int i=0; i<5; i++) {
-            printf("%.6f ", s->gate[i]);
-        }
-        printf("\n");
-        printf("up: ");
-        for (int i=0; i<5; i++) {
-            printf("%.6f ", s->up[i]);
-        }
-        printf("\n");
-        */
 
         // SwiGLU non-linearity
         const float alpha = 1.702f;
@@ -865,14 +722,6 @@ float *forward(Transformer *transformer, int token, int pos) {
                   1.0f); // gpt-oss adds an extra bias of 1 to the up layer
           s->gate_up[i] = val;
         }
-        
-        /*
-        printf("gate_up: ");
-        for (int i=0; i<5; i++) {
-            printf("%.6f ", s->gate_up[i]);
-        }
-        printf("\n");
-        */
 
         // final matmul to get the output of the ffn
         float *w_mlp2 =
@@ -885,50 +734,18 @@ float *forward(Transformer *transformer, int token, int pos) {
         for (int i = 0; i < hidden_dim; i++) {
           s->tb2[i] += b_mlp2[i];
         }
-        
-        /*
-        printf("tb2_tensor: ");
-        for (int i=0; i<5; i++) {
-            printf("%.6f ", s->tb2[i]);
-        }
-        printf("\n");
-        */
 
         // aggregate topk experts using weighted sum
         for (int i = 0; i < hidden_dim; i++) {
           s->e_agg[i] += s->tb2[i] * expert_w;
         }
-      
-        /*
-        printf("e_agg_tensor: ");
-        for (int i=0; i<5; i++) {
-            printf("%.6f ", s->e_agg[i]);
-        }
-        printf("\n");
-        */
       }
     }
-    
-    /*
-    printf("e_agg_tensor: ");
-    for (int i=0; i<5; i++) {
-        printf("%.6f ", s->e_agg[i]);
-    }
-    printf("\n");
-    */
 
     // residual connection
     for (int i = 0; i < hidden_dim; i++) {
       x[i] += s->e_agg[i];
     }
-    
-    /*
-    printf("x after expert: ");
-    for (int i=0; i<5; i++) {
-        printf("%.6f ", x[i]);
-    }
-    printf("\n");
-    */
   }
   // final rmsnorm
   rmsnorm(x, x, w->rms_out_w, hidden_dim);
@@ -1158,9 +975,9 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
     }
     pos++;
 
-    // data-dependent terminating condition: the BOS (=1) token delimits
-    // sequences
-    if (next == 1) {
+    // data-dependent terminating condition: the EOS (=199999 or =200002) token
+    // delimits sequences
+    if (next == 199999 || next == 200002) {
       break;
     }
 

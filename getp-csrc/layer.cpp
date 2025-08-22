@@ -11,8 +11,9 @@ void EmbeddingLookup(const Tensor *embedding /*[vocab, hidden]*/, int token_id,
 
 // RMSNorm: out = scale * x / rms(x)
 void RMSNorm(const Tensor *x /*[hidden]*/, const Tensor *scale /*[hidden]*/,
-             Tensor *out /*[hidden]*/, float eps) {
+             Tensor *out /*[hidden]*/, long long layer_offset, float eps) {
     size_t size = x->num_elem();
+    float *scale_buf = scale->buf + 1ll * layer_offset * size;
     // calculate sum of squares
     double ss = 0.0;
     for (size_t j = 0; j < size; j++) {
@@ -23,48 +24,44 @@ void RMSNorm(const Tensor *x /*[hidden]*/, const Tensor *scale /*[hidden]*/,
     ss = 1.0 / sqrt(ss);
     // normalize and scale
     for (size_t j = 0; j < size; j++) {
-        out->buf[j] = scale->buf[j] * (ss * x->buf[j]);
+        out->buf[j] = scale_buf[j] * (ss * x->buf[j]);
     }
 }
 
 // y = Wx + b -- W: [out, in], x: [in], y: [out]
-void Linear(const Tensor *x, const Tensor *W, const Tensor *b, Tensor *y) {
-    size_t in_dim = x->num_elem();
-    size_t out_dim = y->num_elem();
-    
+void Linear(const float *x, size_t in_dim, const float *W, const float *b, 
+            size_t out_dim, float *y) {
     for (size_t i = 0; i < out_dim; i++) {
         double val = 0.0;
         for (size_t j = 0; j < in_dim; j++) {
-            val += W->buf[i * in_dim + j] * x->buf[j];
+            val += W[i * in_dim + j] * x[j];
         }
-        if (b) val += b->buf[i];
-        y->buf[i] = val;
+        if (b) val += b[i];
+        y[i] = val;
     }
 }
 
-void Softmax(Tensor *x) {
-    size_t size = x->num_elem();
-
+void Softmax(float *x, size_t size) {
     // find max value (for numerical stability)
-    double max_val = x->buf[0];
+    double max_val = x[0];
     for (size_t i = 1; i < size; i++) {
-        if (x->buf[i] > max_val) {
-            max_val = x->buf[i];
+        if (x[i] > max_val) {
+            max_val = x[i];
         }
     }
     // exp and sum
     double sum = 0.0;
     for (size_t i = 0; i < size; i++) {
         // printf("x->buf[%d] before: %.6f\n", i, x->buf[i]);
-        x->buf[i] = expf(x->buf[i] - max_val);
+        x[i] = expf(x[i] - max_val);
         // printf("x->buf[%d] after: %.6f\n", i, x->buf[i]);
-        sum += x->buf[i];
+        sum += x[i];
     }
     // printf("sum: %.6f\n", sum);
     // printf("max_val: %.6f\n", max_val);
     // normalize
     for (size_t i = 0; i < size; i++) {
-        x->buf[i] /= sum;
+        x[i] /= sum;
     }
 }
 
@@ -72,8 +69,15 @@ void Softmax(Tensor *x) {
 // qkv.shape = [(n_q + 2*n_kv)*head_dim]
 void QKVProject(const Tensor *x /*[hidden]*/,
                 const Tensor *W_qkv /*[(n_q+2*n_kv)*hd, hidden]*/,
-                const Tensor *b_qkv, Tensor *qkv /*[(n_q+2*n_kv)*hd]*/) {
-    Linear(x, W_qkv, b_qkv, qkv);
+                const Tensor *b_qkv, Tensor *qkv /*[(n_q+2*n_kv)*hd]*/,
+                long long layer_offset) {
+    const long long hidden = x->num_elem();
+    const long long nq_kv_hd = qkv->num_elem();
+    
+    const float *w_qkv_ptr = W_qkv->buf + 1ll * layer_offset * nq_kv_hd * hidden;
+    const float *b_qkv_ptr = b_qkv->buf + 1ll * layer_offset * nq_kv_hd;
+
+    Linear(x->buf, hidden, w_qkv_ptr, b_qkv_ptr, nq_kv_hd, qkv->buf);
 }
 
 void SplitQKV(const Tensor *qkv, int head_dim, int n_q, int n_kv,
@@ -256,15 +260,26 @@ void AttnWeightedSumOneHead(const float *att /*[pos+1]*/,
 // Output projection for attention: y = W_o * tb + b_o
 void AttnOutProject(const Tensor *tb /*[n_q*hd]*/,
                     const Tensor *W_o /*[hidden, n_q*hd]*/, const Tensor *b_o,
-                    Tensor *y /*[hidden]*/) {
-    Linear(tb, W_o, b_o, y);
+                    Tensor *y /*[hidden]*/, long long layer_offset) {
+    const long long n_q_hd = tb->num_elem();
+    const long long hidden = y->num_elem();
+    const float *w_o_ptr = W_o->buf + 1ll * layer_offset * n_q_hd * hidden;
+    const float *b_o_ptr = b_o->buf + 1ll * layer_offset * hidden;
+    Linear(tb->buf, n_q_hd, w_o_ptr, b_o_ptr, hidden, y->buf);
 }
 
 // Router: r = W_router * t + b_router
 void RouterScores(const Tensor *t /*[hidden]*/,
                   const Tensor *W_router /*[n_experts, hidden]*/,
-                  const Tensor *b_router, Tensor *r /*[n_experts]*/) {
-    Linear(t, W_router, b_router, r);
+                  const Tensor *b_router, Tensor *r /*[n_experts]*/,
+                  long long layer_offset) {
+    const long long hidden = t->num_elem();
+    const long long n_experts = r->num_elem();
+    const float *w_router_ptr = W_router->buf + 1ll * layer_offset * n_experts * hidden;
+    const float *b_router_ptr = b_router->buf + 1ll * layer_offset * n_experts;
+    // memcpy(w_router_tensor->buf, w->w_router + l * p->n_experts * p->hidden_dim, (size_t)p->n_experts * (size_t)p->hidden_dim * sizeof(float));
+    // memcpy(b_router_tensor->buf, w->b_router + l * p->n_experts, (size_t)p->n_experts * sizeof(float));
+    Linear(t->buf, hidden, w_router_ptr, b_router_ptr, n_experts, r->buf);
 }
 
 void TopK(const Tensor *r /*[n_experts]*/, int k, Tensor *topk_vals /*[k]*/,
@@ -325,14 +340,26 @@ void SwiGLU(const Tensor *gate /*[d]*/, const Tensor *up /*[d]*/,
 
 // Expert FFN 1: z = W1 * t + b1
 void ExpertFFN1(const Tensor *t, const Tensor *W1, const Tensor *b1,
-                Tensor *z) {
-    Linear(t, W1, b1, z);
+                Tensor *z, long long layer_offset, long long expert_offset) {
+    const long long offset = 1ll * (layer_offset * b1->shape[1] + expert_offset);
+    const long long intermediate = z->num_elem();
+    const long long hidden = t->num_elem();
+    const float *w1_buf = W1->buf + offset * intermediate * hidden;
+    const float *b1_buf = b1->buf + offset * intermediate;
+    
+    Linear(t->buf, hidden, w1_buf, b1_buf, intermediate, z->buf);
 }
 
 // Expert FFN 2: y = W2 * swiglu + b2
 void ExpertFFN2(const Tensor *swiglu, const Tensor *W2, const Tensor *b2,
-                Tensor *y) {
-    Linear(swiglu, W2, b2, y);
+                Tensor *y, long long layer_offset, long long expert_offset) {
+    const long long offset = 1ll * (layer_offset * b2->shape[1] + expert_offset);
+    const long long intermediate = swiglu->num_elem();
+    const long long hidden = y->num_elem();
+    const float *w2_buf = W2->buf + offset * intermediate * hidden;
+    const float *b2_buf = b2->buf + offset * hidden;
+
+    Linear(swiglu->buf, intermediate, w2_buf, b2_buf, hidden, y->buf);
 }
 
 // Add residual: x += y
@@ -347,5 +374,6 @@ void ResidualAdd(Tensor *x /*[hidden]*/, const Tensor *y /*[hidden]*/) {
 void Classifier(const Tensor *x /*[hidden]*/,
                 const Tensor *W_out /*[vocab, hidden]*/,
                 Tensor *logits /*[vocab]*/) {
-    Linear(x, W_out, nullptr, logits);
+    Linear(x->buf, x->num_elem(), W_out->buf, 
+           nullptr, logits->num_elem(), logits->buf);
 }

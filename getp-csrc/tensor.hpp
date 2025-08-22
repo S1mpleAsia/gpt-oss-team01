@@ -28,10 +28,11 @@ struct Tensor {
   float *buf = nullptr;
 
   Tensor(const vector<size_t> &shape_);
-  Tensor(const vector<size_t> &shape_, float *buf_);
+  Tensor(const vector<size_t> &shape_, float *buf_, bool malloc_new);
   ~Tensor();
 
   size_t num_elem() const;
+  void printShape(const std::string& descr) const;
   void reshape(const vector<int> &shape_);
 };
 
