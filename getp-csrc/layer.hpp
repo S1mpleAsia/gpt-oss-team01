@@ -21,12 +21,12 @@ void RMSNormGPU(const float *x,  // [hidden]
                 float eps,  // e.g. 1e-5
                 hipStream_t stream);
 
-// ---------- QKV GEMM ----------
-/* qkv_out = W_qkv [ (n_q+2*n_kv)*hd , hidden ]  *  t [hidden]  (+ optional b) */
-void QKVGemmGPU(const float *W_qkv,
-                const float *t,  // [hidden]
-                float *qkv_out,  // [(n_q+2*n_kv)*hd]
-                int hidden_dim, int head_dim, int n_q, int n_kv, hipStream_t stream);
+void QKVGemmGPU(const float *w_qkv,  // (out, in)
+                const float *b_qkv,  // (out, )
+                const float *t,      // (in, )
+                float *out,          // (out, )
+                int hidden_dim, int head_dim, int in_features, int out_features,
+                hipStream_t stream);
 
 // (tuỳ chọn) cộng bias riêng nếu không có epilogue:
 void AddBiasGPU(float *y,  // len = cols
@@ -38,8 +38,7 @@ void AddVectorGPU(float *x, const float *y, int n, hipStream_t stream);
 /* Đọc qkv_out (đã có/hoặc chưa có bias), cộng bias (nếu b != nullptr),
  *  tách Q; ghi K,V vào cache vị trí pos; áp RoPE cho Q và K@pos
  */
-void QKVEpilogueSplitRoPECacheGPU(float *qkv_out,  // [(n_q+2*n_kv)*hd]
-                                  const float *b_qkv_or_null,
+void QKVEpilogueSplitRoPECacheGPU(float *qkv_out,             // [(n_q+2*n_kv)*hd]
                                   float *q_out,               // [n_q*hd]
                                   float *k_pos,               // [n_kv*hd] (cache @pos)
                                   float *v_pos,               // [n_kv*hd] (cache @pos)
@@ -50,8 +49,8 @@ void QKVEpilogueSplitRoPECacheGPU(float *qkv_out,  // [(n_q+2*n_kv)*hd]
 // ---------- Precompute RoPE table ----------
 void BuildRopeTableGPU(int seq_len, int head_dim, float rope_theta, float scaling_factor,
                        float init_ctx_len, float ntk_beta, float ntk_alpha,
-                       float *out_cos,  // [seq_len, hd/2]
-                       float *out_sin,  // [seq_len, hd/2]
+                       float *d_out_cos,  // [seq_len, hd/2]
+                       float *d_out_sin,  // [seq_len, hd/2]
                        hipStream_t stream);
 
 // ---------- Single-query attention fused ----------

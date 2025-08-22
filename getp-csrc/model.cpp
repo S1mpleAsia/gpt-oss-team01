@@ -1,4 +1,5 @@
 #include "model.hpp"
+#include <vector>
 
 void device_alloc_run_state(DeviceRunState *rs_d, Config *config) {
   int kv_dim = config->head_dim * config->n_kv_heads;
@@ -251,52 +252,51 @@ float *hip_forward(DeviceTransformerWeights *w, DeviceRunState *rs, Config *conf
 
   for (int l = 0; l < config->n_layers; l++) {
     const float *w_rms_attn = w->rms_attn_w + (size_t)l * hidden_dim;
-    const float *w_qkv_layer =
+    const float *w_qkv =
       w->w_qkv + (size_t)l * hidden_dim * (head_dim * (n_q_heads + 2 * n_kv_heads));
-    const float *b_qkv_layer = w->b_qkv + (size_t)l * (head_dim * (n_q_heads + 2 * n_kv_heads));
-    const float *w_o_layer = w->w_o + (size_t)l * (head_dim * n_q_heads) * hidden_dim;
-    const float *b_o_layer = w->b_o + (size_t)l * hidden_dim;
-    const float *attn_sinks_layer = w->attn_sinks + (size_t)l * n_q_heads;
+    const float *b_qkv = w->b_qkv + (size_t)l * (head_dim * (n_q_heads + 2 * n_kv_heads));
+    const float *w_o = w->w_o + (size_t)l * (head_dim * n_q_heads) * hidden_dim;
+    const float *b_o = w->b_o + (size_t)l * hidden_dim;
+    const float *attn_sinks = w->attn_sinks + (size_t)l * n_q_heads;
 
-    // 2. Pre-attention RMSNorm: Chuẩn hóa rs->x, kết quả lưu vào rs->t
+    // 2. Pre-attention RMSNorm
     RMSNormGPU(rs->x, w_rms_attn, rs->t, hidden_dim, 1e-5f, stream);
     // printf("Done step 2 - layer: %d\n", l);
 
-    // 3. QKV GEMM: Nhân ma trận để có Q, K, V
-    // rs->t (hidden_dim) @ w_qkv_layer -> rs->qkv
-    QKVGemmGPU(w_qkv_layer, rs->t, rs->qkv, hidden_dim, head_dim, n_q_heads, n_kv_heads, stream);
+    // 3. Compute Q, K, V
+    // w_qkv (head_dim * (n_attn_head + 2 * n_kv_head), hidden_dim) @ rs->t (hidden_dim, ) + b_qkv => rs->qkv
+    QKVGemmGPU(w_qkv, b_qkv, rs->t, rs->qkv, hidden_dim, head_dim, hidden_dim,
+               head_dim * (n_q_heads + 2 * n_kv_heads), stream);
 
     // printf("Done step 3 - layer: %d\n", l);
 
-    // 4. QKV Epilogue: Tách Q, K, V; áp dụng RoPE; và lưu K, V vào cache
-    const size_t loff = (size_t)l * config->seq_len * kv_dim;  // Layer offset trong KV cache
+    // 4. Split QKV and RoPE
+    const size_t loff = (size_t)l * config->seq_len * kv_dim;  // layer offset in KV cache
     float *k_pos = rs->key_cache + loff + (size_t)pos * kv_dim;
     float *v_pos = rs->value_cache + loff + (size_t)pos * kv_dim;
 
     const float *rope_cos_pos = d_rope_cos + (size_t)pos * (head_dim / 2);
     const float *rope_sin_pos = d_rope_sin + (size_t)pos * (head_dim / 2);
 
-    QKVEpilogueSplitRoPECacheGPU(rs->qkv, b_qkv_layer, rs->q, k_pos, v_pos, rope_cos_pos,
-                                 rope_sin_pos, head_dim, n_q_heads, n_kv_heads, stream);
+    QKVEpilogueSplitRoPECacheGPU(rs->qkv, rs->q, k_pos, v_pos, rope_cos_pos, rope_sin_pos, head_dim,
+                                 n_q_heads, n_kv_heads, stream);
 
     // printf("Done step 4 - layer: %d\n", l);
 
     // 5. Multi-Head Attention
-    const float *K_cache_layer = rs->key_cache + loff;
-    const float *V_cache_layer = rs->value_cache + loff;
+    const float *k_cache = rs->key_cache + loff;
+    const float *v_cache = rs->value_cache + loff;
     const float *mask_row =
       (config->sliding_window > 0) ? (rs->mask + (size_t)pos * config->seq_len) : nullptr;
 
-    SingleQueryAttentionGPU(rs->q, K_cache_layer, V_cache_layer, mask_row, attn_sinks_layer, rs->tb,
-                            head_dim, n_q_heads, n_q_heads / n_kv_heads, kv_dim, pos + 1, pos,
-                            stream);
+    SingleQueryAttentionGPU(rs->q, k_cache, v_cache, mask_row, attn_sinks, rs->tb, head_dim,
+                            n_q_heads, n_q_heads / n_kv_heads, kv_dim, pos + 1, pos, stream);
 
     // printf("Done step 5 - layer: %d\n", l);
 
-    // 6. Post-attention Linear layer và kết nối residual
-    // rs->x += W_o * rs->tb + b_o
-    LinearBiasResidualGPU(w_o_layer, rs->tb, b_o_layer, rs->x, head_dim * n_q_heads, hidden_dim,
-                          stream);
+    // 6. Post-attention Linear and residual
+    // rs->x += w_o * rs->tb + b_o
+    LinearBiasResidualGPU(w_o, rs->tb, b_o, rs->x, head_dim * n_q_heads, hidden_dim, stream);
 
     // printf("Done step 6 - layer: %d\n", l);
 
@@ -304,12 +304,12 @@ float *hip_forward(DeviceTransformerWeights *w, DeviceRunState *rs, Config *conf
 
     // Tính toán con trỏ offset cho FFN/MoE của layer hiện tại (l)
     const float *w_rms_ffn = w->rms_ffn_w + (size_t)l * hidden_dim;
-    const float *w_router_layer = w->w_router + (size_t)l * hidden_dim * n_experts;
-    const float *b_router_layer = w->b_router + (size_t)l * n_experts;
-    const float *w_mlp1_layer = w->w_mlp1;  // Base pointer, MoE kernel sẽ tự tính offset
-    const float *b_mlp1_layer = w->b_mlp1;
-    const float *w_mlp2_layer = w->w_mlp2;
-    const float *b_mlp2_layer = w->b_mlp2;
+    const float *w_router = w->w_router + (size_t)l * hidden_dim * n_experts;
+    const float *b_router = w->b_router + (size_t)l * n_experts;
+    const float *w_mlp1 = w->w_mlp1;  // Base pointer, MoE kernel sẽ tự tính offset
+    const float *b_mlp1 = w->b_mlp1;
+    const float *w_mlp2 = w->w_mlp2;
+    const float *b_mlp2 = w->b_mlp2;
 
     // 7. Pre-FFN RMSNorm
     RMSNormGPU(rs->x, w_rms_ffn, rs->t, hidden_dim, 1e-5f, stream);
@@ -317,19 +317,29 @@ float *hip_forward(DeviceTransformerWeights *w, DeviceRunState *rs, Config *conf
     // printf("Done step 7 - layer: %d\n", l);
 
     // 8. Router GEMM: Tính điểm cho các expert
-    RouterGemmGPU(w_router_layer, rs->t, b_router_layer, rs->router_score, hidden_dim, n_experts,
-                  stream);
+    RouterGemmGPU(w_router, rs->t, b_router, rs->router_score, hidden_dim, n_experts, stream);
 
     // printf("Done step 8 - layer: %d\n", l);
 
-    // 9. Top-K + Softmax: Chọn ra các expert hàng đầu và tính trọng số của chúng
+    // 9. Top-K + Softmax
     TopKSoftmaxGPU(rs->router_score, n_experts, experts_per_token, rs->topk_v, rs->topk_i, stream);
 
     // printf("Done step 9 - layer: %d\n", l);
 
-    // 10. MoE Gating: Áp dụng các expert đã chọn
-    MoEApplyTopKGPU(rs->t, w_mlp1_layer, b_mlp1_layer, w_mlp2_layer, b_mlp2_layer, rs->topk_i,
-                    rs->topk_v, rs->mlp1_out, rs->e_agg, hidden_dim, intermediate_dim,
+    size_t layer_w1_offset = 1ll * l * n_experts * (2 * intermediate_dim) * hidden_dim;
+    size_t layer_b1_offset = 1ll * l * n_experts * (2 * intermediate_dim);
+    size_t layer_w2_offset = 1ll * l * n_experts * hidden_dim * intermediate_dim;
+    size_t layer_b2_offset = 1ll * l * n_experts * hidden_dim;
+
+    // Lấy con trỏ trên GPU cho layer hiện tại (w_mlp1 là con trỏ gốc của DeviceTransformerWeights)
+    const float *d_w_mlp1_layer = w_mlp1 + layer_w1_offset;
+    const float *d_b_mlp1_layer = b_mlp1 + layer_b1_offset;
+    const float *d_w_mlp2_layer = w_mlp2 + layer_w2_offset;
+    const float *d_b_mlp2_layer = b_mlp2 + layer_b2_offset;
+
+    MoEApplyTopKGPU(rs->t, d_w_mlp1_layer, d_b_mlp1_layer,  // Truyền con trỏ của layer 'l'
+                    d_w_mlp2_layer, d_b_mlp2_layer,         // Truyền con trỏ của layer 'l'
+                    rs->topk_i, rs->topk_v, rs->mlp1_out, rs->e_agg, hidden_dim, intermediate_dim,
                     experts_per_token, config->swiglu_limit, stream);
 
     // printf("Done step 10 - layer: %d\n", l);
