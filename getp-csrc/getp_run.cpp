@@ -1,6 +1,13 @@
 // TODO: Modify this file to optimize end-to-end throughput
 #include "getp_eval.cpp"
 
+#include "layer.cpp"
+#include "layer.hpp"
+#include "model.cpp"
+#include "model.hpp"
+#include "tensor.cpp"
+#include "tensor.hpp"
+
 #ifndef GETP_RUN
 #define GETP_RUN
 
@@ -47,10 +54,19 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   int next;                     // will store the next token in the sequence
   int token = prompt_tokens[0]; // kick off with the first token in the prompt
   int pos = 0;                  // position in the sequence
+
   while (pos < steps) {
 
     // forward the transformer to get logits for the next token
-    float *logits = forward(transformer, token, pos);
+    float *logits = our_forward(transformer, token, pos);
+
+    /*
+    printf("logits: ");
+    for (int i=0; i<5; i++) {
+      printf("%.6f ", logits[i]);
+    }
+    printf("\n");
+    */
 
     // advance the state machine
     if (pos < num_prompt_tokens - 1) {

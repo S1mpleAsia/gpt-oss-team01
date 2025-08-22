@@ -31,7 +31,21 @@ struct Tensor {
   Tensor(const vector<size_t> &shape_, float *buf_);
   ~Tensor();
 
-  size_t num_elem();
+  size_t num_elem() const;
+  void reshape(const vector<int> &shape_);
+};
+
+struct TensorI32 {
+  size_t ndim = 0;
+  vector<size_t> shape;
+  //   size_t shape[5] = {1, 1, 1, 1, 1};
+  int *buf = nullptr;
+
+  TensorI32(const vector<size_t> &shape_);
+  TensorI32(const vector<size_t> &shape_, int *buf_);
+  ~TensorI32();
+
+  size_t num_elem() const;
   void reshape(const vector<int> &shape_);
 };
 
