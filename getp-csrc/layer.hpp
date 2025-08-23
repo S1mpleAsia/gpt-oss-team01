@@ -71,13 +71,13 @@ void SingleQueryAttentionGPU(const float *q,                   // [n_q*hd]
 
 // ---------- Linear + bias + residual (epilogue nếu có Lt) ----------
 /* y = W [out,in] * x [in] + b  ;  x_out = x_resid + y */
-void LinearBiasResidualGPU(const float *W, const float *x, const float *b_or_null,
+void LinearBiasResidualGPU(const float *W, const float *x, const float *bias,
                            float *x_resid_inout,  // in: residual src, out: x += y
                            int in_features, int out_features, hipStream_t stream);
 
 // ---------- Router GEMM ----------
 /* r = W_router [n_experts, hidden] * t [hidden] + b */
-void RouterGemmGPU(const float *W_router, const float *t, const float *b_router_or_null,
+void RouterGemmGPU(const float *W_router, const float *t, const float *bias,
                    float *r,  // [n_experts]
                    int hidden_dim, int n_experts, hipStream_t stream);
 
@@ -98,10 +98,10 @@ void TopKSoftmaxGPU(const float *r,  // [n_experts]
  */
 void MoEApplyTopKGPU(
   const float *t,          // [hidden]
-  const float *W1,         // [n_layers? n_experts? 2*inter, hidden] - pass base for this layer
-  const float *b1,         // [n_experts, 2*inter]
-  const float *W2,         // [n_experts, hidden, inter]
-  const float *b2,         // [n_experts, hidden]
+  const bf16 *W1,          // [n_layers? n_experts? 2*inter, hidden] - pass base for this layer
+  const bf16 *b1,          // [n_experts, 2*inter]
+  const bf16 *W2,          // [n_experts, hidden, inter]
+  const bf16 *b2,          // [n_experts, hidden]
   const int *topk_idx,     // [k]
   const float *topk_vals,  // [k] (đã softmax)
   float *work_gate_up,     // [inter] scratch
@@ -110,12 +110,6 @@ void MoEApplyTopKGPU(
   int k,              // experts_per_token
   float clamp_limit,  // swiglu_limit
   hipStream_t stream);
-
-// ---------- Final RMSNorm ----------
-/* In-place hợp lệ (out == x) */
-void RMSNormInplaceGPU(float *x,            // [hidden]
-                       const float *scale,  // [hidden]
-                       int hidden_dim, float eps, hipStream_t stream);
 
 // ---------- Classifier (logits = W_out * x) ----------
 void ClassifierGemmGPU(const float *W_out,  // [vocab, hidden]

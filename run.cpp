@@ -625,6 +625,11 @@ float *forward(Transformer *transformer, int token, int pos) {
         }
       }
     }
+
+    // for (int i = 0; i < 10; i++) {
+    //   printf("tb[%d] = %f\n", i, s->tb[i]);
+    // }
+
     // final matmul to get the output of the attention
     float *w_o = w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
     float *b_o = w->b_o + 1ll * l * hidden_dim;
@@ -638,6 +643,10 @@ float *forward(Transformer *transformer, int token, int pos) {
     for (int i = 0; i < hidden_dim; i++) {
       x[i] += s->tb2[i];
     }
+
+    // for (int i = 0; i < 10; i++) {
+    //   printf("x[%d] = %f\n", i, x[i]);
+    // }
 
     // ffn rmsnorm
     rmsnorm(s->t, x, w->rms_ffn_w + 1ll * l * hidden_dim, hidden_dim);
@@ -656,10 +665,20 @@ float *forward(Transformer *transformer, int token, int pos) {
     for (int i = 0; i < n_experts; i++) {
       s->router_score[i] += b_router[i];
     }
+
+    // for (int i = 0; i < n_experts; i++) {
+    //   printf("score[%d] = %f\n", i, s->router_score[i]);
+    // }
+
     // Select top-k experts
     topk(s->topk_v, s->topk_i, s->router_score, n_experts, p->experts_per_token);
     // Normalize selected experts using softmax or sigmoid
     softmax(s->topk_v, p->experts_per_token);  // expert
+
+    // for (int i = 0; i < p->experts_per_token; i++) {
+    //   printf("topk_i[%d] = %d\n", i, s->topk_i[i]);
+    //   printf("topk_v[%d] = %f\n", i, s->topk_v[i]);
+    // }
 
     // Route the tokens to their corresponding top-k experts
     memset(s->e_agg, 0, hidden_dim * sizeof(float));
@@ -727,6 +746,10 @@ float *forward(Transformer *transformer, int token, int pos) {
       }
     }
 
+    // for (int i = 0; i < 10; i++) {
+    //   printf("e_agg[%d] = %f\n", i, s->e_agg[i]);
+    // }
+
     // residual connection
     for (int i = 0; i < hidden_dim; i++) {
       x[i] += s->e_agg[i];
@@ -734,9 +757,16 @@ float *forward(Transformer *transformer, int token, int pos) {
   }
   // final rmsnorm
   rmsnorm(x, x, w->rms_out_w, hidden_dim);
+  for (int i = 0; i < 10; i++) {
+    printf("x[%d] = %f\n", i, s->x[i]);
+  }
 
   // classifier into logits
   matmul(s->logits, x, w->out, hidden_dim, p->vocab_size);
+  // for (int i = 0; i < 15; i++) {
+  //   printf("logits[%d] = %f\n", i, s->logits[i]);
+  // }
+
   return s->logits;
 }
 

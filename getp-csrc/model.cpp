@@ -265,28 +265,26 @@ float *hip_forward(DeviceTransformerWeights *w, DeviceRunState *rs, Config *conf
 
   // 1. Embedding lookup
   EmbeddingLookupGPU(w->token_embedding_table, token, rs->x, hidden_dim, stream);
-  // printf("Done step 1\n");
 
   for (int l = 0; l < config->n_layers; l++) {
-    const float *w_rms_attn = w->rms_attn_w + (size_t)l * hidden_dim;
+    const float *w_rms_attn = w->rms_attn_w + 1ll * l * hidden_dim;
     const float *w_qkv =
-      w->w_qkv + (size_t)l * hidden_dim * (head_dim * (n_q_heads + 2 * n_kv_heads));
-    const float *b_qkv = w->b_qkv + (size_t)l * (head_dim * (n_q_heads + 2 * n_kv_heads));
-    const float *w_o = w->w_o + (size_t)l * (head_dim * n_q_heads) * hidden_dim;
-    const float *b_o = w->b_o + (size_t)l * hidden_dim;
-    const float *attn_sinks = w->attn_sinks + (size_t)l * n_q_heads;
+      w->w_qkv + 1ll * l * hidden_dim * (head_dim * n_q_heads + 2 * head_dim * n_kv_heads);
+    const float *b_qkv = w->b_qkv + 1ll * l * (head_dim * n_q_heads + 2 * head_dim * n_kv_heads);
+    const float *w_o = w->w_o + 1ll * l * (head_dim * n_q_heads) * hidden_dim;
+    const float *b_o = w->b_o + 1ll * l * hidden_dim;
+    const float *attn_sinks = w->attn_sinks + 1ll * l * n_q_heads;
 
     // 2. Pre-attention RMSNorm
     RMSNormGPU(rs->x, w_rms_attn, rs->t, hidden_dim, 1e-5f, stream);
-    // printf("Done step 2 - layer: %d\n", l);
 
-    // CHECK_HIP(hipStreamSynchronize(stream));
-    // float *h_buffer = (float *)malloc(hidden_dim * sizeof(float));
-    // CHECK_HIP(hipMemcpy(h_buffer, rs->t, hidden_dim * sizeof(float), hipMemcpyDeviceToHost));
+    CHECK_HIP(hipStreamSynchronize(stream));
+    float *h_buffer = (float *)malloc(hidden_dim * sizeof(float));
+    CHECK_HIP(hipMemcpy(h_buffer, rs->t, hidden_dim * sizeof(float), hipMemcpyDeviceToHost));
 
-    // for (int i = 0; i < 10; i++) {
-    //   printf("t[%d] = %f\n", i, h_buffer[i]);
-    // }
+    for (int i = 0; i < 10; i++) {
+      printf("t[%d] = %f\n", i, h_buffer[i]);
+    }
 
     // 3. Compute Q, K, V
     // w_qkv (head_dim * (n_attn_head + 2 * n_kv_head), hidden_dim) @ rs->t (hidden_dim, ) + b_qkv => rs->qkv
@@ -302,45 +300,41 @@ float *hip_forward(DeviceTransformerWeights *w, DeviceRunState *rs, Config *conf
     //   printf("qkv[%d] = %f\n", i, h_buffer[i]);
     // }
 
-    // printf("Done step 3 - layer: %d\n", l);
-
     // 4. Split QKV and RoPE
-    const size_t loff = (size_t)l * config->seq_len * kv_dim;  // layer offset in KV cache
-    float *k_pos = rs->key_cache + loff + (size_t)pos * kv_dim;
-    float *v_pos = rs->value_cache + loff + (size_t)pos * kv_dim;
+    const int loff = l * config->seq_len * kv_dim;  // layer offset in KV cache
+    float *k_pos = rs->key_cache + loff + pos * kv_dim;
+    float *v_pos = rs->value_cache + loff + pos * kv_dim;
 
-    const float *rope_cos_pos = d_rope_cos + (size_t)pos * (head_dim / 2);
-    const float *rope_sin_pos = d_rope_sin + (size_t)pos * (head_dim / 2);
+    const float *rope_cos_pos = d_rope_cos + pos * (head_dim / 2);
+    const float *rope_sin_pos = d_rope_sin + pos * (head_dim / 2);
 
     QKVEpilogueSplitRoPECacheGPU(rs->qkv, rs->q, k_pos, v_pos, rope_cos_pos, rope_sin_pos, head_dim,
                                  n_q_heads, n_kv_heads, stream);
 
-    int q_dim = n_q_heads * head_dim;
-    CHECK_HIP(hipStreamSynchronize(stream));
-    float *q_buffer = (float *)malloc(q_dim * sizeof(float));
-    float *k_buffer = (float *)malloc(kv_dim * sizeof(float));
-    float *v_buffer = (float *)malloc(kv_dim * sizeof(float));
+    // int q_dim = n_q_heads * head_dim;
+    // CHECK_HIP(hipStreamSynchronize(stream));
+    // float *q_buffer = (float *)malloc(q_dim * sizeof(float));
+    // float *k_buffer = (float *)malloc(kv_dim * sizeof(float));
+    // float *v_buffer = (float *)malloc(kv_dim * sizeof(float));
 
-    CHECK_HIP(hipMemcpy(q_buffer, rs->q, q_dim * sizeof(float), hipMemcpyDeviceToHost));
-    CHECK_HIP(hipMemcpy(k_buffer, k_pos, kv_dim * sizeof(float), hipMemcpyDeviceToHost));
-    CHECK_HIP(hipMemcpy(v_buffer, v_pos, kv_dim * sizeof(float), hipMemcpyDeviceToHost));
+    // CHECK_HIP(hipMemcpy(q_buffer, rs->q, q_dim * sizeof(float), hipMemcpyDeviceToHost));
+    // CHECK_HIP(hipMemcpy(k_buffer, k_pos, kv_dim * sizeof(float), hipMemcpyDeviceToHost));
+    // CHECK_HIP(hipMemcpy(v_buffer, v_pos, kv_dim * sizeof(float), hipMemcpyDeviceToHost));
 
-    printf("Q vector (10 elements):\n");
-    for (int i = 0; i < 10; i++) {
-      printf("\tq[%d] = %f\n", i, q_buffer[i]);
-    }
+    // printf("Q vector (10 elements):\n");
+    // for (int i = 0; i < 10; i++) {
+    //   printf("\tq[%d] = %f\n", i, q_buffer[i]);
+    // }
 
-    printf("K vector (10 elements):\n");
-    for (int i = 0; i < 10; i++) {
-      printf("\tk[%d] = %f\n", i, k_buffer[i]);
-    }
+    // printf("K vector (10 elements):\n");
+    // for (int i = 0; i < 10; i++) {
+    //   printf("\tk[%d] = %f\n", i, k_buffer[i]);
+    // }
 
-    printf("V vector (10 elements):\n");
-    for (int i = 0; i < 10; i++) {
-      printf("\tv[%d] = %f\n", i, v_buffer[i]);
-    }
-
-    // printf("Done step 4 - layer: %d\n", l);
+    // printf("V vector (10 elements):\n");
+    // for (int i = 0; i < 10; i++) {
+    //   printf("\tv[%d] = %f\n", i, v_buffer[i]);
+    // }
 
     // 5. Multi-Head Attention
     const float *k_cache = rs->key_cache + loff;
@@ -351,21 +345,34 @@ float *hip_forward(DeviceTransformerWeights *w, DeviceRunState *rs, Config *conf
     SingleQueryAttentionGPU(rs->q, k_cache, v_cache, mask_row, attn_sinks, rs->tb, head_dim,
                             n_q_heads, n_q_heads / n_kv_heads, kv_dim, pos + 1, pos, stream);
 
-    // printf("Done step 5 - layer: %d\n", l);
+    // int tb_dim = head_dim * n_q_heads;
+    // CHECK_HIP(hipStreamSynchronize(stream));
+    // float *h_buffer = (float *)malloc(tb_dim * sizeof(float));
+    // CHECK_HIP(hipMemcpy(h_buffer, rs->tb, tb_dim * sizeof(float), hipMemcpyDeviceToHost));
+
+    // for (int i = 0; i < 10; i++) {
+    //   printf("tb[%d] = %f\n", i, h_buffer[i]);
+    // }
 
     // 6. Post-attention Linear and residual
     // rs->x += w_o * rs->tb + b_o
     LinearBiasResidualGPU(w_o, rs->tb, b_o, rs->x, head_dim * n_q_heads, hidden_dim, stream);
 
-    // printf("Done step 6 - layer: %d\n", l);
+    // CHECK_HIP(hipStreamSynchronize(stream));
+    // float *h_buffer = (float *)malloc(hidden_dim * sizeof(float));
+    // CHECK_HIP(hipMemcpy(h_buffer, rs->x, hidden_dim * sizeof(float), hipMemcpyDeviceToHost));
+
+    // for (int i = 0; i < 10; i++) {
+    //   printf("x[%d] = %f\n", i, h_buffer[i]);
+    // }
 
     // --- MOE FFN BLOCK ---
 
     // Tính toán con trỏ offset cho FFN/MoE của layer hiện tại (l)
-    const float *w_rms_ffn = w->rms_ffn_w + (size_t)l * hidden_dim;
-    const float *w_router = w->w_router + (size_t)l * hidden_dim * n_experts;
-    const float *b_router = w->b_router + (size_t)l * n_experts;
-    const bf16 *w_mlp1 = w->w_mlp1;  // Base pointer, MoE kernel sẽ tự tính offset
+    const float *w_rms_ffn = w->rms_ffn_w + 1ll * l * hidden_dim;
+    const float *w_router = w->w_router + 1ll * l * hidden_dim * n_experts;
+    const float *b_router = w->b_router + 1ll * l * n_experts;
+    const bf16 *w_mlp1 = w->w_mlp1;
     const bf16 *b_mlp1 = w->b_mlp1;
     const bf16 *w_mlp2 = w->w_mlp2;
     const bf16 *b_mlp2 = w->b_mlp2;
@@ -381,17 +388,34 @@ float *hip_forward(DeviceTransformerWeights *w, DeviceRunState *rs, Config *conf
     //   printf("t[%d] = %f\n", i, h_buffer[i]);
     // }
 
-    // printf("Done step 7 - layer: %d\n", l);
-
     // 8. Router GEMM: Tính điểm cho các expert
     RouterGemmGPU(w_router, rs->t, b_router, rs->router_score, hidden_dim, n_experts, stream);
+    // float *h_buffer = (float *)malloc(n_experts * sizeof(float));
 
-    // printf("Done step 8 - layer: %d\n", l);
+    // CHECK_HIP(hipStreamSynchronize(stream));
+    // CHECK_HIP(
+    //   hipMemcpy(h_buffer, rs->router_score, n_experts * sizeof(float), hipMemcpyDeviceToHost));
+
+    // for (int i = 0; i < n_experts; i++) {
+    //   printf("score[%d] = %f\n", i, h_buffer[i]);
+    // }
 
     // 9. Top-K + Softmax
     TopKSoftmaxGPU(rs->router_score, n_experts, experts_per_token, rs->topk_v, rs->topk_i, stream);
 
-    // printf("Done step 9 - layer: %d\n", l);
+    // float *topk_v_buffer = (float *)malloc(experts_per_token * sizeof(float));
+    // int *topk_i_buffer = (int *)malloc(experts_per_token * sizeof(int));
+
+    // CHECK_HIP(hipStreamSynchronize(stream));
+    // CHECK_HIP(
+    //   hipMemcpy(topk_i_buffer, rs->topk_i, experts_per_token * sizeof(int), hipMemcpyDeviceToHost));
+    // CHECK_HIP(hipMemcpy(topk_v_buffer, rs->topk_v, experts_per_token * sizeof(float),
+    //                     hipMemcpyDeviceToHost));
+
+    // for (int i = 0; i < experts_per_token; i++) {
+    //   printf("topk_i[%d] = %d\n", i, topk_i_buffer[i]);
+    //   printf("topk_v[%d] = %f\n", i, topk_v_buffer[i]);
+    // }
 
     size_t layer_w1_offset = 1ll * l * n_experts * (2 * intermediate_dim) * hidden_dim;
     size_t layer_b1_offset = 1ll * l * n_experts * (2 * intermediate_dim);
@@ -409,25 +433,40 @@ float *hip_forward(DeviceTransformerWeights *w, DeviceRunState *rs, Config *conf
                     rs->topk_i, rs->topk_v, rs->mlp1_out, rs->e_agg, hidden_dim, intermediate_dim,
                     experts_per_token, config->swiglu_limit, stream);
 
-    // printf("Done step 10 - layer: %d\n", l);
+    // float *h_buffer = (float *)malloc(hidden_dim * sizeof(float));
+    // CHECK_HIP(hipStreamSynchronize(stream));
+    // CHECK_HIP(hipMemcpy(h_buffer, rs->e_agg, hidden_dim * sizeof(int), hipMemcpyDeviceToHost));
+
+    // for (int i = 0; i < 10; i++) {
+    //   printf("e_agg[%d] = %f\n", i, rs->e_agg[i]);
+    // }
 
     // 11. Kết nối residual cuối cùng của layer
     // rs->x += rs->e_agg
     AddVectorGPU(rs->x, rs->e_agg, hidden_dim, stream);
-
-    // printf("Done step 11 - layer: %d\n", l);
   }
   // --- FINAL CLASSIFIER ---
 
-  // 12. Final RMSNorm (in-place)
-  RMSNormInplaceGPU(rs->x, w->rms_out_w, hidden_dim, 1e-5f, stream);
+  // 12. Final RMSNorm
+  RMSNormGPU(rs->x, w->rms_out_w, rs->x, hidden_dim, 1e-5f, stream);
+  CHECK_HIP(hipStreamSynchronize(stream));
+  float *h_buffer = (float *)malloc(hidden_dim * sizeof(float));
+  CHECK_HIP(hipMemcpy(h_buffer, rs->x, hidden_dim * sizeof(float), hipMemcpyDeviceToHost));
 
-  // printf("Done step 12\n");
+  // for (int i = 0; i < 10; i++) {
+  //   printf("x[%d] = %f\n", i, h_buffer[i]);
+  // }
 
   // 13. Classifier GEMM: Tính toán logits cuối cùng
   ClassifierGemmGPU(w->out, rs->x, rs->logits, hidden_dim, config->vocab_size, stream);
 
-  // printf("Done step 13\n");
+  // float *h_buffer = (float *)malloc(config->vocab_size * sizeof(float));
+  // CHECK_HIP(hipStreamSynchronize(stream));
+  // CHECK_HIP(
+  //   hipMemcpy(h_buffer, rs->logits, config->vocab_size * sizeof(float), hipMemcpyDeviceToHost));
+  // for (int i = 0; i < 15; i++) {
+  //   printf("logits[%d] = %f\n", i, h_buffer[i]);
+  // }
 
   // Trả về con trỏ device tới logits
   return rs->logits;

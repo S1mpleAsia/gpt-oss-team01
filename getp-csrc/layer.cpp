@@ -18,6 +18,7 @@ __global__ void AddVector_kernel(float *x, const float *y, int n) {
     x[i] += y[i];
   }
 }
+
 void AddVectorGPU(float *x, const float *y, int n, hipStream_t stream) {
   dim3 block_dim(256);
   dim3 grid_dim((n + block_dim.x - 1) / block_dim.x);
@@ -73,7 +74,7 @@ __global__ void rmsnorm_kernel_double_precision(const float *x, const float *w, 
   // Vòng lặp tính tổng bình phương của mỗi thread
   for (int j = tid; j < hidden_dim; j += block_size) {
     float v = x_row[j];
-    acc += (double)v * v;  // Ép kiểu để phép nhân và cộng thực hiện ở double
+    acc += v * v;  // Ép kiểu để phép nhân và cộng thực hiện ở double
   }
 
   // --- THAY ĐỔI 2: Dùng shared memory cho toàn bộ quá trình reduction ---
@@ -92,18 +93,19 @@ __global__ void rmsnorm_kernel_double_precision(const float *x, const float *w, 
 
   // --- THAY ĐỔI 3: Chỉ thread 0 tính toán kết quả cuối cùng ---
   // Tạo một biến shared để lưu kết quả và chia sẻ cho các thread khác
-  __shared__ float final_inv_rms;
+  __shared__ double final_inv_rms;
   if (tid == 0) {
     double block_sum = s_partials[0];
     double mean = block_sum / hidden_dim;
-    final_inv_rms = rsqrtf((float)mean + eps);
+    mean = mean + 1e-5f;
+    final_inv_rms = 1.0f / sqrtf(mean);
   }
   __syncthreads();  // Đảm bảo mọi thread đều thấy giá trị final_inv_rms
 
   // --- THAY ĐỔI 4: Tất cả các thread áp dụng chuẩn hóa ---
   // Mỗi thread đọc giá trị inv_rms từ shared memory và thực hiện phép tính
   for (int j = tid; j < hidden_dim; j += block_size) {
-    o_row[j] = w_row[j] * (x_row[j] * final_inv_rms);
+    o_row[j] = w_row[j] * (final_inv_rms * x_row[j]);
   }
 }
 
@@ -262,12 +264,11 @@ __global__ void LinearBiasResidual_kernel(const float *W, const float *x, const 
   }
 }
 
-void LinearBiasResidualGPU(const float *W, const float *x, const float *b_or_null,
-                           float *x_resid_inout, int in_features, int out_features,
-                           hipStream_t stream) {
+void LinearBiasResidualGPU(const float *W, const float *x, const float *bias, float *x_resid_inout,
+                           int in_features, int out_features, hipStream_t stream) {
   dim3 block_dim(DEFAULT_BLOCK_SIZE);
   dim3 grid_dim((out_features + block_dim.x - 1) / block_dim.x);
-  LinearBiasResidual_kernel<<<grid_dim, block_dim, 0, stream>>>(W, x, b_or_null, x_resid_inout,
+  LinearBiasResidual_kernel<<<grid_dim, block_dim, 0, stream>>>(W, x, bias, x_resid_inout,
                                                                 in_features, out_features);
 }
 
@@ -401,73 +402,59 @@ __global__ void attention_kernel(const float *q, const float *K_cache, const flo
                                  const float *attn_sinks,  // Con trỏ tới mảng các sink
                                  float *tb, int head_dim, int n_q, int kv_mul, int kv_dim,
                                  int seq_len /* pos + 1 */) {
-  // Mỗi block xử lý một query head
   int head_idx = blockIdx.x;
   if (head_idx >= n_q)
     return;
 
-  // Lấy giá trị sink dành riêng cho head này
   const float attn_sink = attn_sinks[head_idx];
-
   const float *q_head = q + head_idx * head_dim;
   float *tb_head = tb + head_idx * head_dim;
 
-  // Kích thước shared memory cần là (seq_len + 1) cho scores+sink và head_dim cho output
-  extern __shared__ float s_data[];
-  float *s_scores = s_data;
-  float *s_output = &s_data[seq_len + 1];
+  extern __shared__ char s_data[];
+  float *s_scores = (float *)s_data;
+  double *s_output = (double *)(s_data + ((size_t)seq_len + 1) * sizeof(float));
 
-  // SỬA LỖI GQA: dùng phép chia số nguyên
   int kv_head_idx = head_idx / kv_mul;
-
-  // Step 1: Tính scores = q_head * K_cache[t] / sqrt(head_dim)
   float scale = rsqrtf((float)head_dim);
+
   for (int t = threadIdx.x; t < seq_len; t += blockDim.x) {
     const float *k_vec = K_cache + (size_t)t * kv_dim + (size_t)kv_head_idx * head_dim;
-    float score = 0.0f;
+
+    double score = 0.0f;
     for (int i = 0; i < head_dim; i++) {
-      score += q_head[i] * k_vec[i];
+      score += (double)q_head[i] * k_vec[i];
     }
     score *= scale;
 
-    // THÊM MASK
     if (mask_row != nullptr) {
       score += mask_row[t];
     }
-    s_scores[t] = score;
+    s_scores[t] = (float)score;
   }
   __syncthreads();
 
-  // Step 2: Softmax (vẫn là single-thread, nên được tối ưu bằng parallel reduction)
   if (threadIdx.x == 0) {
-    // THÊM ATTN SINK vào cuối
     s_scores[seq_len] = attn_sink;
-
     int softmax_len = seq_len + 1;
 
-    // Tìm max score để tính softmax ổn định
-    float max_score = -FLT_MAX;
+    double max_score = -DBL_MAX;
     for (int t = 0; t < softmax_len; t++) {
       if (s_scores[t] > max_score) {
         max_score = s_scores[t];
       }
     }
 
-    // Tính mẫu số (denominator) của softmax
-    float denom = 0.0f;
+    double denom = 0.0;
     for (int t = 0; t < softmax_len; t++) {
-      s_scores[t] = expf(s_scores[t] - max_score);
+      s_scores[t] = expf(s_scores[t] - (float)max_score);
       denom += s_scores[t];
     }
 
-    // Khởi tạo output
     for (int i = 0; i < head_dim; i++)
-      s_output[i] = 0.0f;
+      s_output[i] = 0.0;
 
-    // Step 3: Tích lũy V (weighted sum)
-    // Vòng lặp này chỉ chạy đến seq_len vì sink không có vector V tương ứng
     for (int t = 0; t < seq_len; t++) {
-      float prob = s_scores[t] / denom;
+      double prob = (double)s_scores[t] / denom;
       const float *v_vec = V_cache + (size_t)t * kv_dim + (size_t)kv_head_idx * head_dim;
       for (int i = 0; i < head_dim; i++) {
         s_output[i] += prob * v_vec[i];
@@ -478,71 +465,7 @@ __global__ void attention_kernel(const float *q, const float *K_cache, const flo
 
   // Step 4: Ghi kết quả ra global memory
   for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-    tb_head[i] = s_output[i];
-  }
-}
-
-__global__ void SingleQueryAttention_kernel(const float *q, const float *K_cache,
-                                            const float *V_cache, float *tb, int head_dim, int n_q,
-                                            int kv_dim, int seq_len) {
-  // Mỗi block xử lý một query head
-  int head_idx = blockIdx.x;
-  if (head_idx >= n_q)
-    return;
-
-  const float *q_head = q + head_idx * head_dim;
-  float *tb_head = tb + head_idx * head_dim;
-
-  // shared memory để lưu scores và kết quả V tích lũy
-  extern __shared__ float s_data[];
-  float *s_scores = s_data;            // size: seq_len
-  float *s_output = &s_data[seq_len];  // size: head_dim
-
-  // Step 1: Tính scores = q_head * K_cache[t] / sqrt(head_dim)
-  float scale = rsqrtf((float)head_dim);
-  for (int t = threadIdx.x; t < seq_len; t += blockDim.x) {
-    const float *k_vec = K_cache + t * kv_dim + (head_idx % (kv_dim / head_dim)) * head_dim;
-    float score = 0.0f;
-    for (int i = 0; i < head_dim; i++) {
-      score += q_head[i] * k_vec[i];
-    }
-    s_scores[t] = score * scale;
-  }
-  __syncthreads();
-
-  if (threadIdx.x == 0) {
-    float max_score = -FLT_MAX;
-    for (int t = 0; t < seq_len; t++) {
-      if (s_scores[t] > max_score) {
-        max_score = s_scores[t];
-      }
-    }
-
-    // Tính mẫu số (denominator) của softmax
-    float denom = 0.0f;
-    for (int t = 0; t < seq_len; t++) {
-      s_scores[t] = expf(s_scores[t] - max_score);  // Lưu lại tử số
-      denom += s_scores[t];
-    }
-
-    // Khởi tạo output
-    for (int i = 0; i < head_dim; i++)
-      s_output[i] = 0.0f;
-
-    // Step 3: Tích lũy V
-    for (int t = 0; t < seq_len; t++) {
-      float prob = s_scores[t] / denom;
-      const float *v_vec = V_cache + t * kv_dim + (head_idx % (kv_dim / head_dim)) * head_dim;
-      for (int i = 0; i < head_dim; i++) {
-        s_output[i] += prob * v_vec[i];
-      }
-    }
-  }
-  __syncthreads();
-
-  // Step 4: Ghi kết quả ra global memory
-  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-    tb_head[i] = s_output[i];
+    tb_head[i] = (float)s_output[i];
   }
 }
 
@@ -553,7 +476,8 @@ void SingleQueryAttentionGPU(const float *q, const float *K_cache, const float *
   dim3 grid_dim(n_q);
   dim3 block_dim(256);
 
-  size_t shared_mem_size = ((size_t)seq_len + 1 + head_dim) * sizeof(float);
+  size_t shared_mem_size =
+    ((size_t)seq_len + 1) * sizeof(float) + (size_t)head_dim * sizeof(double);
 
   attention_kernel<<<grid_dim, block_dim, shared_mem_size, stream>>>(
     q, K_cache, V_cache, mask_row, attn_sink_per_head, tb, head_dim, n_q, kv_mul, kv_dim, seq_len);
@@ -565,71 +489,80 @@ void SingleQueryAttentionGPU(const float *q, const float *K_cache, const float *
 
 __global__ void TopKSoftmax_kernel(const float *r, int n_experts, int k, float *topk_vals,
                                    int *topk_idx) {
-  // Naive: dùng một block duy nhất để tìm Top-K
-  if (threadIdx.x != 0)
+  if (threadIdx.x != 0 || blockIdx.x != 0)
     return;
 
-  // Tạm thời dùng mảng tĩnh, giả sử n_experts không quá lớn
-  float temp_vals[32];
-  int temp_idx[32];
+  extern __shared__ char s_data[];
+  float *temp_vals = (float *)s_data;
+  int *temp_idx = (int *)(s_data + n_experts * sizeof(float));
 
+  // Copy input data to shared memory
   for (int i = 0; i < n_experts; ++i) {
     temp_vals[i] = r[i];
     temp_idx[i] = i;
   }
 
-  // Simple selection sort
+  // Partial selection sort for top-k (MORE EFFICIENT)
   for (int i = 0; i < k; ++i) {
     int max_idx = i;
+    // Find maximum in the remaining portion [i, n_experts)
     for (int j = i + 1; j < n_experts; ++j) {
       if (temp_vals[j] > temp_vals[max_idx]) {
         max_idx = j;
       }
     }
-    // Swap
-    float t_v = temp_vals[i];
-    temp_vals[i] = temp_vals[max_idx];
-    temp_vals[max_idx] = t_v;
-    int t_i = temp_idx[i];
-    temp_idx[i] = temp_idx[max_idx];
-    temp_idx[max_idx] = t_i;
+    // Swap position i with the maximum found
+    if (max_idx != i) {
+      // Swap values
+      float temp_val = temp_vals[i];
+      temp_vals[i] = temp_vals[max_idx];
+      temp_vals[max_idx] = temp_val;
+
+      // Swap indices
+      int temp_index = temp_idx[i];
+      temp_idx[i] = temp_idx[max_idx];
+      temp_idx[max_idx] = temp_index;
+    }
   }
 
-  // Tính softmax cho K giá trị top
-  float max_val = temp_vals[0];
-  float denom = 0.0f;
-  for (int i = 0; i < k; ++i) {
-    denom += expf(temp_vals[i] - max_val);
+  // Apply softmax to top-k values
+  double max_val = -DBL_MAX;
+  if (k > 0) {
+    max_val = temp_vals[0];
   }
 
+  double denom = 0.0;
   for (int i = 0; i < k; ++i) {
-    topk_vals[i] = expf(temp_vals[i] - max_val) / denom;
+    denom += expf(temp_vals[i] - (float)max_val);
+  }
+
+  // Output results
+  for (int i = 0; i < k; ++i) {
+    topk_vals[i] = expf(temp_vals[i] - (float)max_val) / (float)denom;
     topk_idx[i] = temp_idx[i];
   }
 }
 
 void TopKSoftmaxGPU(const float *r, int n_experts, int k, float *topk_vals, int *topk_idx,
                     hipStream_t stream) {
-  TopKSoftmax_kernel<<<1, 1, 0, stream>>>(r, n_experts, k, topk_vals, topk_idx);
+  size_t shared_mem_size = (size_t)n_experts * (sizeof(float) + sizeof(int));
+  TopKSoftmax_kernel<<<1, 1, shared_mem_size, stream>>>(r, n_experts, k, topk_vals, topk_idx);
+  CHECK_HIP(hipGetLastError());
 }
 
 __global__ void SwiGLU_kernel(const float *interleaved_in, float *swiglu_out, int inter_dim,
                               float clamp_limit) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < inter_dim) {
-    // SỬA LỖI: Đọc dữ liệu từ layout xen kẽ [g0, u0, g1, u1, ...]
     float gate_val = interleaved_in[2 * i];
     float up_val = interleaved_in[2 * i + 1];
 
-    const float alpha = 1.702f;  // Hệ số alpha từ code CPU
-
-    // --- Áp dụng đúng logic từ CPU version ---
+    const float alpha = 1.702f;
 
     // 1. Clamping
     if (clamp_limit > 0.0f) {
       if (gate_val > clamp_limit)
         gate_val = clamp_limit;
-      // CPU không clamp cận dưới cho gate, chỉ clamp cận trên.
 
       if (up_val > clamp_limit)
         up_val = clamp_limit;
@@ -637,10 +570,8 @@ __global__ void SwiGLU_kernel(const float *interleaved_in, float *swiglu_out, in
         up_val = -clamp_limit;
     }
 
-    // 2. Tính toán SILU với alpha
     float silu_val = gate_val * (1.0f / (1.0f + expf(-alpha * gate_val)));
 
-    // 3. Nhân với (up + 1.0)
     swiglu_out[i] = silu_val * (up_val + 1.0f);
   }
 }
@@ -740,19 +671,4 @@ void MoEApplyTopKGPU(const float *t, const bf16 *W1, const bf16 *b1, const bf16 
   // Giải phóng bộ nhớ tạm
   CHECK_HIP(hipFree(work_swiglu));
   CHECK_HIP(hipFree(expert_output));
-}
-
-//================================================================================================
-// 9. Final RMSNorm (In-place)
-//================================================================================================
-
-// Hàm này có thể tái sử dụng kernel RMSNorm đã viết ở phần trước,
-// vì kernel đó nhận con trỏ input và output riêng biệt.
-// Ta chỉ cần truyền cùng một con trỏ cho cả hai là được.
-void RMSNormInplaceGPU(float *x, const float *scale, int hidden_dim, float eps,
-                       hipStream_t stream) {
-  dim3 block_dim(DEFAULT_BLOCK_SIZE);
-  dim3 grid_dim(1);
-  // Truyền `x` cho cả input `x` và output `out` của kernel
-  RMSNorm_kernel<<<grid_dim, block_dim, 0, stream>>>(x, scale, x, hidden_dim, eps);
 }
