@@ -1,19 +1,19 @@
 // TODO: Modify this file to optimize end-to-end throughput
 #include "getp_eval.cpp"
 
-#include "tensor.cpp"
-#include "tensor.hpp"
-#include "layer.cpp"
-#include "layer.hpp"
-#include "layer_hip.cpp"
-#include "layer_hip.hpp"
-#include "model.cpp"
-#include "model.hpp"
-#include "alloc.cpp"
-#include "alloc.hpp"
-#include "utils.cpp"
-#include "utils.hpp"
-#include "config.hpp"
+#include "src/tensor.cpp"
+#include "include/tensor.hpp"
+#include "src/layer.cpp"
+#include "include/layer.hpp"
+#include "src/layer_hip.cpp"
+#include "include/layer_hip.hpp"
+#include "src/model.cpp"
+#include "include/model.hpp"
+#include "src/alloc.cpp"
+#include "include/alloc.hpp"
+#include "src/utils.cpp"
+#include "include/utils.hpp"
+#include "include/config.hpp"
 
 #ifndef GETP_RUN
 #define GETP_RUN

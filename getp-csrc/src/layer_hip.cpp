@@ -1,4 +1,4 @@
-#include "layer_hip.hpp"
+#include "../include/layer_hip.hpp"
 #include <cmath>
 #include <cfloat>
 

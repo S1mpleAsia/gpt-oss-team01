@@ -1,5 +1,5 @@
 // tensor.cpp
-#include "tensor.hpp"
+#include "../include/tensor.hpp"
 #include <stdexcept>
 
 Tensor::Tensor(const vector<size_t> &shape_, DType::Type dtype) 
