@@ -4,8 +4,18 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <hip/hip_bfloat16.h>
 
 using std::vector;
+
+typedef hip_bfloat16 bf16;
+
+struct DType {
+  enum Type {
+    FP32,
+    BF16
+  };
+};
 
 /* Macro for checking CUDA errors */
 #define CHECK_HIP(call)                                                        \
@@ -26,9 +36,11 @@ struct Tensor {
   vector<size_t> shape;
   //   size_t shape[5] = {1, 1, 1, 1, 1};
   float *buf = nullptr;
+  float *d_buf = nullptr;
+  bf16 *d_buf_bf16 = nullptr;
 
   Tensor(const vector<size_t> &shape_);
-  Tensor(const vector<size_t> &shape_, float *buf_, bool malloc_new);
+  Tensor(const vector<size_t> &shape_, float *buf_);
   ~Tensor();
 
   size_t num_elem() const;

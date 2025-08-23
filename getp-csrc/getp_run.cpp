@@ -7,9 +7,16 @@
 #include "layer.hpp"
 #include "model.cpp"
 #include "model.hpp"
+#include "alloc.cpp"
+#include "alloc.hpp"
+#include "config.hpp"
 
 #ifndef GETP_RUN
 #define GETP_RUN
+
+OurTransformerWeights *weights;
+OurRunState *rs;
+Config *p;
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // Do not inference here
@@ -18,7 +25,10 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // - Memory allocation
   // - Load model
   // - ...
-  our_init(transformer);
+  weights = new OurTransformerWeights;
+  rs = new OurRunState;
+  p = &transformer->config;
+  our_init(transformer, weights, rs);
 }
 
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
@@ -28,7 +38,8 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
   // - Memory deallocation
   // - Unload model
   // - ...
-  our_free();
+  our_free(weights, rs);
+  delete weights; delete rs;
 }
 
 long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
@@ -67,7 +78,8 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   while (pos < steps) {
 
     // forward the transformer to get logits for the next token
-    float *logits = our_forward(transformer, token, pos);
+    float *logits = our_forward(p, weights, rs, token, pos);
+    // float *logits = forward(transformer, token, pos);
 
     printf("logits: ");
     for (int i=0; i<5; i++) {

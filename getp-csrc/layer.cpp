@@ -145,54 +145,105 @@ void our_compute_concentration_and_inv_freq(float base, int head_dim,
     free(freq);
 }
 
-// cos/sin computation for RoPE at pos
-void RopeComputeCS(int pos, const Config &p, Tensor *cos_out /*[head_dim/2]*/,
-                   Tensor *sin_out /*[head_dim/2]*/) {
-    int d_half = cos_out->num_elem();
-    float base = p.rope_theta;
-    int head_dim = d_half * 2;
-    float scaling_factor = p.rope_scaling_factor;
-    float initial_context_length = p.initial_context_length;
+/**
+ * @brief Pre-computes the RoPE cos/sin values for ALL positions.
+ *
+ * This function iterates from position 0 to seq_len-1, calculating the
+ * rotary embeddings for each position and storing them in the output tensors.
+ * The output tensors are treated as 2D arrays of shape [seq_len, head_dim/2]
+ * but are stored contiguously in a 1D buffer (row-major order).
+ *
+ * @param p Configuration parameters.
+ * @param cos_all_out Output tensor for cosine values. Must be pre-allocated with
+ * size = seq_len * (head_dim / 2).
+ * @param sin_all_out Output tensor for sine values. Must be pre-allocated with
+ * size = seq_len * (head_dim / 2).
+ */
+void RopePrecomputeCS(Config *p, Tensor *cos_all_out, Tensor *sin_all_out) {
+    int seq_len = p->seq_len;
+    int head_dim = p->head_dim;
+    int d_half = head_dim / 2;
+
+    // --- These parameters are position-independent ---
+    float base = p->rope_theta;
+    float scaling_factor = p->rope_scaling_factor;
+    float initial_context_length = p->initial_context_length;
     float ntk_beta = 32.0f;
     float ntk_alpha = 1.0f;
 
-    // Get concentration + inv_freq
+    // Get concentration + inv_freq once, as they don't depend on the position
     float concentration;
     float *inv_freq = (float *)malloc(d_half * sizeof(float));
-
     our_compute_concentration_and_inv_freq(base, head_dim, scaling_factor,
-                                        initial_context_length, ntk_beta,
-                                        ntk_alpha, &concentration, inv_freq);
+                                           initial_context_length, ntk_beta,
+                                           ntk_alpha, &concentration, inv_freq);
 
-    // Compute cos and sin for this position
-    for (int j = 0; j < d_half; j++) {
-        float val = (float)pos * inv_freq[j];
-        cos_out->buf[j] = cosf(val) * concentration;
-        sin_out->buf[j] = sinf(val) * concentration;
+    // --- Loop over all positions to pre-compute the values ---
+    for (int pos = 0; pos < seq_len; pos++) {
+        // Loop over each dimension of the embedding
+        for (int j = 0; j < d_half; j++) {
+            // Calculate the angle for this position and dimension
+            float val = (float)pos * inv_freq[j];
+
+            // Map the 2D index (pos, j) to a 1D index in the buffer
+            int index = pos * d_half + j;
+
+            // Compute and store the final cos and sin values
+            cos_all_out->buf[index] = cosf(val) * concentration;
+            sin_all_out->buf[index] = sinf(val) * concentration;
+        }
     }
 
-    free(inv_freq);                    
+    free(inv_freq);
 }
 
-// RoPE (n_heads * head_dim)
-void ApplyRotary(Tensor *x /*[n_heads*hd]*/, const Tensor *cos /*[hd/2]*/,
-                 const Tensor *sin /*[hd/2]*/, int n_heads, int head_dim) {
+/**
+ * @brief Applies Rotary Positional Embeddings (RoPE) to an input tensor.
+ *
+ * This version uses pre-computed RoPE tables for all positions. The `pos`
+ * argument is used as an offset to look up the correct cos/sin values
+ * for the current token from these tables.
+ *
+ * @param x The input tensor to modify, e.g., queries or keys.
+ * Shape: [n_heads, head_dim] (flattened).
+ * @param cos_table The pre-computed cosine table for all positions.
+ * Shape: [seq_len, head_dim/2] (flattened).
+ * @param sin_table The pre-computed sine table for all positions.
+ * Shape: [seq_len, head_dim/2] (flattened).
+ * @param n_heads The number of attention heads.
+ * @param head_dim The dimension of each attention head.
+ * @param pos The position of the current token in the sequence.
+ */
+void ApplyRotary(Tensor *x /*[n_heads*hd]*/,
+                 const Tensor *cos_table /*[seq_len*hd/2]*/,
+                 const Tensor *sin_table /*[seq_len*hd/2]*/,
+                 int n_heads, int head_dim, int pos) {
     int half = head_dim / 2;
 
     for (int h = 0; h < n_heads; h++) {
         for (int i = 0; i < half; i++) {
-            // Indexing: head h, dim i
-            float x1 = x->buf[h * head_dim + i];        // first half
-            float x2 = x->buf[h * head_dim + half + i]; // second half
+            // --- THIS IS THE KEY CHANGE ---
+            // Calculate the index to look up the cos/sin values for the given position.
+            // The tables are logically 2D [pos, i], so the 1D index is pos * (width) + i.
+            int rope_idx = pos * half + i;
+            float c = cos_table->buf[rope_idx];
+            float s = sin_table->buf[rope_idx];
 
-            float c = cos->buf[i];
-            float s = sin->buf[i];
+            // --- The rotation logic remains the same ---
+            // Indexing for the input tensor: head h, dim i
+            int x_idx1 = h * head_dim + i;        // first half
+            int x_idx2 = h * head_dim + half + i; // second half
 
+            float x1 = x->buf[x_idx1];
+            float x2 = x->buf[x_idx2];
+
+            // Apply the 2D rotation
             float o1 = x1 * c - x2 * s;
             float o2 = x2 * c + x1 * s;
 
-            x->buf[h * head_dim + i] = o1;
-            x->buf[h * head_dim + half + i] = o2;
+            // Write the results back
+            x->buf[x_idx1] = o1;
+            x->buf[x_idx2] = o2;
         }
     }
 }
@@ -219,30 +270,6 @@ void AttnScoresOneHead(const float *q /*[hd]*/,
 }
 
 // Weighted sum for 1 head
-/*
-void AttnWeightedSumOneHead(const float *att,
-                            const float *v_cache_layer,
-                            int kv_offset_bytes, int head_dim, int pos,
-                            float *tb) {
-    memset(tb, 0, head_dim * sizeof(float));
-    for (int t = 0; t <= pos; t++) {
-        // get the value vector for this head and at this timestep
-        const float *v = v_cache_layer + t * head_dim;
-        // get the attention weight for this timestep
-        float a = att[t];
-        printf("v_cache current: ");
-        for (int i = 0; i < min(pos+2, 5); i++) {
-          printf("%.6f ", v[i]);
-        }
-        printf("\n");
-        // accumulate the weighted value into tb
-        for (int i = 0; i < head_dim; i++) {
-            tb[i] += a * v[i];
-        }
-    }
-}
-*/
-
 void AttnWeightedSumOneHead(const float *att /*[pos+1]*/,
                             const float *v_cache_layer /*[seq_len*kv_dim]*/,
                             int kv_head_idx, int head_dim, int kv_dim, int pos,

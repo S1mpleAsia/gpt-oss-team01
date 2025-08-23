@@ -28,12 +28,13 @@ void SplitQKV(const Tensor *qkv, int head_dim, int n_q, int n_kv,
               Tensor *v /*[n_kv*hd]*/);
 
 // cos/sin computation for RoPE at pos
-void RopeComputeCS(int pos, const Config &p, Tensor *cos_out /*[head_dim/2]*/,
-                   Tensor *sin_out /*[head_dim/2]*/);
+void RopePrecomputeCS(Config *p, Tensor *cos_all_out, Tensor *sin_all_out);
 
 // RoPE (n_heads * head_dim)
-void ApplyRotary(Tensor *x /*[n_heads*hd]*/, const Tensor *cos /*[hd/2]*/,
-                 const Tensor *sin /*[hd/2]*/, int n_heads, int head_dim);
+void ApplyRotary(Tensor *x /*[n_heads*hd]*/,
+                 const Tensor *cos_table /*[seq_len*hd/2]*/,
+                 const Tensor *sin_table /*[seq_len*hd/2]*/,
+                 int n_heads, int head_dim, int pos);
 
 // Attention scores for 1 head: att[0..pos] = q·k_t / sqrt(hd) (+ mask)
 void AttnScoresOneHead(const float *q /*[hd]*/,

@@ -1,7 +1,6 @@
 #pragma once
 
 #include "layer.hpp"
+#include "config.hpp"
 
-void our_init(Transformer *transformer);
-void our_free();
-float *our_forward(Transformer *transformer, int token, int pos);
+float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, int token, int pos);
