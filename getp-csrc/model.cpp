@@ -5,7 +5,8 @@
 float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, int token, int pos) {
 
     // copy the token embedding into x
-    EmbeddingLookup(weights->token_embedding_table, token, rs->x);
+    // EmbeddingLookup(weights->token_embedding_table, token, rs->x);
+    EmbeddingLookupGPU(weights->token_embedding_table, token, rs->x, false);
 
     long long loff_one = 1ll * p->seq_len * p->head_dim * p->n_kv_heads;
 
@@ -13,7 +14,8 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
     for (int l = 0; l < p->n_layers; l++) {
         // printf("Layer %d\n", l);
         // attention rmsnorm
-        RMSNorm(rs->x, weights->rms_attn_w, rs->t, 1ll * l);
+        // RMSNorm(rs->x, weights->rms_attn_w, rs->t, 1ll * l);
+        RMSNormGPU(rs->x, weights->rms_attn_w, rs->t, 1ll * l, false, true);
 
         // key and value point to the kv cache
         long long loff = 1ll * l * loff_one; // kv cache layer offset
@@ -82,10 +84,12 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
         AttnOutProject(rs->tb, weights->w_o, weights->b_o, rs->tb2, 1ll * l);
 
         // residual connection back into x
-        ResidualAdd(rs->x, rs->tb2);
+        // ResidualAdd(rs->x, rs->tb2);
+        AddBiasGPU(rs->x, rs->tb2, false, true, false); // equals residual add
 
         // ffn rmsnorm
-        RMSNorm(rs->x, weights->rms_ffn_w, rs->t, 1ll * l);
+        // RMSNorm(rs->x, weights->rms_ffn_w, rs->t, 1ll * l);
+        RMSNormGPU(rs->x, weights->rms_ffn_w, rs->t, 1ll * l, false, true);
         /*
         if (l < 3) {
             printf("CUSTOM:\n");
@@ -241,7 +245,8 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
         }
 
         // residual connection
-        ResidualAdd(rs->x, rs->e_agg);
+        // ResidualAdd(rs->x, rs->e_agg);
+        AddBiasGPU(rs->x, rs->e_agg, false, true, false); // equals residual add
     
         /*
         printf("x after expert: ");
@@ -255,7 +260,8 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
     }
     
     // final rmsnorm
-    RMSNorm(rs->x, weights->rms_out_w, rs->x, 0ll);
+    // RMSNorm(rs->x, weights->rms_out_w, rs->x, 0ll);
+    RMSNormGPU(rs->x, weights->rms_out_w, rs->x, 0ll, false, true);
 
     // classifier into logits
     Classifier(rs->x, weights->out, rs->logits);

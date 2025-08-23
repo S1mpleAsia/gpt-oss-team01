@@ -10,8 +10,7 @@ void EmbeddingLookup(const Tensor *embedding /*[vocab, hidden]*/, int token_id,
 }
 
 // RMSNorm: out = scale * x / rms(x)
-void RMSNorm(const Tensor *x /*[hidden]*/, const Tensor *scale /*[hidden]*/,
-             Tensor *out /*[hidden]*/, long long layer_offset, float eps) {
+void RMSNorm(const Tensor *x /*[hidden]*/, const Tensor *scale /*[n_layers, hidden]*/, Tensor *out /*[hidden]*/, long long layer_offset, float eps) {
     size_t size = x->num_elem();
     float *scale_buf = scale->buf + 1ll * layer_offset * size;
     // calculate sum of squares

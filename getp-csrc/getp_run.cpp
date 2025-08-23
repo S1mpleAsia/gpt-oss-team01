@@ -5,6 +5,8 @@
 #include "tensor.hpp"
 #include "layer.cpp"
 #include "layer.hpp"
+#include "layer_hip.cpp"
+#include "layer_hip.hpp"
 #include "model.cpp"
 #include "model.hpp"
 #include "alloc.cpp"

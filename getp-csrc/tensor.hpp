@@ -36,8 +36,8 @@ struct Tensor {
   DType::Type dtype;
   bool owns_host_buf;
 
-  Tensor(const vector<size_t> &shape_, DType::Type dtype = DType::BF16);
-  Tensor(const vector<size_t> &shape_, float *buf_, DType::Type dtype = DType::BF16);
+  Tensor(const vector<size_t> &shape_, DType::Type dtype = DType::FP32);
+  Tensor(const vector<size_t> &shape_, float *buf_, DType::Type dtype = DType::FP32);
   ~Tensor();
 
   size_t num_elem() const;
