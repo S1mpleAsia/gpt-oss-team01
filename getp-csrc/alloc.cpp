@@ -36,19 +36,26 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs) {
     rs->x = new Tensor({(size_t)p->hidden_dim}, s->x);
     
     rs->t = new Tensor({(size_t)p->hidden_dim}, s->t);
-    // rs->t = new Tensor({(size_t)p->n_experts, (size_t)p->hidden_dim});
-
     rs->tb = new Tensor({(size_t)p->head_dim * p->n_attn_heads}, s->tb);
     rs->tb2 = new Tensor({(size_t)p->hidden_dim}, s->tb2);
+
+    rs->tb3 = new Tensor({(size_t)p->experts_per_token, (size_t)p->hidden_dim});
 
     rs->router_score = new Tensor({(size_t)p->n_experts}, s->router_score);
     rs->topk_v = new Tensor({(size_t)p->experts_per_token}, s->topk_v);
     rs->topk_i = new TensorI32({(size_t)p->experts_per_token}, s->topk_i);
 
-    rs->mlp1_out = new Tensor({2 * (size_t)p->intermediate_dim}, s->mlp1_out);
-    rs->gate = new Tensor({(size_t)p->intermediate_dim}, s->gate);
-    rs->up = new Tensor({(size_t)p->intermediate_dim}, s->up);
-    rs->gate_up = new Tensor({(size_t)p->intermediate_dim}, s->gate_up);
+    // rs->mlp1_out = new Tensor({2 * (size_t)p->intermediate_dim}, s->mlp1_out);
+    rs->mlp1_out = new Tensor({(size_t)p->experts_per_token, 2 * (size_t)p->intermediate_dim});
+
+    // rs->gate = new Tensor({(size_t)p->intermediate_dim}, s->gate);
+    // rs->up = new Tensor({(size_t)p->intermediate_dim}, s->up);
+    rs->gate = new Tensor({(size_t)p->experts_per_token, (size_t)p->intermediate_dim});
+    rs->up = new Tensor({(size_t)p->experts_per_token, (size_t)p->intermediate_dim});
+
+    // rs->gate_up = new Tensor({(size_t)p->intermediate_dim}, s->gate_up);
+    rs->gate_up = new Tensor({(size_t)p->experts_per_token, (size_t)p->intermediate_dim});
+
     rs->e_agg = new Tensor({(size_t)p->hidden_dim}, s->e_agg);
     rs->qkv = new Tensor({((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim}, s->qkv);
     rs->q = new Tensor({(size_t)p->n_attn_heads * p->head_dim}, s->q);

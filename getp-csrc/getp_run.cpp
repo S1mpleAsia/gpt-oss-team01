@@ -86,6 +86,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
       printf("%.6f ", logits[i]);
     }
     printf("\n");
+    // exit(1);
 
     // advance the state machine
     pos++;

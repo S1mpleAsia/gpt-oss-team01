@@ -742,6 +742,12 @@ float *forward(Transformer *transformer, int token, int pos) {
       }
     }
 
+    printf("e_agg_tensor: ");
+    for (int i=0; i<5; i++) {
+        printf("%.6f ", s->e_agg[i]);
+    }
+    printf("\n");
+
     // residual connection
     for (int i = 0; i < hidden_dim; i++) {
       x[i] += s->e_agg[i];

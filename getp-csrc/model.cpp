@@ -111,6 +111,45 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
 
         // Route the tokens to their corresponding top-k experts
         memset(rs->e_agg->buf, 0, p->hidden_dim * sizeof(float));
+
+        // printf("Layer: %d\n", l);
+        ExpertFFN1_Total(rs->t, weights->w_mlp1, weights->b_mlp1, 
+                        rs->mlp1_out, rs->topk_i, 1ll * l);
+
+        // printf("Finish ExpertFFN1...\n");
+
+        for (int j = 0; j < p->experts_per_token * p->intermediate_dim; j++) {
+            rs->gate->buf[j] = rs->mlp1_out->buf[2 * j];
+            rs->up->buf[j] = rs->mlp1_out->buf[2 * j + 1];
+        }
+
+        // printf("Finish to gate&up...\n");
+        
+        SwiGLU(rs->gate, rs->up, p->swiglu_limit, rs->gate_up);
+        
+        // printf("Finish SwiGLU...\n");
+
+        ExpertFFN2_Total(rs->gate_up, weights->w_mlp2, weights->b_mlp2, 
+                        rs->tb3, rs->topk_i, 1ll * l);
+        
+        for (int i = 0; i < p->hidden_dim; i++) {
+            float sum_cur = 0.0f;
+            for (int j = 0; j < p->experts_per_token; j++) {
+                float expert_w = rs->topk_v->buf[j];
+                sum_cur += rs->tb3->buf[j * p->hidden_dim + i] * expert_w;
+            }
+            rs->e_agg->buf[i] += sum_cur;
+        }
+        
+        // printf("Finish combined...\n");
+        
+        /*
+        printf("e_agg_tensor: ");
+        for (int i=0; i<5; i++) {
+            printf("%.6f ", rs->e_agg->buf[i]);
+        }
+        printf("\n");
+        */
         
         for (int idx = 0; idx < p->experts_per_token; idx++) {
             int e = rs->topk_i->buf[idx];
@@ -119,7 +158,7 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
             // printf("e: %d\n", e);
 
             // Expert FFN 1: gate_up = W1 * t + b1
-            ExpertFFN1(rs->t, weights->w_mlp1, weights->b_mlp1, rs->mlp1_out, 1ll * l, 1ll * e);
+            // ExpertFFN1(rs->t, weights->w_mlp1, weights->b_mlp1, rs->mlp1_out, 1ll * l, 1ll * e);
 
             /*
             printf("t_tensor: ");
@@ -140,10 +179,12 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
             */
             
             // Split into gate and up
+            /*
             for (int j = 0; j < p->intermediate_dim; j++) {
                 rs->gate->buf[j] = rs->mlp1_out->buf[2 * j];
                 rs->up->buf[j] = rs->mlp1_out->buf[2 * j + 1];
             }
+            */
 
             /*
             printf("gate: ");
@@ -159,7 +200,7 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
             */
                 
             // SwiGLU non-linearity
-            SwiGLU(rs->gate, rs->up, p->swiglu_limit, rs->gate_up);
+            // SwiGLU(rs->gate, rs->up, p->swiglu_limit, rs->gate_up);
         
             /*
             printf("gate_up: ");
@@ -170,7 +211,7 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
             */
             
             // Expert FFN 2: y = W2 * swiglu + b2
-            ExpertFFN2(rs->gate_up, weights->w_mlp2, weights->b_mlp2, rs->tb2, 1ll * l, 1ll * e);
+            // ExpertFFN2(rs->gate_up, weights->w_mlp2, weights->b_mlp2, rs->tb2, 1ll * l, 1ll * e);
         
             /*
             printf("tb2_tensor: ");
@@ -181,9 +222,11 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
             */
             
             // aggregate topk experts using weighted sum
+            /*
             for (int i = 0; i < p->hidden_dim; i++) {
                 rs->e_agg->buf[i] += rs->tb2->buf[i] * expert_w;
             }
+            */
 
             /*
             printf("e_agg_tensor: ");
@@ -193,14 +236,6 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
             printf("\n");
             */
         }
-
-        /*
-        printf("e_agg_tensor: ");
-        for (int i=0; i<5; i++) {
-            printf("%.6f ", e_agg_tensor->buf[i]);
-        }
-        printf("\n");
-        */
 
         // residual connection
         ResidualAdd(rs->x, rs->e_agg);
