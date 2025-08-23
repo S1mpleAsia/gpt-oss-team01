@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
 
 using std::vector;
@@ -17,7 +18,6 @@ struct DType {
   };
 };
 
-/* Macro for checking CUDA errors */
 #define CHECK_HIP(call)                                                        \
   do {                                                                         \
     hipError_t _st = (call);                                                   \
@@ -28,31 +28,32 @@ struct DType {
     }                                                                          \
   } while (0)
 
-// #define FP16 /* [Advanced] Uncomment this line only for FP16 */
-
-/* [Tensor Structure] */
 struct Tensor {
   size_t ndim = 0;
   vector<size_t> shape;
-  //   size_t shape[5] = {1, 1, 1, 1, 1};
   float *buf = nullptr;
-  float *d_buf = nullptr;
-  bf16 *d_buf_bf16 = nullptr;
+  void *d_buf = nullptr;  // Unified device pointer
+  DType::Type dtype;
+  bool owns_host_buf;
 
-  Tensor(const vector<size_t> &shape_);
-  Tensor(const vector<size_t> &shape_, float *buf_);
+  Tensor(const vector<size_t> &shape_, DType::Type dtype = DType::BF16);
+  Tensor(const vector<size_t> &shape_, float *buf_, DType::Type dtype = DType::BF16);
   ~Tensor();
 
   size_t num_elem() const;
   void printShape(const std::string& descr) const;
   void reshape(const vector<int> &shape_);
+  
+  void to_device(hipStream_t stream = 0);
+  void from_device(hipStream_t stream = 0);
 };
 
 struct TensorI32 {
   size_t ndim = 0;
   vector<size_t> shape;
-  //   size_t shape[5] = {1, 1, 1, 1, 1};
   int *buf = nullptr;
+  int *d_buf = nullptr;  // Device buffer
+  bool owns_host_buf;
 
   TensorI32(const vector<size_t> &shape_);
   TensorI32(const vector<size_t> &shape_, int *buf_);
@@ -60,7 +61,7 @@ struct TensorI32 {
 
   size_t num_elem() const;
   void reshape(const vector<int> &shape_);
+  
+  void to_device(hipStream_t stream = 0);
+  void from_device(hipStream_t stream = 0);
 };
-
-typedef Tensor Parameter;
-typedef Tensor Activation;
