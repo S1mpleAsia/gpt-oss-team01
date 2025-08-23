@@ -41,6 +41,15 @@ size_t Tensor::num_elem() const {
   return size;
 }
 
+size_t Tensor::get_dtype_size() const {
+  if (dtype == DType::FP32) {
+    return sizeof(float);
+  } else if (dtype == DType::BF16) {
+    return sizeof(bf16);
+  }
+  return 0; // Or handle as an error
+}
+
 void Tensor::to_device(hipStream_t stream) {
   size_t N_ = num_elem();
   if (dtype == DType::FP32) {

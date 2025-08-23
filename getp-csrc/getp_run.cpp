@@ -9,6 +9,8 @@
 #include "model.hpp"
 #include "alloc.cpp"
 #include "alloc.hpp"
+#include "utils.cpp"
+#include "utils.hpp"
 #include "config.hpp"
 
 #ifndef GETP_RUN

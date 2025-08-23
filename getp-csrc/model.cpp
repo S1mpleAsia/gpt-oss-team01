@@ -50,8 +50,10 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
         // printf("p->n_kv_heads: %d, p->head_dim: %d\n", p->n_kv_heads, p->head_dim);
 
         // Store k, v in cache
-        memcpy(rs->key_cache->buf + loff + 1ll * pos * p->n_kv_heads * p->head_dim, rs->k->buf, p->n_kv_heads * p->head_dim * sizeof(float));
-        memcpy(rs->value_cache->buf + loff + 1ll * pos * p->n_kv_heads * p->head_dim, rs->v->buf, p->n_kv_heads * p->head_dim * sizeof(float));
+        // memcpy(rs->key_cache->buf + loff + 1ll * pos * p->n_kv_heads * p->head_dim, rs->k->buf, p->n_kv_heads * p->head_dim * sizeof(float));
+        // memcpy(rs->value_cache->buf + loff + 1ll * pos * p->n_kv_heads * p->head_dim, rs->v->buf, p->n_kv_heads * p->head_dim * sizeof(float));
+        MemCpy_Tensor(rs->key_cache, rs->k, loff + 1ll * pos * p->n_kv_heads * p->head_dim, 0, (size_t)p->n_kv_heads * p->head_dim, true, true);
+        MemCpy_Tensor(rs->value_cache, rs->v, loff + 1ll * pos * p->n_kv_heads * p->head_dim, 0, (size_t)p->n_kv_heads * p->head_dim, true, true);
 
         // multihead attention
         int kv_mul = p->n_attn_heads / p->n_kv_heads; // integer multiplier for GQA
@@ -110,7 +112,8 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
         Softmax(rs->topk_v->buf, rs->topk_v->num_elem());
 
         // Route the tokens to their corresponding top-k experts
-        memset(rs->e_agg->buf, 0, p->hidden_dim * sizeof(float));
+        // memset(rs->e_agg->buf, 0, p->hidden_dim * sizeof(float));
+        MemSet_Tensor(rs->e_agg, 0, true, true);
 
         // printf("Layer: %d\n", l);
         ExpertFFN1_Total(rs->t, weights->w_mlp1, weights->b_mlp1, 
