@@ -3,7 +3,7 @@
 #include "tensor.hpp"
 #include <hip/hip_runtime.h>
 
-void MemCpy_Tensor(Tensor *to, Tensor *from, long long to_offset,
+void MemCpy_Tensor(Tensor *to, const Tensor *from, long long to_offset,
                     long long from_offset, size_t num_elem,
                     bool copy_host, bool copy_device, hipStream_t stream = 0);
 void MemSet_Tensor(Tensor *in, int value, bool set_host,

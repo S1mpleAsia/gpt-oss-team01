@@ -23,19 +23,6 @@ void EmbeddingLookupGPU(Tensor *embedding,  // (vocab_size, hidden_dim)
     }
 }
 
-__global__ void AddVector_kernel(float *x, const float *y, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        x[i] += y[i];
-    }
-}
-
-void AddVectorGPU(float *x, const float *y, int n, hipStream_t stream) {
-    dim3 block_dim(256);
-    dim3 grid_dim((n + block_dim.x - 1) / block_dim.x);
-    AddVector_kernel<<<grid_dim, block_dim, 0, stream>>>(x, y, n);
-}
-
 __global__ void RMSNorm_kernel(const float *x, const float *w, float *out, int n, float eps) {
     // Kernel này giả định n đủ nhỏ để tính toán trong một block duy nhất
     __shared__ float s_variance;
@@ -177,25 +164,6 @@ __global__ void rmsnorm_kernel(const float *x, const float *w, float *out, int h
     }
 }
 
-/*
-  x - (B, hidden_dim)
-  w - (hidden_dim)
-  out - (B, hidden_dim)
-*/
-void RMSNormGPU_Old(const float *x, const float *w, float *out, int hidden_dim, float eps, hipStream_t stream) {
-    constexpr int batch_size = 1;  // Change this when using batching
-    constexpr int num_threads = 256;
-    const dim3 block_dim(num_threads), grid_dim(batch_size);
-
-    size_t shared_mem_size = num_threads * sizeof(double);
-
-    rmsnorm_kernel_double_precision<<<grid_dim, block_dim, shared_mem_size, stream>>>(
-        x, w, out, hidden_dim, eps);
-    CHECK_HIP(hipGetLastError());
-    // RMSNorm_kernel<<<grid_dim, block_dim, 0, stream>>>(x, w, out, hidden_dim, eps);
-}
-
-
 void RMSNormGPU(Tensor *x, Tensor *w, Tensor *out, long long layer_offset,
                 bool x_to_device, bool out_from_device, float eps,
                 hipStream_t stream) {
@@ -240,12 +208,60 @@ __global__ void matmul_kernel(const float *W, const float *x, const float *bias,
     }
 }
 
-void QKVGemmGPU(const float *w_qkv, const float *b_qkv, const float *t, float *out, int hidden_dim,
+void QKVGemmGPU_Old(const float *w_qkv, const float *b_qkv, const float *t, float *out, int hidden_dim,
                 int head_dim, int in_features, int out_features, hipStream_t stream) {
     dim3 block_dim(DEFAULT_BLOCK_SIZE);
     dim3 grid_dim((out_features + block_dim.x - 1) / block_dim.x);
 
     matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(w_qkv, t, b_qkv, out, out_features, in_features);
+}
+
+void QKVGemmGPU(Tensor *x, const Tensor *W_qkv, const Tensor *b_qkv, 
+                Tensor *qkv, long long layer_offset, bool x_to_device,
+                bool qkv_from_device, hipStream_t stream) {
+    if (x_to_device) x->to_device(stream);
+
+    const int in_features = x->num_elem();
+    const int out_features = qkv->num_elem();
+
+    const float *x_ptr = (float *)x->d_buf;
+    const float *w_qkv_ptr = (float *)W_qkv->d_buf + 1ll * layer_offset * out_features * in_features;
+    const float *b_qkv_ptr = (float *)b_qkv->d_buf + 1ll * layer_offset * out_features;
+    float *qkv_ptr = (float *)qkv->d_buf;
+    
+    dim3 block_dim(DEFAULT_BLOCK_SIZE);
+    dim3 grid_dim((out_features + block_dim.x - 1) / block_dim.x);
+
+    matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(
+        w_qkv_ptr, x_ptr, b_qkv_ptr, qkv_ptr, out_features, in_features
+    );
+
+    if (qkv_from_device) {
+        qkv->from_device(stream);
+        CHECK_HIP(hipStreamSynchronize(stream));
+    }
+}
+
+void SplitQKVGPU(Tensor *qkv, int head_dim, int n_q, int n_kv,
+                Tensor *q, Tensor *k, Tensor *v, bool qkv_to_device,
+                bool q_from_device, bool k_from_device,
+                bool v_from_device, hipStream_t stream) {
+    // Assume they are all copy on device for now
+    if (qkv_to_device) qkv->to_device(stream);
+
+    size_t offset = 0;
+    MemCpy_Tensor(q, qkv, 0, offset, n_q * head_dim, false, true, stream);
+    offset += n_q * head_dim;
+    MemCpy_Tensor(k, qkv, 0, offset, n_kv * head_dim, false, true, stream);
+    offset += n_kv * head_dim;
+    MemCpy_Tensor(v, qkv, 0, offset, n_kv * head_dim, false, true, stream);
+
+    if (q_from_device) q->from_device(stream);
+    if (k_from_device) k->from_device(stream);
+    if (v_from_device) v->from_device(stream);
+    if (q_from_device || k_from_device || v_from_device) {
+        CHECK_HIP(hipStreamSynchronize(stream));
+    }
 }
 
 void RouterGemmGPU(const float *w_router, const float *t, const float *b_router,
@@ -266,14 +282,14 @@ void ClassifierGemmGPU(const float *W_out, const float *x, float *logits, int hi
 // 4. Các hàm phụ trợ (AddBias, LinearBiasResidual)
 //================================================================================================
 
-__global__ void AddBias_kernel(float *y, const float *b, int len) {
+__global__ void AddVector_kernel(float *y, const float *b, int len) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < len) {
         y[i] += b[i];
     }
 }
 
-void AddBiasGPU(Tensor *y, Tensor *b, bool y_to_device,
+void AddVectorGPU(Tensor *y, Tensor *b, bool y_to_device,
                 bool b_to_device, bool y_from_device, hipStream_t stream) {
     if (y_to_device) y->to_device(stream);
     if (b_to_device) b->to_device(stream);
@@ -285,7 +301,7 @@ void AddBiasGPU(Tensor *y, Tensor *b, bool y_to_device,
 
     dim3 block_dim(DEFAULT_BLOCK_SIZE);
     dim3 grid_dim((len + block_dim.x - 1) / block_dim.x);
-    AddBias_kernel<<<grid_dim, block_dim, 0, stream>>>(y_ptr, b_ptr, len);
+    AddVector_kernel<<<grid_dim, block_dim, 0, stream>>>(y_ptr, b_ptr, len);
 
     if (y_from_device) {
         y->from_device(stream);
@@ -432,6 +448,40 @@ void QKVEpilogueSplitRoPECacheGPU(float *qkv_out, float *q_out, float *k_pos, fl
     dim3 grid_dim((total_dims + block_dim.x - 1) / block_dim.x);
     QKVEpilogueSplitRoPECache_kernel<<<grid_dim, block_dim, 0, stream>>>(
         qkv_out, q_out, k_pos, v_pos, rope_cos_pos, rope_sin_pos, head_dim, n_q, n_kv);
+}
+
+/* TODO: IMPLEMENT THIS FUNCTION */
+void ApplyRotaryGPU(Tensor *x, const Tensor *cos_table,
+                    const Tensor *sin_table, int n_heads,
+                    int head_dim, int pos) {
+    int half = head_dim / 2;
+
+    for (int h = 0; h < n_heads; h++) {
+        for (int i = 0; i < half; i++) {
+            // --- THIS IS THE KEY CHANGE ---
+            // Calculate the index to look up the cos/sin values for the given position.
+            // The tables are logically 2D [pos, i], so the 1D index is pos * (width) + i.
+            int rope_idx = pos * half + i;
+            float c = cos_table->buf[rope_idx];
+            float s = sin_table->buf[rope_idx];
+
+            // --- The rotation logic remains the same ---
+            // Indexing for the input tensor: head h, dim i
+            int x_idx1 = h * head_dim + i;        // first half
+            int x_idx2 = h * head_dim + half + i; // second half
+
+            float x1 = x->buf[x_idx1];
+            float x2 = x->buf[x_idx2];
+
+            // Apply the 2D rotation
+            float o1 = x1 * c - x2 * s;
+            float o2 = x2 * c + x1 * s;
+
+            // Write the results back
+            x->buf[x_idx1] = o1;
+            x->buf[x_idx2] = o2;
+        }
+    }
 }
 
 //================================================================================================

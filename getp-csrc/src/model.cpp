@@ -21,10 +21,14 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
         long long loff = 1ll * l * loff_one; // kv cache layer offset
 
         // QKV projection 
-        QKVProject(rs->t, weights->w_qkv, weights->b_qkv, rs->qkv, 1ll * l);
+        // QKVProject(rs->t, weights->w_qkv, weights->b_qkv, rs->qkv, 1ll * l);
+        QKVGemmGPU(rs->t, weights->w_qkv, weights->b_qkv, rs->qkv,
+                    1ll * l, true, false); // This kernel diverges the most
 
         // Separate q, k, v
-        SplitQKV(rs->qkv, p->head_dim, p->n_attn_heads, p->n_kv_heads, rs->q, rs->k, rs->v);
+        // SplitQKV(rs->qkv, p->head_dim, p->n_attn_heads, p->n_kv_heads, rs->q, rs->k, rs->v);
+        SplitQKVGPU(rs->qkv, p->head_dim, p->n_attn_heads, p->n_kv_heads,
+                    rs->q, rs->k, rs->v, false, true, true, true);
         /*
         printf("CUSTOM\n");
         printf("q_tensor: ");
@@ -85,7 +89,7 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
 
         // residual connection back into x
         // ResidualAdd(rs->x, rs->tb2);
-        AddBiasGPU(rs->x, rs->tb2, false, true, false); // equals residual add
+        AddVectorGPU(rs->x, rs->tb2, false, true, false); // equals residual add
 
         // ffn rmsnorm
         // RMSNorm(rs->x, weights->rms_ffn_w, rs->t, 1ll * l);
@@ -246,7 +250,7 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
 
         // residual connection
         // ResidualAdd(rs->x, rs->e_agg);
-        AddBiasGPU(rs->x, rs->e_agg, false, true, false); // equals residual add
+        AddVectorGPU(rs->x, rs->e_agg, false, true, false); // equals residual add
     
         /*
         printf("x after expert: ");

@@ -9,28 +9,28 @@ void EmbeddingLookupGPU(Tensor *embedding,  // (vocab_size, hidden_dim)
                         int token_id, Tensor *x,  // (hidden_dim, )
                         bool x_from_device, hipStream_t stream);
 
-void RMSNormGPU_Old(const float *x,  // [hidden]
-                const float *w,  // [hidden]
-                float *out,      // [hidden]
-                int hidden_dim,
-                float eps,  // e.g. 1e-5
-                hipStream_t stream);
 void RMSNormGPU(Tensor *x, Tensor *w, Tensor *out, long long layer_offset,
                 bool x_to_device, bool out_from_device, float eps = 1e-5f,
                 hipStream_t stream = 0);
 
-void QKVGemmGPU(const float *w_qkv,  // (out, in)
+void QKVGemmGPU_Old(const float *w_qkv,  // (out, in)
                 const float *b_qkv,  // (out, )
                 const float *t,      // (in, )
                 float *out,          // (out, )
                 int hidden_dim, int head_dim, int in_features, int out_features,
                 hipStream_t stream);
+void QKVGemmGPU(Tensor *x, const Tensor *W_qkv, const Tensor *b_qkv, 
+                Tensor *qkv, long long layer_offset, bool x_to_device,
+                bool qkv_from_device, hipStream_t stream = 0);
+
+void SplitQKVGPU(Tensor *qkv, int head_dim, int n_q, int n_kv,
+                Tensor *q, Tensor *k, Tensor *v, bool qkv_to_device,
+                bool q_from_device, bool k_from_device,
+                bool v_from_device, hipStream_t stream = 0);
 
 // (tuỳ chọn) cộng bias riêng nếu không có epilogue:
-void AddBiasGPU(Tensor *y, Tensor *b, bool y_to_device,
+void AddVectorGPU(Tensor *y, Tensor *b, bool y_to_device,
                 bool b_to_device, bool y_from_device, hipStream_t stream = 0);
-
-void AddVectorGPU(float *x, const float *y, int n, hipStream_t stream);
 
 // ---------- QKV epilogue fused: bias + split + RoPE + cache ----------
 /* Đọc qkv_out (đã có/hoặc chưa có bias), cộng bias (nếu b != nullptr),
