@@ -7,6 +7,8 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
     // copy the token embedding into x
     EmbeddingLookup(weights->token_embedding_table, token, rs->x);
 
+    long long loff_one = 1ll * p->seq_len * p->head_dim * p->n_kv_heads;
+
     // forward all the layers
     for (int l = 0; l < p->n_layers; l++) {
         // printf("Layer %d\n", l);
@@ -14,7 +16,7 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
         RMSNorm(rs->x, weights->rms_attn_w, rs->t, 1ll * l);
 
         // key and value point to the kv cache
-        long long loff = 1ll * l * p->seq_len * p->head_dim * p->n_kv_heads; // kv cache layer offset
+        long long loff = 1ll * l * loff_one; // kv cache layer offset
 
         // QKV projection 
         QKVProject(rs->t, weights->w_qkv, weights->b_qkv, rs->qkv, 1ll * l);
@@ -53,106 +55,26 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
 
         // multihead attention
         int kv_mul = p->n_attn_heads / p->n_kv_heads; // integer multiplier for GQA
+
+        AttnScoresAllHeads(rs->key_cache, rs->q, rs->att, rs->mask,
+                            loff_one, 1ll * l, p->n_attn_heads, kv_mul,
+                            p->head_dim, p->head_dim * p->n_kv_heads,
+                            p->seq_len, p->sliding_window, pos);
         
         // For each head, compute attention scores and weighted sum
         for (int h = 0; h < p->n_attn_heads; h++) {
-            // get the query vector for this head
-            float *q_head = rs->q->buf + h * p->head_dim;
-            
             // attention scores for this head
             float *att_head = rs->att->buf + h * p->seq_len;
-            
-            // Get the key cache for this head group (GQA)
-            int kv_head_idx = h / kv_mul;
-            
-            // Create mask if needed
-            float *mask_row = nullptr;
-            if (p->sliding_window > 0 && (l % 2 == 0)) {
-                mask_row = rs->mask->buf + pos * p->seq_len;
-            }
-
-            /*
-            if (h < 3) {
-                printf("CUSTOM head %d\n", h);
-                printf("q: ");
-                for (int i = 0; i < 5; i++) {
-                    printf("%.6f ", q_head[i]);
-                }
-                printf("\n");
-                printf("att: ");
-                for (int i = 0; i < 5; i++) {
-                    printf("%.6f ", att_head[i]);
-                }
-                printf("\n");
-                float *skeycache = s->key_cache + loff;
-                printf("s->key_cache: ");
-                for (int i = 0; i < 5; i++) {
-                    printf("%.6f ", skeycache[i]);
-                }
-                printf("\n");
-            }
-            */
-            
-            // Compute attention scores
-            AttnScoresOneHead(q_head, rs->key_cache->buf + loff, kv_head_idx, p->head_dim, p->head_dim * p->n_kv_heads, p->seq_len, pos, mask_row, att_head);
-            
             // Add attention sink score
             att_head[pos + 1] = weights->attn_sinks->buf[l * p->n_attn_heads + h];
 
-            /*
-            if (h < 3) {
-                printf("CUSTOM head %d\n", h);
-                printf("att: ");
-                for (int i = 0; i < min(pos+2, 5); i++) {
-                    printf("%.6f ", att_head[i]);
-                }
-                printf("\n");
-            }
-            */
-            
             // softmax the scores to get attention weights
             Softmax(att_head, (size_t)pos + 2);
-
-            /*
-            if (h < 3) {
-                printf("CUSTOM head %d\n", h);
-                printf("att: ");
-                for (int i = 0; i < min(pos+2, 5); i++) {
-                    printf("%.6f ", att_head[i]);
-                }
-                printf("\n");
-            }
-            */    
-            
-            // Get the value cache for this head group (GQA)
-            
-            // weighted sum of the values
-            float *tb_head = rs->tb->buf + h * p->head_dim;
-            // AttnWeightedSumOneHead(att_head, v_cache_head, 0, p->head_dim, pos, tb_head);
-            AttnWeightedSumOneHead(att_head, rs->value_cache->buf + loff, kv_head_idx, p->head_dim, p->head_dim * p->n_kv_heads, pos, tb_head); 
-
-            // Debug output for first few heads
-            /*
-            if (h < 3) {
-                printf("CUSTOM head %d\n", h);
-                printf("att: ");
-                for (int i = 0; i < min(pos+2, 5); i++) {
-                    printf("%.6f ", att_head[i]);
-                }
-                printf("\n");
-                printf("v_cache_head: ");
-                for (int i = 0; i < min(pos+2, 5); i++) {
-                    printf("%.6f ", v_cache_head[i]);
-                }
-                printf("\n");
-                printf("tb: ");
-                for (int i = 0; i < min(p->head_dim, 5); i++) {
-                    printf("%.6f ", tb_head[i]);
-                }
-                printf("\n");
-            }
-            */
         }
+
+        AttnWeightedSumAllHeads(rs->value_cache, rs->q, rs->att, rs->tb, 
+                                loff, p->n_attn_heads, kv_mul, p->head_dim,
+                                p->head_dim * p->n_kv_heads, p->seq_len, pos);
 
         // final matmul to get the output of the attention
         AttnOutProject(rs->tb, weights->w_o, weights->b_o, rs->tb2, 1ll * l);
@@ -162,7 +84,6 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
 
         // ffn rmsnorm
         RMSNorm(rs->x, weights->rms_ffn_w, rs->t, 1ll * l);
-
         /*
         if (l < 3) {
             printf("CUSTOM:\n");

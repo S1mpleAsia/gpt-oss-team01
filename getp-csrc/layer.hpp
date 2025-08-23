@@ -37,23 +37,16 @@ void ApplyRotary(Tensor *x /*[n_heads*hd]*/,
                  int n_heads, int head_dim, int pos);
 
 // Attention scores for 1 head: att[0..pos] = q·k_t / sqrt(hd) (+ mask)
-void AttnScoresOneHead(const float *q /*[hd]*/,
-                       const float *k_cache_layer /*[seq_len*kv_dim]*/,
-                       int kv_offset_bytes, int head_dim, int kv_dim, int seq_len, int pos,
-                       const float *mask_row /*[seq_len] or nullptr*/,
-                       float *att /*[pos+1]*/);
+void AttnScoresAllHeads(Tensor *key_cache, Tensor *q, Tensor *att, Tensor *mask,
+                        long long loff_one, long long layer_offset,
+                        int attn_heads, int kv_mul, int head_dim,
+                        int kv_dim, int seq_len, int sliding_window, int pos);
 
 // Weighted sum for 1 head
-/*
-void AttnWeightedSumOneHead(const float *att,
-                            const float *v_cache_layer,
-                            int kv_offset_bytes, int head_dim, int pos,
-                            float *tb);
-*/
-void AttnWeightedSumOneHead(const float *att /*[pos+1]*/,
-                            const float *v_cache_layer /*[seq_len*kv_dim]*/,
-                            int kv_head_idx, int head_dim, int kv_dim, int pos,
-                            float *tb /*[hd]*/); 
+void AttnWeightedSumAllHeads(Tensor *value_cache, Tensor *q, Tensor *att,
+                            Tensor *tb, long long loff, int attn_heads,
+                            int kv_mul, int head_dim, int kv_dim,
+                            int seq_len, int pos);
 
 // Output projection for attention: y = W_o * tb + b_o
 void AttnOutProject(const Tensor *tb /*[n_q*hd]*/,

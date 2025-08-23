@@ -249,37 +249,73 @@ void ApplyRotary(Tensor *x /*[n_heads*hd]*/,
 }
 
 // Attention scores for 1 head: att[0..pos] = q·k_t / sqrt(hd) (+ mask)
-void AttnScoresOneHead(const float *q /*[hd]*/,
-                       const float *k_cache_layer /*[seq_len*kv_dim]*/,
-                       int kv_head_idx, int head_dim, int kv_dim, int seq_len, int pos,
-                       const float *mask_row /*[seq_len] or nullptr*/,
-                       float *att /*[pos+1]*/) {
-    for (int t = 0; t <= pos; t++) {
-        // Calculate the correct key position
-        const float *k = k_cache_layer + t * kv_dim + kv_head_idx * head_dim;
-        double score = 0.0;
-        for (int i = 0; i < head_dim; i++) {
-            score += q[i] * k[i];
+void AttnScoresAllHeads(Tensor *key_cache, Tensor *q, Tensor *att, Tensor *mask,
+                        long long loff_one, long long layer_offset,
+                        int attn_heads, int kv_mul, int head_dim,
+                        int kv_dim, int seq_len, int sliding_window, int pos) {
+    float *mask_row = nullptr;
+    if (sliding_window > 0 && (layer_offset % 2 == 0)) {
+        mask_row = mask->buf + pos * seq_len;
+    }
+
+    long long loff = 1ll * layer_offset * loff_one;
+
+    for (int h = 0; h < attn_heads; h++) {
+        // get the query vector for this head
+        float *q_head = q->buf + h * head_dim;
+        
+        // attention scores for this head
+        float *att_head = att->buf + h * seq_len;
+        
+        // Get the key cache for this head group (GQA)
+        int kv_head_idx = h / kv_mul;
+
+        // Compute attention scores
+        for (int t = 0; t <= pos; t++) {
+            // Calculate the correct key position
+            const float *k = key_cache->buf + loff + t * kv_dim + kv_head_idx * head_dim;
+            double score = 0.0;
+            for (int i = 0; i < head_dim; i++) {
+                score += q_head[i] * k[i];
+            }
+            score /= sqrtf(head_dim);
+            if (mask_row) {
+                score += mask_row[t];
+            }
+            att_head[t] = score;
         }
-        score /= sqrtf(head_dim);
-        if (mask_row) {
-            score += mask_row[t];
-        }
-        att[t] = score;
     }
 }
 
 // Weighted sum for 1 head
-void AttnWeightedSumOneHead(const float *att /*[pos+1]*/,
-                            const float *v_cache_layer /*[seq_len*kv_dim]*/,
-                            int kv_head_idx, int head_dim, int kv_dim, int pos,
-                            float *tb /*[hd]*/) {
-    memset(tb, 0, head_dim * sizeof(float));
-    for (int t = 0; t <= pos; t++) {
-        const float *v = v_cache_layer + t * kv_dim + kv_head_idx * head_dim;
-        float a = att[t];
-        for (int i = 0; i < head_dim; i++) {
-            tb[i] += a * v[i];
+void AttnWeightedSumAllHeads(Tensor *value_cache, Tensor *q, Tensor *att,
+                            Tensor *tb, long long loff, int attn_heads,
+                            int kv_mul, int head_dim, int kv_dim,
+                            int seq_len, int pos) {
+    // For each head, compute attention scores and weighted sum
+    for (int h = 0; h < attn_heads; h++) {
+        // get the query vector for this head
+        float *q_head = q->buf + h * head_dim;
+        
+        // attention scores for this head
+        float *att_head = att->buf + h * seq_len;
+        
+        // Get the key cache for this head group (GQA)
+        int kv_head_idx = h / kv_mul;
+        
+        // Create mask if needed
+        // Get the value cache for this head group (GQA)
+        
+        // weighted sum of the values
+        float *tb_head = tb->buf + h * head_dim;
+
+        memset(tb_head, 0, head_dim * sizeof(float));
+        for (int t = 0; t <= pos; t++) {
+            const float *v = (value_cache->buf + loff) + t * kv_dim + kv_head_idx * head_dim;
+            float a = att_head[t];
+            for (int i = 0; i < head_dim; i++) {
+                tb_head[i] += a * v[i];
+            }
         }
     }
 }

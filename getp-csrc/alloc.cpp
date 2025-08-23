@@ -34,7 +34,10 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 void our_init_run_state(RunState *s, Config *p, OurRunState *rs) {
     // Create Tensor wrappers for state buffers
     rs->x = new Tensor({(size_t)p->hidden_dim}, s->x);
+    
     rs->t = new Tensor({(size_t)p->hidden_dim}, s->t);
+    // rs->t = new Tensor({(size_t)p->n_experts, (size_t)p->hidden_dim});
+
     rs->tb = new Tensor({(size_t)p->head_dim * p->n_attn_heads}, s->tb);
     rs->tb2 = new Tensor({(size_t)p->hidden_dim}, s->tb2);
 
