@@ -1,0 +1,53 @@
+# .clang-format
+BasedOnStyle: LLVM
+Language: Cpp
+
+# --- layout / width ---
+IndentWidth: 2
+TabWidth: 2
+UseTab: Never
+ColumnLimit: 100
+ContinuationIndentWidth: 2
+
+# --- pointers / references ---
+DerivePointerAlignment: false
+PointerAlignment: Right # float *ptr
+ReferenceAlignment: Right # Tensor &ref
+
+# --- braces & short statements ---
+BreakBeforeBraces: Attach
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: Empty
+AlwaysBreakAfterReturnType: None
+PenaltyReturnTypeOnItsOwnLine: 200
+
+# --- parameters & calls ---
+AlignAfterOpenBracket: Align
+BinPackParameters: true
+BinPackArguments: true
+
+# --- spaces ---
+SpaceBeforeParens: ControlStatements
+SpacesInParentheses: false
+SpaceInEmptyParentheses: false
+SpacesInAngles: false
+SpacesInCStyleCastParentheses: false
+SpaceBeforeAssignmentOperators: true
+
+# --- comments ---
+ReflowComments: false
+AlignTrailingComments: true # <- forces trailing comments into the same column
+SpacesBeforeTrailingComments: 2 # <- minimum gap before the comment column
+CommentPragmas: "^ IWYU pragma:" # leave IWYU pragmas alone
+
+# --- includes / pp ---
+SortIncludes: false
+IncludeBlocks: Preserve
+SortUsingDeclarations: false
+IndentPPDirectives: None
+
+# --- odds & ends ---
+IndentCaseLabels: true
+Cpp11BracedListStyle: true
+KeepEmptyLinesAtTheStartOfBlocks: false

@@ -12,20 +12,16 @@ using std::vector;
 typedef hip_bfloat16 bf16;
 
 struct DType {
-  enum Type {
-    FP32,
-    BF16
-  };
+  enum Type { FP32, BF16 };
 };
 
-#define CHECK_HIP(call)                                                        \
-  do {                                                                         \
-    hipError_t _st = (call);                                                   \
-    if (_st != hipSuccess) {                                                   \
-      fprintf(stderr, "HIP error (%s:%d): %s\n", __FILE__, __LINE__,           \
-              hipGetErrorString(_st));                                         \
-      std::abort();                                                            \
-    }                                                                          \
+#define CHECK_HIP(call)                                                                            \
+  do {                                                                                             \
+    hipError_t _st = (call);                                                                       \
+    if (_st != hipSuccess) {                                                                       \
+      fprintf(stderr, "HIP error (%s:%d): %s\n", __FILE__, __LINE__, hipGetErrorString(_st));      \
+      std::abort();                                                                                \
+    }                                                                                              \
   } while (0)
 
 struct Tensor {
@@ -41,10 +37,10 @@ struct Tensor {
   ~Tensor();
 
   size_t num_elem() const;
-  size_t get_dtype_size() const; // Add this declaration
-  void printShape(const std::string& descr) const;
+  size_t get_dtype_size() const;  // Add this declaration
+  void printShape(const std::string &descr) const;
   void reshape(const vector<int> &shape_);
-  
+
   void to_device(hipStream_t stream = 0);
   void from_device(hipStream_t stream = 0);
 };
@@ -62,7 +58,7 @@ struct TensorI32 {
 
   size_t num_elem() const;
   void reshape(const vector<int> &shape_);
-  
+
   void to_device(hipStream_t stream = 0);
   void from_device(hipStream_t stream = 0);
 };

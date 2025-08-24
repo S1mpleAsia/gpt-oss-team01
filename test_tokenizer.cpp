@@ -29,13 +29,7 @@
 #include "tokenizer.hpp"
 
 // ---------- Exit codes ----------
-enum {
-  EXIT_OK = 0,
-  EXIT_USAGE = 2,
-  EXIT_IO = 3,
-  EXIT_BADFILE = 4,
-  EXIT_NOMEM = 5
-};
+enum { EXIT_OK = 0, EXIT_USAGE = 2, EXIT_IO = 3, EXIT_BADFILE = 4, EXIT_NOMEM = 5 };
 
 // ---------- CLI defaults ----------
 #define DEFAULT_TOKENIZER_PATH "tokenizer.bin"
@@ -59,8 +53,7 @@ static void die_msg(const char *msg, int code) {
 
 // Return both max_token_length and vocab_size by scanning the file once.
 // On failure, exits with a descriptive error.
-static void get_vocab_info(const char *path, int *out_max_len,
-                           int *out_vocab_size) {
+static void get_vocab_info(const char *path, int *out_max_len, int *out_vocab_size) {
   FILE *f = fopen(path, "rb");
   if (!f)
     die_perror("Failed to open", path, EXIT_IO);
@@ -68,8 +61,7 @@ static void get_vocab_info(const char *path, int *out_max_len,
   int32_t maxlen_le = 0;
   if (fread(&maxlen_le, sizeof(int32_t), 1, f) != 1) {
     fclose(f);
-    die_msg("Bad tokenizer header (cannot read max_token_length).",
-            EXIT_BADFILE);
+    die_msg("Bad tokenizer header (cannot read max_token_length).", EXIT_BADFILE);
   }
 
   int vocab = 0;
@@ -77,14 +69,14 @@ static void get_vocab_info(const char *path, int *out_max_len,
     float score;
     int32_t len_le;
     if (fread(&score, sizeof(float), 1, f) != 1)
-      break; // EOF expected after last
+      break;  // EOF expected after last
     if (fread(&len_le, sizeof(int32_t), 1, f) != 1)
-      break; // truncated?
+      break;  // truncated?
     if (len_le < 0) {
       fclose(f);
       die_msg("Corrupt tokenizer: negative token length.", EXIT_BADFILE);
     }
-    if (fseek(f, (long)len_le, SEEK_CUR) != 0) { // skip token bytes
+    if (fseek(f, (long)len_le, SEEK_CUR) != 0) {  // skip token bytes
       fclose(f);
       die_msg("Corrupt tokenizer: cannot seek over token bytes.", EXIT_BADFILE);
     }
@@ -104,20 +96,18 @@ static void get_vocab_info(const char *path, int *out_max_len,
 // ---------- CLI parsing ----------
 
 static void print_usage(const char *prog) {
-  fprintf(
-      stderr,
-      "Usage: %s -t <tokenizer.bin> -i <prompt> [-r] [--max-tokens N]\n"
-      "Options:\n"
-      "  -t, --tokenizer PATH   Path to tokenizer.bin "
-      "(default: " DEFAULT_TOKENIZER_PATH ")\n"
-      "  -i, --input TEXT       Prompt to encode (default: \"" DEFAULT_PROMPT
-      "\")\n"
-      "  -r, --roundtrip        Also decode pieces and print the reconstructed "
-      "text\n"
-      "      --max-tokens N     Capacity for encode output buffer (default: "
-      "%d)\n"
-      "  -h, --help             Show this help\n",
-      prog, DEFAULT_MAX_TOKENS);
+  fprintf(stderr,
+          "Usage: %s -t <tokenizer.bin> -i <prompt> [-r] [--max-tokens N]\n"
+          "Options:\n"
+          "  -t, --tokenizer PATH   Path to tokenizer.bin "
+          "(default: " DEFAULT_TOKENIZER_PATH ")\n"
+          "  -i, --input TEXT       Prompt to encode (default: \"" DEFAULT_PROMPT "\")\n"
+          "  -r, --roundtrip        Also decode pieces and print the reconstructed "
+          "text\n"
+          "      --max-tokens N     Capacity for encode output buffer (default: "
+          "%d)\n"
+          "  -h, --help             Show this help\n",
+          prog, DEFAULT_MAX_TOKENS);
 }
 
 typedef struct {
@@ -188,8 +178,7 @@ int main(int argc, char **argv) {
 
   int n_ids = 0;
   // Disable BOS/EOS: we only test pure BPE behavior by default.
-  encode(&tok, opt.prompt, /*bos_id=*/-1, /*eos_id=*/-1, ids, &n_ids,
-         opt.max_tokens);
+  encode(&tok, opt.prompt, /*bos_id=*/-1, /*eos_id=*/-1, ids, &n_ids, opt.max_tokens);
 
   // Print token IDs
   for (int i = 0; i < n_ids; i++) {
@@ -204,8 +193,7 @@ int main(int argc, char **argv) {
     // joins.
     for (int i = 0; i < n_ids; i++) {
       int prev = (i == 0) ? -1 : ids[i - 1];
-      const char *piece = decode_piece(
-          &tok, prev, ids[i]); // owned by tokenizer; printing is safe
+      const char *piece = decode_piece(&tok, prev, ids[i]);  // owned by tokenizer; printing is safe
       safe_printf(piece);
     }
     printf("\n");

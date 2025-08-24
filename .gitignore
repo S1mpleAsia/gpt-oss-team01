@@ -3,12 +3,14 @@
 !*/
 !*.*
 
+.vscode/
+logs/
 debug/*.txt
 run.sh
 
 data/*
 !data/input.txt
-!data/output.txt
+# !data/output.txt
 
 # Virtual env
 .venv/
