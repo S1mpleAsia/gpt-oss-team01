@@ -264,20 +264,6 @@ void SplitQKVGPU(Tensor *qkv, int head_dim, int n_q, int n_kv,
     }
 }
 
-void RouterGemmGPU(const float *w_router, const float *t, const float *b_router,
-                   float *router_score, int hidden_dim, int n_experts, hipStream_t stream) {
-    dim3 block_dim(DEFAULT_BLOCK_SIZE);
-    dim3 grid_dim((n_experts + block_dim.x - 1) / block_dim.x);
-    matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(w_router, t, b_router, router_score, n_experts, hidden_dim);
-}
-
-void ClassifierGemmGPU(const float *W_out, const float *x, float *logits, int hidden_dim,
-                       int vocab_size, hipStream_t stream) {
-    dim3 block_dim(DEFAULT_BLOCK_SIZE);
-    dim3 grid_dim((vocab_size + block_dim.x - 1) / block_dim.x);
-    matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(W_out, x, nullptr, logits, vocab_size, hidden_dim);
-}
-
 //================================================================================================
 // 4. Các hàm phụ trợ (AddBias, LinearBiasResidual)
 //================================================================================================
@@ -599,9 +585,31 @@ void AttnOutProjectGPU(
 //================================================================================================
 // 7. MoE (Mixture of Experts)
 //================================================================================================
+void RouterGemmGPU(const Tensor *w_router, Tensor *t, const Tensor *b_router,
+                   Tensor *router_score, long long layer_offset,
+                   bool t_to_device, bool r_from_device, hipStream_t stream) {
+    if (t_to_device) t->to_device(stream);
 
-__global__ void TopKSoftmax_kernel(const float *r, int n_experts, int k, float *topk_vals,
-                                   int *topk_idx) {
+    const long long hidden = t->num_elem();
+    const long long n_experts = router_score->num_elem();
+    const float *w_router_ptr = (float *)w_router->d_buf + 1ll * layer_offset * n_experts * hidden;
+    const float *b_router_ptr = (float *)b_router->d_buf + 1ll * layer_offset * n_experts;
+    const float *t_ptr = (float *)t->d_buf;
+    float *r_ptr = (float *)router_score->d_buf;
+
+    dim3 block_dim(DEFAULT_BLOCK_SIZE);
+    dim3 grid_dim((n_experts + block_dim.x - 1) / block_dim.x);
+    matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(
+        w_router_ptr, t_ptr, b_router_ptr, r_ptr, n_experts, hidden
+    );
+
+    if (r_from_device) {
+        router_score->from_device(stream);
+        CHECK_HIP(hipStreamSynchronize(stream));
+    }
+}
+
+__global__ void TopKSoftmax_kernel(const float *r, int n_experts, int k, float *topk_vals, int *topk_idx) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
     extern __shared__ char s_data[];
@@ -655,10 +663,30 @@ __global__ void TopKSoftmax_kernel(const float *r, int n_experts, int k, float *
     }
 }
 
-void TopKSoftmaxGPU(const float *r, int n_experts, int k, float *topk_vals, int *topk_idx, hipStream_t stream) {
-    size_t shared_mem_size = (size_t)n_experts * (sizeof(float) + sizeof(int));
-    TopKSoftmax_kernel<<<1, 1, shared_mem_size, stream>>>(r, n_experts, k, topk_vals, topk_idx);
+void TopKSoftmaxGPU(Tensor *r, Tensor *topk_vals, TensorI32 *topk_idx,
+                    bool r_to_device, bool topk_vals_from_device,
+                    bool topk_idx_from_device, hipStream_t stream) {
+    if (r_to_device) r->to_device(stream);
+
+    const int num_experts = r->num_elem();
+    const int experts_per_token = topk_idx->num_elem();
+
+    const float *r_ptr = (float *)r->d_buf;
+    float *topk_vals_ptr = (float *)topk_vals->d_buf;
+    int *topk_idx_ptr = topk_idx->d_buf;
+
+    // shared_mem_size exceeds when num_experts > 32
+    size_t shared_mem_size = (size_t)num_experts * (sizeof(float) + sizeof(int));
+    TopKSoftmax_kernel<<<1, 1, shared_mem_size, stream>>>(
+        r_ptr, num_experts, experts_per_token, topk_vals_ptr, topk_idx_ptr
+    );
     CHECK_HIP(hipGetLastError());
+
+    if (topk_vals_from_device) topk_vals->from_device(stream);
+    if (topk_idx_from_device) topk_idx->from_device(stream);
+    if (topk_vals_from_device || topk_idx_from_device) {
+        CHECK_HIP(hipStreamSynchronize(stream));
+    }
 }
 
 __global__ void SwiGLU_kernel(const float *interleaved_in, float *swiglu_out, int inter_dim,
@@ -782,4 +810,28 @@ void MoEApplyTopKGPU(const float *t, const bf16 *W1, const bf16 *b1, const bf16 
     // Giải phóng bộ nhớ tạm
     CHECK_HIP(hipFree(work_swiglu));
     CHECK_HIP(hipFree(expert_output));
+}
+
+void ClassifierGemmGPU(const Tensor *W_out, Tensor *x, Tensor *logits,
+                        bool x_to_device, bool logits_from_device,
+                        hipStream_t stream) {
+    if (x_to_device) x->to_device(stream);
+
+    const int hidden_dim = x->num_elem();
+    const int vocab_size = logits->num_elem();
+
+    const float *W_out_ptr = (float *)W_out->d_buf;
+    const float *x_ptr = (float *)x->d_buf;
+    float *logits_ptr = (float *)logits->d_buf;
+
+    dim3 block_dim(DEFAULT_BLOCK_SIZE);
+    dim3 grid_dim((vocab_size + block_dim.x - 1) / block_dim.x);
+    matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(
+        W_out_ptr, x_ptr, nullptr, logits_ptr, vocab_size, hidden_dim
+    );
+
+    if (logits_from_device) {
+        logits->from_device(stream);
+        CHECK_HIP(hipStreamSynchronize(stream));
+    }
 }

@@ -72,16 +72,15 @@ void LinearBiasResidualGPU(const float *W, const float *x, const float *bias,
 
 // ---------- Router GEMM ----------
 /* r = W_router [n_experts, hidden] * t [hidden] + b */
-void RouterGemmGPU(const float *W_router, const float *t, const float *bias,
-                   float *r,  // [n_experts]
-                   int hidden_dim, int n_experts, hipStream_t stream);
+void RouterGemmGPU(const Tensor *w_router, Tensor *t, const Tensor *b_router,
+                   Tensor *router_score, long long layer_offset,
+                   bool t_to_device, bool r_from_device,
+                   hipStream_t stream = 0);
 
 // ---------- TopK + softmax(k) ----------
-void TopKSoftmaxGPU(const float *r,  // [n_experts]
-                    int n_experts, int k,
-                    float *topk_vals,  // [k] (softmaxed)
-                    int *topk_idx,     // [k]
-                    hipStream_t stream);
+void TopKSoftmaxGPU(Tensor *r, Tensor *topk_vals, TensorI32 *topk_idx,
+                    bool r_to_device, bool topk_vals_from_device,
+                    bool topk_idx_from_device, hipStream_t stream = 0);
 
 // ---------- MoE apply TopK (batched) ----------
 /* Với mỗi expert e trong topk_idx:
@@ -107,7 +106,6 @@ void MoEApplyTopKGPU(
   hipStream_t stream);
 
 // ---------- Classifier (logits = W_out * x) ----------
-void ClassifierGemmGPU(const float *W_out,  // [vocab, hidden]
-                       const float *x,      // [hidden]
-                       float *logits,       // [vocab]
-                       int hidden_dim, int vocab_size, hipStream_t stream);
+void ClassifierGemmGPU(const Tensor *W_out, Tensor *x, Tensor *logits,
+                        bool x_to_device, bool logits_from_device,
+                        hipStream_t stream = 0);

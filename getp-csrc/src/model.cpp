@@ -37,8 +37,8 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
         // Store k, v in cache
         // memcpy(rs->key_cache->buf + loff + 1ll * pos * p->n_kv_heads * p->head_dim, rs->k->buf, p->n_kv_heads * p->head_dim * sizeof(float));
         // memcpy(rs->value_cache->buf + loff + 1ll * pos * p->n_kv_heads * p->head_dim, rs->v->buf, p->n_kv_heads * p->head_dim * sizeof(float));
-        MemCpy_Tensor(rs->key_cache, rs->k, loff + 1ll * pos * p->n_kv_heads * p->head_dim, 0, (size_t)p->n_kv_heads * p->head_dim, true, true);
-        MemCpy_Tensor(rs->value_cache, rs->v, loff + 1ll * pos * p->n_kv_heads * p->head_dim, 0, (size_t)p->n_kv_heads * p->head_dim, true, true);
+        MemCpy_Tensor(rs->key_cache, rs->k, loff + 1ll * pos * p->n_kv_heads * p->head_dim, 0, (size_t)p->n_kv_heads * p->head_dim, false, true);
+        MemCpy_Tensor(rs->value_cache, rs->v, loff + 1ll * pos * p->n_kv_heads * p->head_dim, 0, (size_t)p->n_kv_heads * p->head_dim, false, true);
 
         // multihead attention
         int kv_mul = p->n_attn_heads / p->n_kv_heads; // integer multiplier for GQA
@@ -57,17 +57,17 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
                                 weights->attn_sinks, rs->tb, p->head_dim,
                                 p->n_attn_heads, kv_mul,
                                 p->head_dim * p->n_kv_heads, p->seq_len, p->sliding_window, pos, 1ll * l, false, false,
-                                false, false, true);
+                                false, false, false);
 
 
         // final matmul to get the output of the attention
         // AttnOutProject(rs->tb, weights->w_o, weights->b_o, rs->tb2, 1ll * l);
         AttnOutProjectGPU(rs->tb, weights->w_o, weights->b_o, rs->tb2,
-                            1ll * l, true, true);
+                            1ll * l, false, false);
 
         // residual connection back into x
         // ResidualAdd(rs->x, rs->tb2);
-        AddVectorGPU(rs->x, rs->tb2, false, true, false); // equals residual add
+        AddVectorGPU(rs->x, rs->tb2, false, false, false); // equals residual add
 
         // ffn rmsnorm
         // RMSNorm(rs->x, weights->rms_ffn_w, rs->t, 1ll * l);
@@ -89,13 +89,18 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
         */
 
         // MoE routing
-        RouterScores(rs->t, weights->w_router, weights->b_router, rs->router_score, 1ll * l);
+        // RouterScores(rs->t, weights->w_router, weights->b_router, rs->router_score, 1ll * l);
+        RouterGemmGPU(weights->w_router, rs->t, weights->b_router,
+                        rs->router_score, 1ll * l, false, false);
         
         // Select top-k experts
-        TopK(rs->router_score, p->experts_per_token, rs->topk_v, rs->topk_i);
+        // TopK(rs->router_score, p->experts_per_token, rs->topk_v, rs->topk_i);
         
         // Normalize selected experts using softmax
-        Softmax(rs->topk_v->buf, rs->topk_v->num_elem());
+        // Softmax(rs->topk_v->buf, rs->topk_v->num_elem());
+
+        TopKSoftmaxGPU(rs->router_score, rs->topk_v, rs->topk_i,
+                        false, true, true);
 
         // Route the tokens to their corresponding top-k experts
         // memset(rs->e_agg->buf, 0, p->hidden_dim * sizeof(float));
@@ -139,92 +144,6 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
         }
         printf("\n");
         */
-        
-        for (int idx = 0; idx < p->experts_per_token; idx++) {
-            int e = rs->topk_i->buf[idx];
-            float expert_w = rs->topk_v->buf[idx];
-
-            // printf("e: %d\n", e);
-
-            // Expert FFN 1: gate_up = W1 * t + b1
-            // ExpertFFN1(rs->t, weights->w_mlp1, weights->b_mlp1, rs->mlp1_out, 1ll * l, 1ll * e);
-
-            /*
-            printf("t_tensor: ");
-            for (int i=0; i<5; i++) {
-                printf("%.6f ", t_tensor->buf[i]);
-            }
-            printf("\n");
-            printf("w_mlp1_tensor: ");
-            for (int i=0; i<5; i++) {
-                printf("%.6f ", w_mlp1_tensor->buf[i]);
-            }
-            printf("\n");
-            printf("b_mlp1_tensor: ");
-            for (int i=0; i<5; i++) {
-                printf("%.6f ", b_mlp1_tensor->buf[i]);
-            }
-            printf("\n");
-            */
-            
-            // Split into gate and up
-            /*
-            for (int j = 0; j < p->intermediate_dim; j++) {
-                rs->gate->buf[j] = rs->mlp1_out->buf[2 * j];
-                rs->up->buf[j] = rs->mlp1_out->buf[2 * j + 1];
-            }
-            */
-
-            /*
-            printf("gate: ");
-            for (int i=0; i<5; i++) {
-                printf("%.6f ", gate_tensor->buf[i]);
-            }
-            printf("\n");
-            printf("up: ");
-            for (int i=0; i<5; i++) {
-                printf("%.6f ", up_tensor->buf[i]);
-            }
-            printf("\n");
-            */
-                
-            // SwiGLU non-linearity
-            // SwiGLU(rs->gate, rs->up, p->swiglu_limit, rs->gate_up);
-        
-            /*
-            printf("gate_up: ");
-            for (int i=0; i<5; i++) {
-                printf("%.6f ", gate_up_tensor->buf[i]);
-            }
-            printf("\n");
-            */
-            
-            // Expert FFN 2: y = W2 * swiglu + b2
-            // ExpertFFN2(rs->gate_up, weights->w_mlp2, weights->b_mlp2, rs->tb2, 1ll * l, 1ll * e);
-        
-            /*
-            printf("tb2_tensor: ");
-            for (int i=0; i<5; i++) {
-                printf("%.6f ", tb2_tensor->buf[i]);
-            }
-            printf("\n");
-            */
-            
-            // aggregate topk experts using weighted sum
-            /*
-            for (int i = 0; i < p->hidden_dim; i++) {
-                rs->e_agg->buf[i] += rs->tb2->buf[i] * expert_w;
-            }
-            */
-
-            /*
-            printf("e_agg_tensor: ");
-            for (int i=0; i<5; i++) {
-                printf("%.6f ", e_agg_tensor->buf[i]);
-            }
-            printf("\n");
-            */
-        }
 
         // residual connection
         // ResidualAdd(rs->x, rs->e_agg);
@@ -243,10 +162,11 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
     
     // final rmsnorm
     // RMSNorm(rs->x, weights->rms_out_w, rs->x, 0ll);
-    RMSNormGPU(rs->x, weights->rms_out_w, rs->x, 0ll, false, true);
+    RMSNormGPU(rs->x, weights->rms_out_w, rs->x, 0ll, false, false);
 
     // classifier into logits
-    Classifier(rs->x, weights->out, rs->logits);
+    // Classifier(rs->x, weights->out, rs->logits);
+    ClassifierGemmGPU(weights->out, rs->x, rs->logits, false, true);
     
     return rs->logits->buf;
 }
