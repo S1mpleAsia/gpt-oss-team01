@@ -28,7 +28,8 @@ void SplitQKV(const Tensor *qkv, int head_dim, int n_q, int n_kv,
               Tensor *v /*[n_kv*hd]*/);
 
 // cos/sin computation for RoPE at pos
-void RopePrecomputeCS(Config *p, Tensor *cos_all_out, Tensor *sin_all_out);
+void RopePrecomputeCS(Config *p, Tensor *cos_all_out,
+                    Tensor *sin_all_out, hipStream_t stream = 0);
 
 // RoPE (n_heads * head_dim)
 void ApplyRotary(Tensor *x /*[n_heads*hd]*/,

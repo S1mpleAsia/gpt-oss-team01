@@ -27,33 +27,12 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
 
         // Separate q, k, v
         // SplitQKV(rs->qkv, p->head_dim, p->n_attn_heads, p->n_kv_heads, rs->q, rs->k, rs->v);
-        SplitQKVGPU(rs->qkv, p->head_dim, p->n_attn_heads, p->n_kv_heads,
-                    rs->q, rs->k, rs->v, false, true, true, true);
-        /*
-        printf("CUSTOM\n");
-        printf("q_tensor: ");
-        for (int i = 0; i < 5; i++) {
-            printf("%.6f ", q_tensor->buf[i]);
-        }
-        printf("\n");
-        printf("k_tensor: ");
-        for (int i = 0; i < 5; i++) {
-            printf("%.6f ", k_tensor->buf[i]);
-        }
-        printf("\n");
-        printf("v_tensor: ");
-        for (int i = 0; i < 5; i++) {
-            printf("%.6f ", v_tensor->buf[i]);
-        }
-        printf("\n");
-        */
-
-        // RoPE relative positional encoding
-        // RopeComputeCS(pos, *p, cos_tensor, sin_tensor);
-        ApplyRotary(rs->q, cos_tensor, sin_tensor, p->n_attn_heads, p->head_dim, pos);
-        ApplyRotary(rs->k, cos_tensor, sin_tensor, p->n_kv_heads, p->head_dim, pos);
-
-        // printf("p->n_kv_heads: %d, p->head_dim: %d\n", p->n_kv_heads, p->head_dim);
+        // SplitQKVGPU(rs->qkv, p->head_dim, p->n_attn_heads, p->n_kv_heads, rs->q, rs->k, rs->v, false, true, true, true);
+        QKVEpilogueSplitRoPECacheGPU(
+            rs->qkv, rs->q, rs->k, rs->v, cos_tensor, sin_tensor,
+            p->head_dim, p->n_attn_heads, p->n_kv_heads, pos,
+            false, true, true, true
+        );
 
         // Store k, v in cache
         // memcpy(rs->key_cache->buf + loff + 1ll * pos * p->n_kv_heads * p->head_dim, rs->k->buf, p->n_kv_heads * p->head_dim * sizeof(float));

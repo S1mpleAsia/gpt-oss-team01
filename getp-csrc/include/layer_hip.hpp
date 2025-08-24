@@ -36,20 +36,13 @@ void AddVectorGPU(Tensor *y, Tensor *b, bool y_to_device,
 /* Đọc qkv_out (đã có/hoặc chưa có bias), cộng bias (nếu b != nullptr),
  *  tách Q; ghi K,V vào cache vị trí pos; áp RoPE cho Q và K@pos
  */
-void QKVEpilogueSplitRoPECacheGPU(float *qkv_out,             // [(n_q+2*n_kv)*hd]
-                                  float *q_out,               // [n_q*hd]
-                                  float *k_pos,               // [n_kv*hd] (cache @pos)
-                                  float *v_pos,               // [n_kv*hd] (cache @pos)
-                                  const float *rope_cos_pos,  // [hd/2]
-                                  const float *rope_sin_pos,  // [hd/2]
-                                  int head_dim, int n_q, int n_kv, hipStream_t stream);
-
-// ---------- Precompute RoPE table ----------
-void BuildRopeTableGPU(int seq_len, int head_dim, float rope_theta, float scaling_factor,
-                       float init_ctx_len, float ntk_beta, float ntk_alpha,
-                       float *d_out_cos,  // [seq_len, hd/2]
-                       float *d_out_sin,  // [seq_len, hd/2]
-                       hipStream_t stream);
+void QKVEpilogueSplitRoPECacheGPU(
+    Tensor *qkv_out, Tensor *q_out, Tensor *k_pos, Tensor *v_pos,
+    const Tensor *rope_cos_pos, const Tensor *rope_sin_pos,
+    int head_dim, int n_q, int n_kv, int pos, bool qkv_out_to_device,
+    bool q_out_from_device, bool k_pos_from_device,
+    bool v_pos_from_device, hipStream_t stream = 0
+);
 
 // ---------- Single-query attention fused ----------
 /* Tính logits q·k_t/√d + mask (nếu có) + 1 logit sink; softmax online;

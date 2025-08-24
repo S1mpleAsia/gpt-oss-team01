@@ -336,151 +336,104 @@ void LinearBiasResidualGPU(const float *W, const float *x, const float *bias, fl
 // 5. RoPE (Rotary Positional Embedding)
 //================================================================================================
 
-__global__ void rope_kernel(int seq_len, int head_dim, const float *d_inv_freq, float concentration, float *out_cos, float *out_sin) {
-    int pos = blockIdx.y;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;  // i là chỉ số của cặp dimension
+__global__ void QKVEpilogueSplitRoPECache_kernel(
+    float *qkv_out, float *q_out, float *k_pos, float *v_pos,
+    const float *rope_cos_pos, const float *rope_sin_pos,
+    int head_dim, int n_q, int n_kv) {
 
-    if (pos < seq_len && i < head_dim / 2) {
-        float inv_freq_val = d_inv_freq[i];
-        float val = (float)pos * inv_freq_val;
-        size_t idx = (size_t)pos * (head_dim / 2) + i;
-
-        out_cos[idx] = cosf(val) * concentration;
-        out_sin[idx] = sinf(val) * concentration;
-    }
-}
-
-void BuildRopeTableGPU(int seq_len, int head_dim, float rope_theta, float scaling_factor, float init_ctx_len, float ntk_beta, float ntk_alpha, float *d_out_cos, float *d_out_sin, hipStream_t stream) {
-    float concentration;
-    int d_half = head_dim / 2;
-
-    float *h_inv_freq = (float *)malloc(d_half * sizeof(float));
-
-    // void compute_concentration_and_inv_freq(float base, int head_dim, float scaling_factor,
-    //                                         float initial_context_length, float ntk_beta,
-    //                                         float ntk_alpha, float *concentration_out,
-    //                                         float *inv_freq_out  // length head_dim/2
-    //                                         )
-
-    // Pre-defined in run.cpp
-    compute_concentration_and_inv_freq(rope_theta, head_dim, scaling_factor, init_ctx_len, ntk_beta,
-                                        ntk_alpha, &concentration, h_inv_freq);
-
-    float *d_inv_freq;
-    size_t inv_freq_size = d_half * sizeof(float);
-
-    CHECK_HIP(hipMalloc(&d_inv_freq, inv_freq_size));
-    CHECK_HIP(hipMemcpyAsync(d_inv_freq, h_inv_freq, inv_freq_size, hipMemcpyHostToDevice, stream));
-
-    dim3 block_dim(DEFAULT_BLOCK_SIZE);
-    dim3 grid_dim((head_dim / 2 + block_dim.x - 1) / block_dim.x, seq_len);
-    rope_kernel<<<grid_dim, block_dim, 0, stream>>>(seq_len, head_dim, d_inv_freq, concentration,
-                                                    d_out_cos, d_out_sin);
-    CHECK_HIP(hipGetLastError());
-
-    CHECK_HIP(hipStreamSynchronize(stream));
-    CHECK_HIP(hipFree(d_inv_freq));
-    free(h_inv_freq);
-}
-
-__global__ void QKVEpilogueSplitRoPECache_kernel(float *qkv_out, float *q_out, float *k_pos,
-                                                 float *v_pos, const float *rope_cos_pos,
-                                                 const float *rope_sin_pos, int head_dim, int n_q,
-                                                 int n_kv) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int half_dim = head_dim / 2;
 
-    // Tổng số chiều của Q, K, V
+    // Total dimensions for Q, K, V
     int q_dims = n_q * head_dim;
     int k_dims = n_kv * head_dim;
     int v_dims = n_kv * head_dim;
 
-    if (idx < q_dims + k_dims + v_dims) {
-        float val = qkv_out[idx];
+    if (idx >= q_dims + k_dims + v_dims) return;
 
-        if (idx < q_dims) {  // Đây là phần tử của Q
-            int head_idx = idx / head_dim;
-            int dim_idx = idx % head_dim;
+    if (idx < q_dims) { // Processing a Q element
+        int head_idx = idx / head_dim;
+        int dim_idx_in_head = idx % head_dim;
+        int rope_idx = dim_idx_in_head % half_dim;
 
-            // Áp dụng RoPE cho Q
-            if (dim_idx % 2 == 0) {
-                int pair_dim_idx = dim_idx + 1;
-                int pair_idx = head_idx * head_dim + pair_dim_idx;
-                float val_pair = qkv_out[pair_idx];
+        float cos_val = rope_cos_pos[rope_idx];
+        float sin_val = rope_sin_pos[rope_idx];
 
-                int rope_idx = dim_idx / 2;
-                float cos_val = rope_cos_pos[rope_idx];
-                float sin_val = rope_sin_pos[rope_idx];
+        int partner_dim_offset;
+        float partner_val;
 
-                q_out[idx] = val * cos_val - val_pair * sin_val;
-                q_out[pair_idx] = val * sin_val + val_pair * cos_val;
-            }
-
-        } else if (idx < q_dims + k_dims) {  // Đây là phần tử của K
-            int k_idx = idx - q_dims;
-            int head_idx = k_idx / head_dim;
-            int dim_idx = k_idx % head_dim;
-
-            // Áp dụng RoPE cho K và ghi vào cache
-            if (dim_idx % 2 == 0) {
-                int pair_dim_idx = dim_idx + 1;
-                int pair_idx = q_dims + head_idx * head_dim + pair_dim_idx;
-                float val_pair = qkv_out[pair_idx];
-
-                int rope_idx = dim_idx / 2;
-                float cos_val = rope_cos_pos[rope_idx];
-                float sin_val = rope_sin_pos[rope_idx];
-
-                k_pos[k_idx] = val * cos_val - val_pair * sin_val;
-                k_pos[k_idx + 1] = val * sin_val + val_pair * cos_val;
-            }
-        } else {  // Đây là phần tử của V
-            int v_idx = idx - q_dims - k_dims;
-            v_pos[v_idx] = val;  // Chỉ cần copy V vào cache
+        if (dim_idx_in_head < half_dim) {
+            // This is the first half of the vector (x1)
+            partner_dim_offset = half_dim;
+            partner_val = qkv_out[idx + partner_dim_offset];
+            q_out[idx] = qkv_out[idx] * cos_val - partner_val * sin_val;
+        } else {
+            // This is the second half of the vector (x2)
+            partner_dim_offset = -half_dim;
+            partner_val = qkv_out[idx + partner_dim_offset];
+            q_out[idx] = qkv_out[idx] * cos_val + partner_val * sin_val;
         }
+
+    } else if (idx < q_dims + k_dims) { // Processing a K element
+        int k_local_idx = idx - q_dims;
+        int head_idx = k_local_idx / head_dim;
+        int dim_idx_in_head = k_local_idx % head_dim;
+        int rope_idx = dim_idx_in_head % half_dim;
+
+        float cos_val = rope_cos_pos[rope_idx];
+        float sin_val = rope_sin_pos[rope_idx];
+
+        int partner_dim_offset;
+        float partner_val;
+
+        if (dim_idx_in_head < half_dim) {
+            // First half
+            partner_dim_offset = half_dim;
+            partner_val = qkv_out[idx + partner_dim_offset];
+            k_pos[k_local_idx] = qkv_out[idx] * cos_val - partner_val * sin_val;
+        } else {
+            // Second half
+            partner_dim_offset = -half_dim;
+            partner_val = qkv_out[idx + partner_dim_offset];
+            k_pos[k_local_idx] = qkv_out[idx] * cos_val + partner_val * sin_val;
+        }
+
+    } else { // Processing a V element (simple copy)
+        int v_local_idx = idx - q_dims - k_dims;
+        v_pos[v_local_idx] = qkv_out[idx];
     }
 }
 
-void QKVEpilogueSplitRoPECacheGPU(float *qkv_out, float *q_out, float *k_pos, float *v_pos,
-                                  const float *rope_cos_pos, const float *rope_sin_pos,
-                                  int head_dim, int n_q, int n_kv, hipStream_t stream) {
+void QKVEpilogueSplitRoPECacheGPU(
+    Tensor *qkv_out, Tensor *q_out, Tensor *k_pos, Tensor *v_pos,
+    const Tensor *rope_cos_pos, const Tensor *rope_sin_pos,
+    int head_dim, int n_q, int n_kv, int pos, bool qkv_out_to_device,
+    bool q_out_from_device, bool k_pos_from_device,
+    bool v_pos_from_device, hipStream_t stream
+) {
+    if (qkv_out_to_device) qkv_out->to_device(stream);
+
+    int offset = pos * (head_dim / 2);
+
+    float *qkv_out_ptr = (float *)qkv_out->d_buf;
+    float *q_out_ptr = (float *)q_out->d_buf;
+    float *k_pos_ptr = (float *)k_pos->d_buf;
+    float *v_pos_ptr = (float *)v_pos->d_buf;
+    const float *rope_cos_pos_ptr = (float *)rope_cos_pos->d_buf + 1ll * offset;
+    const float *rope_sin_pos_ptr = (float *)rope_sin_pos->d_buf + 1ll * offset;
+    
     int total_dims = (n_q + 2 * n_kv) * head_dim;
     dim3 block_dim(DEFAULT_BLOCK_SIZE);
     dim3 grid_dim((total_dims + block_dim.x - 1) / block_dim.x);
     QKVEpilogueSplitRoPECache_kernel<<<grid_dim, block_dim, 0, stream>>>(
-        qkv_out, q_out, k_pos, v_pos, rope_cos_pos, rope_sin_pos, head_dim, n_q, n_kv);
-}
+        qkv_out_ptr, q_out_ptr, k_pos_ptr, v_pos_ptr, rope_cos_pos_ptr, rope_sin_pos_ptr, head_dim, n_q, n_kv
+    );
 
-/* TODO: IMPLEMENT THIS FUNCTION */
-void ApplyRotaryGPU(Tensor *x, const Tensor *cos_table,
-                    const Tensor *sin_table, int n_heads,
-                    int head_dim, int pos) {
-    int half = head_dim / 2;
-
-    for (int h = 0; h < n_heads; h++) {
-        for (int i = 0; i < half; i++) {
-            // --- THIS IS THE KEY CHANGE ---
-            // Calculate the index to look up the cos/sin values for the given position.
-            // The tables are logically 2D [pos, i], so the 1D index is pos * (width) + i.
-            int rope_idx = pos * half + i;
-            float c = cos_table->buf[rope_idx];
-            float s = sin_table->buf[rope_idx];
-
-            // --- The rotation logic remains the same ---
-            // Indexing for the input tensor: head h, dim i
-            int x_idx1 = h * head_dim + i;        // first half
-            int x_idx2 = h * head_dim + half + i; // second half
-
-            float x1 = x->buf[x_idx1];
-            float x2 = x->buf[x_idx2];
-
-            // Apply the 2D rotation
-            float o1 = x1 * c - x2 * s;
-            float o2 = x2 * c + x1 * s;
-
-            // Write the results back
-            x->buf[x_idx1] = o1;
-            x->buf[x_idx2] = o2;
-        }
+    if (q_out_from_device) q_out->from_device(stream);
+    if (k_pos_from_device) k_pos->from_device(stream);
+    if (v_pos_from_device) v_pos->from_device(stream);
+    if (q_out_from_device || k_pos_from_device || v_pos_from_device) {
+        CHECK_HIP(hipStreamSynchronize(stream));
     }
 }
 

@@ -158,7 +158,8 @@ void our_compute_concentration_and_inv_freq(float base, int head_dim,
  * @param sin_all_out Output tensor for sine values. Must be pre-allocated with
  * size = seq_len * (head_dim / 2).
  */
-void RopePrecomputeCS(Config *p, Tensor *cos_all_out, Tensor *sin_all_out) {
+void RopePrecomputeCS(Config *p, Tensor *cos_all_out,
+                    Tensor *sin_all_out, hipStream_t stream) {
     int seq_len = p->seq_len;
     int head_dim = p->head_dim;
     int d_half = head_dim / 2;
@@ -194,6 +195,10 @@ void RopePrecomputeCS(Config *p, Tensor *cos_all_out, Tensor *sin_all_out) {
     }
 
     free(inv_freq);
+
+    cos_all_out->to_device(stream);
+    sin_all_out->to_device(stream);
+    CHECK_HIP(hipStreamSynchronize(stream));
 }
 
 /**
