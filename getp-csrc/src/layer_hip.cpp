@@ -747,30 +747,21 @@ __global__ void matmul_kernel_bf16_weights(const bf16 *W, const float *x, const 
 
 void MoEApplyTopKGPU_wrapper(const float *t, const bf16 *W1, const bf16 *b1, const bf16 *W2, const bf16 *b2,
                      const int *topk_idx, const float *topk_vals,
-                     float *work_gate_up,  // scratch: [2*inter]
+                     float *mlp1_out,  // mlp1_out: [2*inter]
+                     float *gate_up, // gate_up: [inter]
                      float *e_agg_inout,   // out: [hidden]
+                     float *tb3,
                      int hidden_dim, int inter_dim, int k, float clamp_limit, hipStream_t stream) {
     // Cảnh báo: Cài đặt naive này copy dữ liệu về host để điều khiển vòng lặp.
     // Điều này rất chậm và chỉ dùng cho mục đích minh họa/debug.
     // Một cài đặt thực tế sẽ dùng các kernel phức tạp hơn để giữ mọi thứ trên GPU.
-    int h_topk_idx[k];
-    float h_topk_vals[k];
-    CHECK_HIP(hipMemcpy(h_topk_idx, topk_idx, k * sizeof(int), hipMemcpyDeviceToHost));
-    CHECK_HIP(hipMemcpy(h_topk_vals, topk_vals, k * sizeof(float), hipMemcpyDeviceToHost));
-    CHECK_HIP(hipDeviceSynchronize());  // Đợi copy xong
 
     // Xóa bộ đệm tích lũy kết quả
     CHECK_HIP(hipMemsetAsync(e_agg_inout, 0, hidden_dim * sizeof(float), stream));
 
-    // Cấp phát bộ nhớ tạm trên GPU cho kết quả của từng expert
-    float *work_swiglu;    // scratch: [inter]
-    float *expert_output;  // scratch: [hidden]
-    CHECK_HIP(hipMalloc(&work_swiglu, inter_dim * sizeof(float)));
-    CHECK_HIP(hipMalloc(&expert_output, hidden_dim * sizeof(float)));
-
     for (int i = 0; i < k; i++) {
-        int expert_idx = h_topk_idx[i];
-        float expert_weight = h_topk_vals[i];
+        int expert_idx = topk_idx[i];
+        float expert_weight = topk_vals[i];
 
         // Con trỏ tới trọng số của expert đang xét
         size_t w1_offset = (size_t)expert_idx * (2 * inter_dim) * hidden_dim;
@@ -784,38 +775,32 @@ void MoEApplyTopKGPU_wrapper(const float *t, const bf16 *W1, const bf16 *b1, con
         const bf16 *b2_expert = b2 + b2_offset;
 
         // --- Bước 1: GEMM đầu tiên ---
-        // z = W1 * t + b1 -> ghi vào work_gate_up
+        // z = W1 * t + b1 -> ghi vào mlp1_out
         matmul_kernel_bf16_weights<<<(2 * inter_dim + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE,
                                     DEFAULT_BLOCK_SIZE, 0, stream>>>(
-        W1_expert, t, b1_expert, work_gate_up, 2 * inter_dim, hidden_dim);
+        W1_expert, t, b1_expert, mlp1_out, 2 * inter_dim, hidden_dim);
 
         // --- Bước 2: Kích hoạt SwiGLU ---
-        // swiglu = silu(gate) * up -> ghi vào work_swiglu
+        // swiglu = silu(gate) * up -> ghi vào gate_up
         SwiGLU_kernel<<<(inter_dim + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE, DEFAULT_BLOCK_SIZE,
-                        0, stream>>>(work_gate_up, work_swiglu, inter_dim, clamp_limit);
+                        0, stream>>>(mlp1_out, gate_up, inter_dim, clamp_limit);
 
         // --- Bước 3: GEMM thứ hai ---
-        // y = W2 * swiglu + b2 -> ghi vào expert_output
+        // y = W2 * swiglu + b2 -> ghi vào tb3
         matmul_kernel_bf16_weights<<<(hidden_dim + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE,
                                     DEFAULT_BLOCK_SIZE, 0, stream>>>(
-        W2_expert, work_swiglu, b2_expert, expert_output, hidden_dim, inter_dim);
+        W2_expert, gate_up, b2_expert, tb3, hidden_dim, inter_dim);
 
         // --- Bước 4: Cộng dồn kết quả theo trọng số ---
         // e_agg_inout += weight * y
-        WeightedAccumulate_kernel<<<(hidden_dim + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE,
-                                    DEFAULT_BLOCK_SIZE, 0, stream>>>(expert_output, expert_weight,
-                                                                    e_agg_inout, hidden_dim);
+        WeightedAccumulate_kernel<<<(hidden_dim + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE, DEFAULT_BLOCK_SIZE, 0, stream>>>(tb3, expert_weight, e_agg_inout, hidden_dim);
     }
-
-    // Giải phóng bộ nhớ tạm
-    CHECK_HIP(hipFree(work_swiglu));
-    CHECK_HIP(hipFree(expert_output));
 }
 
 void MoEApplyTopKGPU(Tensor *t, const Tensor *W1, const Tensor *b1,
                     const Tensor *W2, const Tensor *b2, TensorI32 *topk_idx,
-                    Tensor *topk_vals, Tensor *gate_up, Tensor *e_agg,
-                    float clamp_limit, long long layer_offset, bool t_to_device,
+                    Tensor *topk_vals, Tensor *mlp1_out, Tensor *gate_up, Tensor *tb3, Tensor *e_agg, float clamp_limit,
+                    long long layer_offset, bool t_to_device,
                     bool topk_idx_to_device, bool topk_vals_to_device,
                     bool e_agg_from_device, hipStream_t stream) {
     if (t_to_device) t->to_device(stream);
@@ -837,17 +822,18 @@ void MoEApplyTopKGPU(Tensor *t, const Tensor *W1, const Tensor *b1,
     const bf16 *b1_ptr = (const bf16 *)b1->d_buf + 1ll * offset * 2 * inter_dim;
     const bf16 *W2_ptr = (const bf16 *)W2->d_buf + 1ll * offset * inter_hidden;
     const bf16 *b2_ptr = (const bf16 *)b2->d_buf + 1ll * offset * hidden_dim;
-    const int *topk_idx_ptr = topk_idx->d_buf;
-    const float *topk_vals_ptr = (const float *)topk_vals->d_buf;
+    const int *topk_idx_ptr = topk_idx->buf;
+    const float *topk_vals_ptr = topk_vals->buf;
+    float *mlp1_out_ptr = (float *)mlp1_out->d_buf;
+    float *tb3_ptr = (float *)tb3->d_buf;
     float *gate_up_ptr = (float *)gate_up->d_buf;
     float *e_agg_ptr = (float *)e_agg->d_buf;
 
     // Call the wrapper function with the extracted parameters and pointers
     MoEApplyTopKGPU_wrapper(t_ptr, W1_ptr, b1_ptr, W2_ptr, b2_ptr,
-                            topk_idx_ptr, topk_vals_ptr,
-                            gate_up_ptr,  // work_gate_up scratch space
-                            e_agg_ptr,    // e_agg_inout accumulator
-                            hidden_dim, inter_dim, k, clamp_limit, stream);
+                            topk_idx_ptr, topk_vals_ptr, mlp1_out_ptr,
+                            gate_up_ptr, e_agg_ptr, tb3_ptr, hidden_dim,
+                            inter_dim, k, clamp_limit, stream);
     
     if (e_agg_from_device) {
         e_agg->from_device(stream);

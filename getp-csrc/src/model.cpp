@@ -57,13 +57,14 @@ float *forward_gpu_20b(Config *p, OurTransformerWeights *weights, OurRunState *r
         
         // Select top-k experts
         TopKSoftmaxGPU(rs->router_score, rs->topk_v, rs->topk_i,
-                        false, false, false);
+                        false, true, true);
 
         // Route the tokens to their corresponding top-k experts
         MoEApplyTopKGPU(rs->t, weights->w_mlp1, weights->b_mlp1,
                         weights->w_mlp2, weights->b_mlp2, rs->topk_i,
-                        rs->topk_v, rs->gate_up, rs->e_agg,
-                        p->swiglu_limit, 1ll * l, false, false, false, false);
+                        rs->topk_v, rs->mlp1_out, rs->gate_up, rs->tb3,
+                        rs->e_agg, p->swiglu_limit, 1ll * l, false, false,
+                        false, false);
 
         // residual connection
         AddVectorGPU(rs->x, rs->e_agg, false, false, false); // equals residual add

@@ -86,8 +86,8 @@ void TopKSoftmaxGPU(Tensor *r, Tensor *topk_vals, TensorI32 *topk_idx,
  */
 void MoEApplyTopKGPU(Tensor *t, const Tensor *W1, const Tensor *b1,
                     const Tensor *W2, const Tensor *b2, TensorI32 *topk_idx,
-                    Tensor *topk_vals, Tensor *gate_up, Tensor *e_agg,
-                    float clamp_limit, long long layer_offset, bool t_to_device,
+                    Tensor *topk_vals, Tensor *mlp1_out, Tensor *gate_up, Tensor *tb3, Tensor *e_agg, float clamp_limit,
+                    long long layer_offset, bool t_to_device,
                     bool topk_idx_to_device, bool topk_vals_to_device,
                     bool e_agg_from_device, hipStream_t stream = 0);
 
