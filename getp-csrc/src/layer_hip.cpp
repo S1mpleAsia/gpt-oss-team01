@@ -715,85 +715,109 @@ __global__ void SwiGLU_kernel(const float *interleaved_in, float *swiglu_out, in
     }
 }
 
-__global__ void WeightedAccumulate_kernel(const float *expert_out, float weight, float *accumulator,
-                                          int hidden_dim) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < hidden_dim) {
-        accumulator[i] += weight * expert_out[i];
-    }
-}
+/**
+ * @brief Performs batched matrix-vector multiplication for a set of selected experts in an MoE layer.
+ *
+ * This kernel computes `out[j] = W_experts[j] * x + b_experts[j]` for each j in topk_idx.
+ *
+ * @param W Pointer to the weight tensor for ALL experts, shaped (num_experts, out_features, in_features).
+ * @param x Pointer to the single input vector, shaped (in_features).
+ * @param bias Pointer to the bias tensor for ALL experts, shaped (num_experts, out_features).
+ * @param out Pointer to the output tensor, shaped (k, out_features).
+ * @param topk_idx Pointer to an array of integers containing the indices of the k selected experts.
+ * @param k The number of experts to process (the 'k' in top-k).
+ * @param out_features The output dimension of a single expert's matrix (number of rows).
+ * @param in_features The input dimension of a single expert's matrix (number of columns).
+ */
+__global__ void moe_matmul_kernel_bf16_weights(
+    const bf16 *W, const float *x, const bf16 *bias, float *out,
+    const int *topk_idx, int k, int out_features, int in_features,
+    bool offset_input
+) {
+    // A global index for each output element across all k experts.
+    // Total work items = k * out_features.
+    int global_idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-__global__ void matmul_kernel_bf16_weights(const bf16 *W, const float *x, const bf16 *bias,
-                                           float *out, int out_features, int in_features) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (global_idx < k * out_features) {
+        // 1. Decompose the global index to find which expert and which row this thread handles.
 
-    if (row < out_features) {
-        double sum = 0.0;  // Vẫn dùng double để tích lũy cho chính xác
-        const bf16 *W_row = W + (size_t)row * in_features;
+        // `expert_k_idx`: which of the k experts we are working on (from 0 to k-1).
+        int expert_k_idx = global_idx / out_features;
+        // `row`: which output row for that specific expert (from 0 to out_features-1).
+        int row = global_idx % out_features;
 
+        // 2. Get the actual expert ID from the top-k index array.
+        int expert_id = topk_idx[expert_k_idx];
+
+        // 3. Calculate the correct offsets for this expert's data.
+        size_t expert_w_offset = (size_t)expert_id * out_features * in_features;
+        size_t expert_b_offset = (size_t)expert_id * out_features;
+
+        // Pointer to the specific row of the selected expert's weight matrix.
+        const bf16 *W_row = W + expert_w_offset + (size_t)row * in_features;
+        const float *x_cur = offset_input ? x + 1ll * expert_k_idx * in_features : x;
+
+        // The inner loop for the dot product remains the same.
+        double sum = 0.0;
         for (int i = 0; i < in_features; i++) {
-            // Chuyển đổi trọng số bfloat16 sang float để tính toán
+            // Convert bfloat16 weight to float for calculation.
             float w_val = static_cast<float>(W_row[i]);
-            sum += (double)w_val * x[i];
+            sum += (double)w_val * x_cur[i];
         }
 
         if (bias != nullptr) {
-            // Chuyển đổi bias bfloat16 sang float để cộng
-            sum += static_cast<float>(bias[row]);
+            // Add the bias for the corresponding expert and row.
+            sum += static_cast<float>(bias[expert_b_offset + row]);
         }
-        out[row] = (float)sum;
+
+        // Write the result to the correct position in the output tensor.
+        // The output is structured as [expert_0_output, expert_1_output, ...].
+        // `global_idx` naturally maps to the correct flat index in the output.
+        out[global_idx] = (float)sum;
     }
 }
 
-void MoEApplyTopKGPU_wrapper(const float *t, const bf16 *W1, const bf16 *b1, const bf16 *W2, const bf16 *b2,
-                     const int *topk_idx, const float *topk_vals,
-                     float *mlp1_out,  // mlp1_out: [2*inter]
-                     float *gate_up, // gate_up: [inter]
-                     float *e_agg_inout,   // out: [hidden]
-                     float *tb3,
-                     int hidden_dim, int inter_dim, int k, float clamp_limit, hipStream_t stream) {
-    // Cảnh báo: Cài đặt naive này copy dữ liệu về host để điều khiển vòng lặp.
-    // Điều này rất chậm và chỉ dùng cho mục đích minh họa/debug.
-    // Một cài đặt thực tế sẽ dùng các kernel phức tạp hơn để giữ mọi thứ trên GPU.
+/**
+ * @brief Performs a batched, weighted accumulation of expert outputs.
+ *
+ * This kernel replaces a loop of individual kernel launches. It calculates
+ * `accumulator[j] += topk_weights[i] * expert_outputs[i][j]` for all experts 'i' and all elements 'j'.
+ *
+ * @param expert_outputs Pointer to a contiguous block of memory containing the outputs of all k experts,
+ * shaped [k, hidden_dim]. This corresponds to the 'tb3' buffer.
+ * @param topk_weights   Pointer to the weights for the k selected experts on the device.
+ * @param accumulator    Pointer to the final output tensor to accumulate results into, shaped [hidden_dim].
+ * @param k              The number of selected experts.
+ * @param hidden_dim     The dimension of each expert's output.
+ */
+__global__ void BatchedWeightedAccumulate_kernel(const float *expert_outputs,
+                                                 const float *topk_weights,
+                                                 float *accumulator,
+                                                 int k,
+                                                 int hidden_dim) {
+    // A global index for each output element across all k experts.
+    // Total work items = k * hidden_dim.
+    int global_idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // Xóa bộ đệm tích lũy kết quả
-    CHECK_HIP(hipMemsetAsync(e_agg_inout, 0, hidden_dim * sizeof(float), stream));
+    if (global_idx < k * hidden_dim) {
+        // 1. Decompose the global index to find which expert and which element this thread handles.
 
-    for (int i = 0; i < k; i++) {
-        int expert_idx = topk_idx[i];
-        float expert_weight = topk_vals[i];
+        // `expert_k_idx`: which of the k experts we are working on (from 0 to k-1).
+        int expert_k_idx = global_idx / hidden_dim;
 
-        // Con trỏ tới trọng số của expert đang xét
-        size_t w1_offset = (size_t)expert_idx * (2 * inter_dim) * hidden_dim;
-        size_t b1_offset = (size_t)expert_idx * (2 * inter_dim);
-        size_t w2_offset = (size_t)expert_idx * hidden_dim * inter_dim;
-        size_t b2_offset = (size_t)expert_idx * hidden_dim;
+        // `element_idx`: which element within the hidden_dim vector this thread is responsible for.
+        int element_idx = global_idx % hidden_dim;
 
-        const bf16 *W1_expert = W1 + w1_offset;
-        const bf16 *b1_expert = b1 + b1_offset;
-        const bf16 *W2_expert = W2 + w2_offset;
-        const bf16 *b2_expert = b2 + b2_offset;
+        // 2. Fetch the corresponding weight for this expert.
+        float weight = topk_weights[expert_k_idx];
 
-        // --- Bước 1: GEMM đầu tiên ---
-        // z = W1 * t + b1 -> ghi vào mlp1_out
-        matmul_kernel_bf16_weights<<<(2 * inter_dim + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE,
-                                    DEFAULT_BLOCK_SIZE, 0, stream>>>(
-        W1_expert, t, b1_expert, mlp1_out, 2 * inter_dim, hidden_dim);
+        // 3. Fetch the output value from the expert tensor.
+        float expert_out_val = expert_outputs[global_idx];
 
-        // --- Bước 2: Kích hoạt SwiGLU ---
-        // swiglu = silu(gate) * up -> ghi vào gate_up
-        SwiGLU_kernel<<<(inter_dim + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE, DEFAULT_BLOCK_SIZE,
-                        0, stream>>>(mlp1_out, gate_up, inter_dim, clamp_limit);
-
-        // --- Bước 3: GEMM thứ hai ---
-        // y = W2 * swiglu + b2 -> ghi vào tb3
-        matmul_kernel_bf16_weights<<<(hidden_dim + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE,
-                                    DEFAULT_BLOCK_SIZE, 0, stream>>>(
-        W2_expert, gate_up, b2_expert, tb3, hidden_dim, inter_dim);
-
-        // --- Bước 4: Cộng dồn kết quả theo trọng số ---
-        // e_agg_inout += weight * y
-        WeightedAccumulate_kernel<<<(hidden_dim + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE, DEFAULT_BLOCK_SIZE, 0, stream>>>(tb3, expert_weight, e_agg_inout, hidden_dim);
+        // 4. Atomically add the weighted value to the accumulator.
+        // This is crucial because multiple threads (one for each expert) will be writing
+        // to the same `accumulator[element_idx]` location.
+        atomicAdd(&accumulator[element_idx], weight * expert_out_val);
     }
 }
 
@@ -807,10 +831,9 @@ void MoEApplyTopKGPU(Tensor *t, const Tensor *W1, const Tensor *b1,
     if (topk_idx_to_device) topk_idx->to_device(stream);
     if (topk_vals_to_device) topk_vals->to_device(stream);
 
-    // TODO: add values here: hidden_dim, etc.
     // Extract dimensions from tensor shapes
     const int hidden_dim = t->shape[0];
-    const int inter_dim = W2->shape[2]; // W2 shape is [n_layers, n_experts, hidden, inter] -> we need inter
+    const int inter_dim = W2->shape[2];
     const int k = topk_idx->num_elem();
     const int num_experts = b2->shape[1];
     const long long offset = layer_offset * num_experts;
@@ -822,18 +845,49 @@ void MoEApplyTopKGPU(Tensor *t, const Tensor *W1, const Tensor *b1,
     const bf16 *b1_ptr = (const bf16 *)b1->d_buf + 1ll * offset * 2 * inter_dim;
     const bf16 *W2_ptr = (const bf16 *)W2->d_buf + 1ll * offset * inter_hidden;
     const bf16 *b2_ptr = (const bf16 *)b2->d_buf + 1ll * offset * hidden_dim;
-    const int *topk_idx_ptr = topk_idx->buf;
-    const float *topk_vals_ptr = topk_vals->buf;
+    const int *topk_idx_ptr = topk_idx->d_buf;
+    const float *topk_vals_ptr = (float *)topk_vals->d_buf;
     float *mlp1_out_ptr = (float *)mlp1_out->d_buf;
     float *tb3_ptr = (float *)tb3->d_buf;
     float *gate_up_ptr = (float *)gate_up->d_buf;
     float *e_agg_ptr = (float *)e_agg->d_buf;
 
-    // Call the wrapper function with the extracted parameters and pointers
-    MoEApplyTopKGPU_wrapper(t_ptr, W1_ptr, b1_ptr, W2_ptr, b2_ptr,
-                            topk_idx_ptr, topk_vals_ptr, mlp1_out_ptr,
-                            gate_up_ptr, e_agg_ptr, tb3_ptr, hidden_dim,
-                            inter_dim, k, clamp_limit, stream);
+    // Xóa bộ đệm tích lũy kết quả
+    MemSet_Tensor(e_agg, 0, false, true, stream);
+
+    // --- Bước 1: GEMM thứ nhất ---
+    // z = W1 * t + b1 -> ghi vào mlp1_out
+    size_t total_threads_mlp1 = 1ll * k * 2 * inter_dim;
+
+    moe_matmul_kernel_bf16_weights<<<(total_threads_mlp1 + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE, DEFAULT_BLOCK_SIZE, 0, stream>>>(
+        W1_ptr, t_ptr, b1_ptr, mlp1_out_ptr, topk_idx_ptr, k,
+        2 * inter_dim, hidden_dim, false
+    );
+
+    // --- Bước 2: Kích hoạt SwiGLU ---
+    // swiglu = silu(gate) * up -> ghi vào gate_up
+    size_t swiglu_threads = k * inter_dim;
+    
+    SwiGLU_kernel<<<(swiglu_threads + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE, DEFAULT_BLOCK_SIZE, 0, stream>>>(
+        mlp1_out_ptr, gate_up_ptr, k * inter_dim, clamp_limit
+    );
+    
+    // --- Bước 3: GEMM thứ hai ---
+    // y = W2 * swiglu + b2 -> ghi vào tb3
+    size_t total_threads_mlp2 = 1ll * k * hidden_dim;
+
+    moe_matmul_kernel_bf16_weights<<<(total_threads_mlp2 + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE, DEFAULT_BLOCK_SIZE, 0, stream>>>(
+        W2_ptr, gate_up_ptr, b2_ptr, tb3_ptr, topk_idx_ptr, k,
+        hidden_dim, inter_dim, true
+    );
+
+    // --- Bước 4: Cộng dồn kết quả theo trọng số ---
+    // e_agg_inout += weight * y
+    size_t total_threads_accum = 1ll * k * hidden_dim;
+
+    BatchedWeightedAccumulate_kernel<<<(total_threads_accum + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE, DEFAULT_BLOCK_SIZE, 0, stream>>>(
+        tb3_ptr, topk_vals_ptr, e_agg_ptr, k, hidden_dim
+    );
     
     if (e_agg_from_device) {
         e_agg->from_device(stream);

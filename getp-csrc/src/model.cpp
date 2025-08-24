@@ -57,7 +57,7 @@ float *forward_gpu_20b(Config *p, OurTransformerWeights *weights, OurRunState *r
         
         // Select top-k experts
         TopKSoftmaxGPU(rs->router_score, rs->topk_v, rs->topk_i,
-                        false, true, true);
+                        false, false, false);
 
         // Route the tokens to their corresponding top-k experts
         MoEApplyTopKGPU(rs->t, weights->w_mlp1, weights->b_mlp1,
