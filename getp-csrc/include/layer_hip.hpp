@@ -18,7 +18,7 @@ void qkv_gemm(Tensor *x, const Tensor *W_qkv, const Tensor *b_qkv, Tensor *qkv,
 
 void split_qkv(Tensor *qkv, int head_dim, int n_q, int n_kv, Tensor *q, Tensor *k, Tensor *v,
                bool qkv_to_device, bool q_from_device, bool k_from_device, bool v_from_device,
-               hipStream_t stream = 0);
+               hipStream_t stream = 0);  // (Not used)
 
 void add_vector(Tensor *y, Tensor *b, bool y_to_device, bool b_to_device, bool y_from_device,
                 hipStream_t stream = 0);
@@ -40,7 +40,7 @@ void attn_out_project(Tensor *tb, const Tensor *W_o, const Tensor *b_o, Tensor *
                       long long layer_offset, bool tb_to_device, bool y_from_device,
                       hipStream_t stream = 0);
 
-// ---------- Linear + bias + residual----------
+// ---------- Linear + bias + residual---------- (Not used)
 /* y = W [out,in] * x [in] + b  ;  x_out = x_resid + y */
 void linear_bias_residual(const float *W, const float *x, const float *bias,
                           float *x_resid_inout,  // in: residual src, out: x += y

@@ -91,31 +91,34 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer, S
     // exit(1);
 
     // advance the state machine
-    pos++;
-    if (pos < num_prompt_tokens) {
-      // if we are still processing the input prompt, force the next prompt
-      // token
-      next = prompt_tokens[pos];
-    } else {
-      // otherwise sample the next token from the logits
-      next = sample(sampler, logits);
-      // save the output token, it will be printed to file
-      output_tokens[pos - num_prompt_tokens] = next;
+    {
+      // GpuTimer("sample");
+      pos++;
+      if (pos < num_prompt_tokens) {
+        // if we are still processing the input prompt, force the next prompt
+        // token
+        next = prompt_tokens[pos];
+      } else {
+        // otherwise sample the next token from the logits
+        next = sample(sampler, logits);
+        // save the output token, it will be printed to file
+        output_tokens[pos - num_prompt_tokens] = next;
+      }
+
+      // data-dependent terminating condition: the EOS (=199999 or =200002) token
+      // delimits sequences
+      if (next == 199999 || next == 200002) {
+        break;
+      }
+
+      // print the token as string, decode it with the Tokenizer object
+      // should be removed
+      const char *piece = decode_piece(tokenizer, token, next);
+      safe_printf(piece);  // same as printf("%s", piece), but skips "unsafe" bytes
+      fflush(stdout);
+
+      token = next;
     }
-
-    // data-dependent terminating condition: the EOS (=199999 or =200002) token
-    // delimits sequences
-    if (next == 199999 || next == 200002) {
-      break;
-    }
-
-    // print the token as string, decode it with the Tokenizer object
-    // should be removed
-    const char *piece = decode_piece(tokenizer, token, next);
-    safe_printf(piece);  // same as printf("%s", piece), but skips "unsafe" bytes
-    fflush(stdout);
-
-    token = next;
   }
 
   // should be removed
