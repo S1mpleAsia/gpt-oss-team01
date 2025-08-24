@@ -43,21 +43,10 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
         // multihead attention
         int kv_mul = p->n_attn_heads / p->n_kv_heads; // integer multiplier for GQA
 
-        AttnScoresAllHeads(rs->key_cache, rs->q, rs->att, rs->mask,
-                            loff_one, 1ll * l, p->n_attn_heads, kv_mul,
-                            p->head_dim, p->head_dim * p->n_kv_heads,
+        AttnScoresAllHeads(rs->key_cache, rs->q, rs->att, weights->attn_sinks,
+                            rs->mask, loff_one, 1ll * l, p->n_attn_heads,
+                            kv_mul, p->head_dim, p->head_dim * p->n_kv_heads,
                             p->seq_len, p->sliding_window, pos);
-        
-        // For each head, compute attention scores and weighted sum
-        for (int h = 0; h < p->n_attn_heads; h++) {
-            // attention scores for this head
-            float *att_head = rs->att->buf + h * p->seq_len;
-            // Add attention sink score
-            att_head[pos + 1] = weights->attn_sinks->buf[l * p->n_attn_heads + h];
-
-            // softmax the scores to get attention weights
-            Softmax(att_head, (size_t)pos + 2);
-        }
 
         AttnWeightedSumAllHeads(rs->value_cache, rs->q, rs->att, rs->tb, 
                                 loff, p->n_attn_heads, kv_mul, p->head_dim,

@@ -253,10 +253,11 @@ void ApplyRotary(Tensor *x /*[n_heads*hd]*/,
 }
 
 // Attention scores for 1 head: att[0..pos] = q·k_t / sqrt(hd) (+ mask)
-void AttnScoresAllHeads(Tensor *key_cache, Tensor *q, Tensor *att, Tensor *mask,
-                        long long loff_one, long long layer_offset,
-                        int attn_heads, int kv_mul, int head_dim,
-                        int kv_dim, int seq_len, int sliding_window, int pos) {
+void AttnScoresAllHeads(Tensor *key_cache, Tensor *q, Tensor *att,
+                        Tensor *attn_sinks, Tensor *mask, long long loff_one,
+                        long long layer_offset, int attn_heads, int kv_mul,
+                        int head_dim, int kv_dim, int seq_len,
+                        int sliding_window, int pos) {
     float *mask_row = nullptr;
     if (sliding_window > 0 && (layer_offset % 2 == 0)) {
         mask_row = mask->buf + pos * seq_len;
@@ -288,6 +289,13 @@ void AttnScoresAllHeads(Tensor *key_cache, Tensor *q, Tensor *att, Tensor *mask,
             }
             att_head[t] = score;
         }
+
+        // ADD THOSE THINGS MAKE THE PRECISION WORSE BY A LOT
+        // Add attention sink score
+        att_head[pos + 1] = attn_sinks->buf[layer_offset * attn_heads + h];
+
+        // softmax the scores to get attention weights
+        Softmax(att_head, (size_t)pos + 2);
     }
 }
 

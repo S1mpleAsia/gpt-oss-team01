@@ -38,10 +38,11 @@ void ApplyRotary(Tensor *x /*[n_heads*hd]*/,
                  int n_heads, int head_dim, int pos);
 
 // Attention scores for 1 head: att[0..pos] = q·k_t / sqrt(hd) (+ mask)
-void AttnScoresAllHeads(Tensor *key_cache, Tensor *q, Tensor *att, Tensor *mask,
-                        long long loff_one, long long layer_offset,
-                        int attn_heads, int kv_mul, int head_dim,
-                        int kv_dim, int seq_len, int sliding_window, int pos);
+void AttnScoresAllHeads(Tensor *key_cache, Tensor *q, Tensor *att,
+                        Tensor *attn_sinks, Tensor *mask, long long loff_one,
+                        long long layer_offset, int attn_heads, int kv_mul,
+                        int head_dim, int kv_dim, int seq_len,
+                        int sliding_window, int pos);
 
 // Weighted sum for 1 head
 void AttnWeightedSumAllHeads(Tensor *value_cache, Tensor *q, Tensor *att,
