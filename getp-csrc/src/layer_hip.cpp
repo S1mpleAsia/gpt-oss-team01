@@ -4,6 +4,55 @@
 
 #define DEFAULT_BLOCK_SIZE 256
 
+// try GEMV (FP32 W): caches x in LDS, 1 row per thread
+#ifndef WAVE_SIZE
+#define WAVE_SIZE warpSize
+#endif
+
+template<int TILE_K=256>
+__global__ void matmul_kernel_opt_fp32(
+    const float* __restrict__ W, 
+    const float* __restrict__ x, 
+    const float* __restrict__ bias,
+    float*       __restrict__ y,
+    int out_features, int in_features, size_t row_stride
+){
+    __shared__ float sx[TILE_K];
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    float acc = 0.f;
+
+    for (int k0 = 0; k0 < in_features; k0 += TILE_K) {
+        for (int t = threadIdx.x; t < TILE_K; t += blockDim.x) {
+            int k = k0 + t;
+            sx[t] = (k < in_features)?x[k]:0.f;
+        }
+        __syncthreads();
+        if (row < out_features) {
+            const float* w = W + (size_t)row * row_stride + k0;
+            int k = 0;
+            const int Ktile = min(TILE_K, in_features - k0);
+            const int V = (Ktile >> 2) << 2;
+            const float4* w4 = reinterpret_cast<const float4*>(w);
+            const float4* x4 = reinterpret_cast<const float4*>(sx);
+            #pragma unroll 
+            for (; k < V; k += 4) {
+                float4 ww = w4[k>>2];
+                float4 xx = x4[k>>2];
+                acc = fmaf(ww.x, xx.x, acc);
+                acc = fmaf(ww.y, xx.y, acc);
+                acc = fmaf(ww.z, xx.z, acc);
+                acc = fmaf(ww.w, xx.w, acc);
+            }
+            for (; k < Ktile; ++k) acc = fmaf(w[k], sx[k], acc);
+        }
+        __syncthreads();
+    }
+    if (row < out_features) {
+        float by = bias?bias[row]:0.f;
+        y[row] = acc + by;
+    }
+}
+
 void EmbeddingLookupGPU(Tensor *embedding,  // (vocab_size, hidden_dim)
                         int token_id, Tensor *x,  // (hidden_dim, )
                         bool x_from_device, hipStream_t stream = 0) {
@@ -213,7 +262,10 @@ void QKVGemmGPU_Old(const float *w_qkv, const float *b_qkv, const float *t, floa
     dim3 block_dim(DEFAULT_BLOCK_SIZE);
     dim3 grid_dim((out_features + block_dim.x - 1) / block_dim.x);
 
-    matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(w_qkv, t, b_qkv, out, out_features, in_features);
+    //matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(w_qkv, t, b_qkv, out, out_features, in_features);
+
+    matmul_kernel_opt_fp32<256><<<grid_dim, block_dim, 0, stream>>>(
+      w_qkv, t, b_qkv, out, out_features, in_features, in_features);
 }
 
 void QKVGemmGPU(Tensor *x, const Tensor *W_qkv, const Tensor *b_qkv, 
@@ -232,9 +284,12 @@ void QKVGemmGPU(Tensor *x, const Tensor *W_qkv, const Tensor *b_qkv,
     dim3 block_dim(DEFAULT_BLOCK_SIZE);
     dim3 grid_dim((out_features + block_dim.x - 1) / block_dim.x);
 
-    matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(
-        w_qkv_ptr, x_ptr, b_qkv_ptr, qkv_ptr, out_features, in_features
-    );
+    // matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(
+    //     w_qkv_ptr, x_ptr, b_qkv_ptr, qkv_ptr, out_features, in_features
+    // );
+    
+    matmul_kernel_opt_fp32<256><<<grid_dim, block_dim, 0, stream>>>(
+      w_qkv_ptr, x_ptr, b_qkv_ptr, qkv_ptr, out_features, in_features, in_features);
 
     if (qkv_from_device) {
         qkv->from_device(stream);
@@ -572,9 +627,12 @@ void AttnOutProjectGPU(
     
     dim3 block_dim(DEFAULT_BLOCK_SIZE);
     dim3 grid_dim((hidden + block_dim.x - 1) / block_dim.x);
-    matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(
-        w_o_ptr, tb_ptr, b_o_ptr, y_ptr, hidden, n_q_hd
-    );
+    // matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(
+    //     w_o_ptr, tb_ptr, b_o_ptr, y_ptr, hidden, n_q_hd
+    // );
+
+    matmul_kernel_opt_fp32<256><<<grid_dim, block_dim, 0, stream>>>(
+      w_o_ptr, tb_ptr, b_o_ptr, y_ptr, hidden, n_q_hd, n_q_hd);
 
     if (y_from_device) {
         y->from_device(stream);
@@ -599,15 +657,92 @@ void RouterGemmGPU(const Tensor *w_router, Tensor *t, const Tensor *b_router,
 
     dim3 block_dim(DEFAULT_BLOCK_SIZE);
     dim3 grid_dim((n_experts + block_dim.x - 1) / block_dim.x);
-    matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(
-        w_router_ptr, t_ptr, b_router_ptr, r_ptr, n_experts, hidden
-    );
+    
+    // matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(
+    //     w_router_ptr, t_ptr, b_router_ptr, r_ptr, n_experts, hidden
+    // );
+
+    matmul_kernel_opt_fp32<256><<<grid_dim, block_dim, 0, stream>>>(
+      w_router_ptr, t_ptr, b_router_ptr, r_ptr, n_experts, hidden, hidden);
 
     if (r_from_device) {
         router_score->from_device(stream);
         CHECK_HIP(hipStreamSynchronize(stream));
     }
 }
+
+// n_experts <= 128; k == 4
+__global__ void TopKSoftmax_kernel_opt(
+    const float* __restrict__ r, int n_experts, int k,
+    float* __restrict__ topk_vals, int* __restrict__ topk_idx)
+{
+    extern __shared__ float smem[];
+    float* vals = smem;                 // n_experts
+    int*   idxs = (int*)(vals + n_experts); // n_experts
+
+    // cooperative load
+    for (int i=threadIdx.x; i<n_experts; i+=blockDim.x){
+        vals[i] = r[i];
+        idxs[i] = i;
+    }
+    __syncthreads();
+
+    // select k maxima
+    for (int sel=0; sel<k; ++sel) {
+        // parallel argmax over vals
+        float best_val = -FLT_MAX;
+        int   best_idx = -1;
+        for (int i=threadIdx.x; i<n_experts; i+=blockDim.x) {
+            float v = vals[i];
+            if (v > best_val) { best_val = v; best_idx = i; }
+        }
+        // block reduce
+        __shared__ float s_val;
+        __shared__ int   s_idx;
+        if (threadIdx.x == 0) { s_val = -FLT_MAX; s_idx = -1; }
+        __syncthreads();
+
+        // warp-level then atomic to shared scalars
+        // (simple approach: each thread races with atomicCAS on index based on value ordering)
+        // Better: use shuffles; here we use shared mem reduction:
+        __shared__ float red_vals[256];
+        __shared__ int   red_idxs[256];
+        red_vals[threadIdx.x] = best_val;
+        red_idxs[threadIdx.x] = best_idx;
+        __syncthreads();
+
+        // reduce inside block
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                if (red_vals[threadIdx.x + stride] > red_vals[threadIdx.x]) {
+                    red_vals[threadIdx.x] = red_vals[threadIdx.x + stride];
+                    red_idxs[threadIdx.x] = red_idxs[threadIdx.x + stride];
+                }
+            }
+            __syncthreads();
+        }
+
+        int winner = red_idxs[0];
+        float winner_val = red_vals[0];
+
+        if (threadIdx.x == 0) {
+            topk_idx[sel]  = idxs[winner];
+            topk_vals[sel] = winner_val;   // store raw score for now
+            vals[winner]   = -INFINITY;    // mark as taken
+        }
+        __syncthreads();
+    }
+
+    // softmax over the picked k (numerical stability)
+    if (threadIdx.x == 0) {
+        double m = -DBL_MAX;
+        for (int i=0;i<k;++i) m = fmax(m, (double)topk_vals[i]);
+        double denom = 0.0;
+        for (int i=0;i<k;++i) denom += exp((double)topk_vals[i] - m);
+        for (int i=0;i<k;++i) topk_vals[i] = (float)(exp((double)topk_vals[i] - m) / denom);
+    }
+}
+
 
 __global__ void TopKSoftmax_kernel(const float *r, int n_experts, int k, float *topk_vals, int *topk_idx) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
@@ -663,6 +798,7 @@ __global__ void TopKSoftmax_kernel(const float *r, int n_experts, int k, float *
     }
 }
 
+
 void TopKSoftmaxGPU(Tensor *r, Tensor *topk_vals, TensorI32 *topk_idx,
                     bool r_to_device, bool topk_vals_from_device,
                     bool topk_idx_from_device, hipStream_t stream) {
@@ -676,10 +812,22 @@ void TopKSoftmaxGPU(Tensor *r, Tensor *topk_vals, TensorI32 *topk_idx,
     int *topk_idx_ptr = topk_idx->d_buf;
 
     // shared_mem_size exceeds when num_experts > 32
-    size_t shared_mem_size = (size_t)num_experts * (sizeof(float) + sizeof(int));
-    TopKSoftmax_kernel<<<1, 1, shared_mem_size, stream>>>(
-        r_ptr, num_experts, experts_per_token, topk_vals_ptr, topk_idx_ptr
-    );
+    // size_t shared_mem_size = (size_t)num_experts * (sizeof(float) + sizeof(int));
+    // TopKSoftmax_kernel<<<1, 1, shared_mem_size, stream>>>(
+    //     r_ptr, num_experts, experts_per_token, topk_vals_ptr, topk_idx_ptr
+    // );
+
+    {
+        int n_experts = r->num_elem();
+        int k = topk_idx->num_elem();
+        dim3 block( 16 ); // power-of-two ≤256
+        dim3 grid(1);
+        size_t shmem = (size_t)n_experts * (sizeof(float) + sizeof(int));
+        TopKSoftmax_kernel_opt<<<grid, block, shmem, stream>>>(
+            r_ptr, n_experts, k, topk_vals_ptr, topk_idx_ptr);
+        CHECK_HIP(hipGetLastError());
+    }
+
     CHECK_HIP(hipGetLastError());
 
     if (topk_vals_from_device) topk_vals->from_device(stream);
@@ -729,52 +877,51 @@ __global__ void SwiGLU_kernel(const float *interleaved_in, float *swiglu_out, in
  * @param out_features The output dimension of a single expert's matrix (number of rows).
  * @param in_features The input dimension of a single expert's matrix (number of columns).
  */
-__global__ void moe_matmul_kernel_bf16_weights(
-    const bf16 *W, const float *x, const bf16 *bias, float *out,
-    const int *topk_idx, int k, int out_features, int in_features,
-    bool offset_input
-) {
-    // A global index for each output element across all k experts.
-    // Total work items = k * out_features.
-    int global_idx = blockIdx.x * blockDim.x + threadIdx.x;
+template<int TILE_K=256>
+__global__ void moe_matmul_kernel_bf16_opt(
+    const bf16 * __restrict__ W,     // [num_experts, out_features, in_features] row-major
+    const float* __restrict__ x_base,// [in_features] or [k, in_features] if offset_input=true
+    const bf16 * __restrict__ bias,  // [num_experts, out_features] or nullptr
+    float*       __restrict__ out,   // [k, out_features] flat
+    const int*   __restrict__ topk_idx,
+    int k, int out_features, int in_features, bool offset_input)
+{
+    __shared__ float sx[TILE_K];
 
-    if (global_idx < k * out_features) {
-        // 1. Decompose the global index to find which expert and which row this thread handles.
+    const int gid = blockIdx.x * blockDim.x + threadIdx.x; // 0..k*out_features-1
+    if (gid >= k * out_features) return;
 
-        // `expert_k_idx`: which of the k experts we are working on (from 0 to k-1).
-        int expert_k_idx = global_idx / out_features;
-        // `row`: which output row for that specific expert (from 0 to out_features-1).
-        int row = global_idx % out_features;
+    const int ek  = gid / out_features;  // which of k
+    const int row = gid % out_features;  // row inside expert
 
-        // 2. Get the actual expert ID from the top-k index array.
-        int expert_id = topk_idx[expert_k_idx];
+    const int expert = topk_idx[ek];
+    const bf16* W_row = W + (size_t)expert * out_features * in_features
+                           + (size_t)row    * in_features;
+    const float* x = offset_input ? (x_base + (size_t)ek * in_features) : x_base;
 
-        // 3. Calculate the correct offsets for this expert's data.
-        size_t expert_w_offset = (size_t)expert_id * out_features * in_features;
-        size_t expert_b_offset = (size_t)expert_id * out_features;
+    float acc = 0.f;
 
-        // Pointer to the specific row of the selected expert's weight matrix.
-        const bf16 *W_row = W + expert_w_offset + (size_t)row * in_features;
-        const float *x_cur = offset_input ? x + 1ll * expert_k_idx * in_features : x;
-
-        // The inner loop for the dot product remains the same.
-        double sum = 0.0;
-        for (int i = 0; i < in_features; i++) {
-            // Convert bfloat16 weight to float for calculation.
-            float w_val = static_cast<float>(W_row[i]);
-            sum += (double)w_val * x_cur[i];
+    for (int k0=0; k0<in_features; k0+=TILE_K) {
+        // cache x tile
+        for (int t=threadIdx.x; t<TILE_K; t+=blockDim.x) {
+            int kk = k0 + t;
+            sx[t] = (kk < in_features) ? x[kk] : 0.f;
         }
+        __syncthreads();
 
-        if (bias != nullptr) {
-            // Add the bias for the corresponding expert and row.
-            sum += static_cast<float>(bias[expert_b_offset + row]);
+        // dot with bf16 weights → float
+        const int Ktile = min(TILE_K, in_features - k0);
+        int kk = 0;
+        // simple unroll; bf16 packs aren't guaranteed aligned, keep scalar
+        #pragma unroll 4
+        for (; kk < Ktile; ++kk) {
+            acc = fmaf((float)W_row[k0 + kk], sx[kk], acc);
         }
-
-        // Write the result to the correct position in the output tensor.
-        // The output is structured as [expert_0_output, expert_1_output, ...].
-        // `global_idx` naturally maps to the correct flat index in the output.
-        out[global_idx] = (float)sum;
+        __syncthreads();
     }
+
+    if (bias) acc += (float)bias[(size_t)expert * out_features + row];
+    out[gid] = acc;
 }
 
 /**
@@ -794,31 +941,18 @@ __global__ void BatchedWeightedAccumulate_kernel(const float *expert_outputs,
                                                  const float *topk_weights,
                                                  float *accumulator,
                                                  int k,
-                                                 int hidden_dim) {
-    // A global index for each output element across all k experts.
-    // Total work items = k * hidden_dim.
-    int global_idx = blockIdx.x * blockDim.x + threadIdx.x;
+                                                 int hidden_dim) 
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= hidden_dim) return;    
 
-    if (global_idx < k * hidden_dim) {
-        // 1. Decompose the global index to find which expert and which element this thread handles.
-
-        // `expert_k_idx`: which of the k experts we are working on (from 0 to k-1).
-        int expert_k_idx = global_idx / hidden_dim;
-
-        // `element_idx`: which element within the hidden_dim vector this thread is responsible for.
-        int element_idx = global_idx % hidden_dim;
-
-        // 2. Fetch the corresponding weight for this expert.
-        float weight = topk_weights[expert_k_idx];
-
-        // 3. Fetch the output value from the expert tensor.
-        float expert_out_val = expert_outputs[global_idx];
-
-        // 4. Atomically add the weighted value to the accumulator.
-        // This is crucial because multiple threads (one for each expert) will be writing
-        // to the same `accumulator[element_idx]` location.
-        atomicAdd(&accumulator[element_idx], weight * expert_out_val);
+    float sum = 0.f;
+    #pragma unroll
+    for (int ek = 0; ek < 8; ++ek) {
+        if (ek >= k) break;
+        sum = fmaf(topk_weights[ek], expert_outputs[(size_t)ek * hidden_dim + i], sum);
     }
+    accumulator[i] += sum;
 }
 
 void MoEApplyTopKGPU(Tensor *t, const Tensor *W1, const Tensor *b1,
@@ -859,10 +993,17 @@ void MoEApplyTopKGPU(Tensor *t, const Tensor *W1, const Tensor *b1,
     // z = W1 * t + b1 -> ghi vào mlp1_out
     size_t total_threads_mlp1 = 1ll * k * 2 * inter_dim;
 
-    moe_matmul_kernel_bf16_weights<<<(total_threads_mlp1 + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE, DEFAULT_BLOCK_SIZE, 0, stream>>>(
-        W1_ptr, t_ptr, b1_ptr, mlp1_out_ptr, topk_idx_ptr, k,
-        2 * inter_dim, hidden_dim, false
-    );
+    // moe_matmul_kernel_bf16_weights<<<(total_threads_mlp1 + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE, DEFAULT_BLOCK_SIZE, 0, stream>>>(
+    //     W1_ptr, t_ptr, b1_ptr, mlp1_out_ptr, topk_idx_ptr, k,
+    //     2 * inter_dim, hidden_dim, false
+    // );
+
+   const int rows1 = 2 * inter_dim;
+    const int work1 = k * rows1;
+    dim3 block(256);
+    dim3 grid((work1 + block.x - 1) / block.x);
+    moe_matmul_kernel_bf16_opt<256><<<grid, block, 0, stream>>>(
+        W1_ptr, t_ptr, b1_ptr, mlp1_out_ptr, topk_idx_ptr, k, rows1, hidden_dim, /*offset_input=*/false);
 
     // --- Bước 2: Kích hoạt SwiGLU ---
     // swiglu = silu(gate) * up -> ghi vào gate_up
@@ -876,10 +1017,16 @@ void MoEApplyTopKGPU(Tensor *t, const Tensor *W1, const Tensor *b1,
     // y = W2 * swiglu + b2 -> ghi vào tb3
     size_t total_threads_mlp2 = 1ll * k * hidden_dim;
 
-    moe_matmul_kernel_bf16_weights<<<(total_threads_mlp2 + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE, DEFAULT_BLOCK_SIZE, 0, stream>>>(
-        W2_ptr, gate_up_ptr, b2_ptr, tb3_ptr, topk_idx_ptr, k,
-        hidden_dim, inter_dim, true
-    );
+    // moe_matmul_kernel_bf16_weights<<<(total_threads_mlp2 + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE, DEFAULT_BLOCK_SIZE, 0, stream>>>(
+    //     W2_ptr, gate_up_ptr, b2_ptr, tb3_ptr, topk_idx_ptr, k,
+    //     hidden_dim, inter_dim, true
+    // );
+
+    const int rows2 = hidden_dim;
+    const int work2 = k * rows2;
+    dim3 grid2((work2 + block.x - 1) / block.x);
+    moe_matmul_kernel_bf16_opt<256><<<grid2, block, 0, stream>>>(
+      W2_ptr, gate_up_ptr, b2_ptr, tb3_ptr, topk_idx_ptr, k, rows2, inter_dim, /*offset_input=*/true);
 
     // --- Bước 4: Cộng dồn kết quả theo trọng số ---
     // e_agg_inout += weight * y
@@ -909,9 +1056,13 @@ void ClassifierGemmGPU(const Tensor *W_out, Tensor *x, Tensor *logits,
 
     dim3 block_dim(DEFAULT_BLOCK_SIZE);
     dim3 grid_dim((vocab_size + block_dim.x - 1) / block_dim.x);
-    matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(
-        W_out_ptr, x_ptr, nullptr, logits_ptr, vocab_size, hidden_dim
-    );
+
+    // matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(
+    //     W_out_ptr, x_ptr, nullptr, logits_ptr, vocab_size, hidden_dim
+    // );
+
+    matmul_kernel_opt_fp32<256><<<grid_dim, block_dim, 0, stream>>>(
+      W_out_ptr, x_ptr, nullptr, logits_ptr, vocab_size, hidden_dim, hidden_dim);
 
     if (logits_from_device) {
         logits->from_device(stream);
