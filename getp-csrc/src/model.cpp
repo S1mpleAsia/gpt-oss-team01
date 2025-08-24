@@ -71,7 +71,7 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
 
         // ffn rmsnorm
         // RMSNorm(rs->x, weights->rms_ffn_w, rs->t, 1ll * l);
-        RMSNormGPU(rs->x, weights->rms_ffn_w, rs->t, 1ll * l, false, true);
+        RMSNormGPU(rs->x, weights->rms_ffn_w, rs->t, 1ll * l, false, false);
         /*
         if (l < 3) {
             printf("CUSTOM:\n");
@@ -100,32 +100,33 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
         // Softmax(rs->topk_v->buf, rs->topk_v->num_elem());
 
         TopKSoftmaxGPU(rs->router_score, rs->topk_v, rs->topk_i,
-                        false, true, true);
+                        false, false, false);
 
         // Route the tokens to their corresponding top-k experts
         // memset(rs->e_agg->buf, 0, p->hidden_dim * sizeof(float));
-        MemSet_Tensor(rs->e_agg, 0, true, true);
+        // MemSet_Tensor(rs->e_agg, 0, true, true);
 
         // printf("Layer: %d\n", l);
-        ExpertFFN1_Total(rs->t, weights->w_mlp1, weights->b_mlp1, 
-                        rs->mlp1_out, rs->topk_i, 1ll * l);
+        // ExpertFFN1_Total(rs->t, weights->w_mlp1, weights->b_mlp1, rs->mlp1_out, rs->topk_i, 1ll * l);
 
         // printf("Finish ExpertFFN1...\n");
 
+        /*
         for (int j = 0; j < p->experts_per_token * p->intermediate_dim; j++) {
             rs->gate->buf[j] = rs->mlp1_out->buf[2 * j];
             rs->up->buf[j] = rs->mlp1_out->buf[2 * j + 1];
         }
+        */
 
         // printf("Finish to gate&up...\n");
         
-        SwiGLU(rs->gate, rs->up, p->swiglu_limit, rs->gate_up);
+        // SwiGLU(rs->gate, rs->up, p->swiglu_limit, rs->gate_up);
         
         // printf("Finish SwiGLU...\n");
 
-        ExpertFFN2_Total(rs->gate_up, weights->w_mlp2, weights->b_mlp2, 
-                        rs->tb3, rs->topk_i, 1ll * l);
+        // ExpertFFN2_Total(rs->gate_up, weights->w_mlp2, weights->b_mlp2, rs->tb3, rs->topk_i, 1ll * l);
         
+        /*
         for (int i = 0; i < p->hidden_dim; i++) {
             float sum_cur = 0.0f;
             for (int j = 0; j < p->experts_per_token; j++) {
@@ -134,6 +135,7 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
             }
             rs->e_agg->buf[i] += sum_cur;
         }
+        */
         
         // printf("Finish combined...\n");
         
@@ -144,10 +146,20 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
         }
         printf("\n");
         */
+        MoEApplyTopKGPU(rs->t, weights->w_mlp1, weights->b_mlp1,
+                        weights->w_mlp2, weights->b_mlp2, rs->topk_i,
+                        rs->topk_v, rs->gate_up, rs->e_agg,
+                        p->swiglu_limit, 1ll * l, false, false, false, false);
+        /*
+        MoEApplyTopKGPU(rs->t, weights->w_mlp1, weights->b_mlp1,
+                        weights->w_mlp2, weights->b_mlp2, rs->topk_i,
+                        rs->topk_v, rs->mlp1_out, rs->gate_up, rs->tb3,
+                        p->swiglu_limit, p->n_experts, true, true, true, true);
+        */
 
         // residual connection
         // ResidualAdd(rs->x, rs->e_agg);
-        AddVectorGPU(rs->x, rs->e_agg, false, true, false); // equals residual add
+        AddVectorGPU(rs->x, rs->e_agg, false, false, false); // equals residual add
     
         /*
         printf("x after expert: ");

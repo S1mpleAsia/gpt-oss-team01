@@ -90,7 +90,7 @@ void TopKSoftmaxGPU(Tensor *r, Tensor *topk_vals, TensorI32 *topk_idx,
  *  e_agg += topk_vals[e] * y
  * Có thể dùng gemm-strided-batched nếu layout tuần tự; nếu không, vòng for k nhỏ.
  */
-void MoEApplyTopKGPU(
+void MoEApplyTopKGPU_wrapper(
   const float *t,          // [hidden]
   const bf16 *W1,          // [n_layers? n_experts? 2*inter, hidden] - pass base for this layer
   const bf16 *b1,          // [n_experts, 2*inter]
@@ -104,6 +104,13 @@ void MoEApplyTopKGPU(
   int k,              // experts_per_token
   float clamp_limit,  // swiglu_limit
   hipStream_t stream);
+
+void MoEApplyTopKGPU(Tensor *t, const Tensor *W1, const Tensor *b1,
+                    const Tensor *W2, const Tensor *b2, TensorI32 *topk_idx,
+                    Tensor *topk_vals, Tensor *gate_up, Tensor *e_agg,
+                    float clamp_limit, long long layer_offset, bool t_to_device,
+                    bool topk_idx_to_device, bool topk_vals_to_device,
+                    bool e_agg_from_device, hipStream_t stream = 0);
 
 // ---------- Classifier (logits = W_out * x) ----------
 void ClassifierGemmGPU(const Tensor *W_out, Tensor *x, Tensor *logits,

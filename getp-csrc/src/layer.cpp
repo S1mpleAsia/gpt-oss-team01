@@ -414,33 +414,12 @@ void SwiGLU(const Tensor *gate /*[d]*/, const Tensor *up /*[d]*/,
 }
 
 // Expert FFN 1: z = W1 * t + b1
-void ExpertFFN1(const Tensor *t, const Tensor *W1, const Tensor *b1,
-                Tensor *z, long long layer_offset, long long expert_offset) {
-    const long long offset = 1ll * (layer_offset * b1->shape[1] + expert_offset);
-    const long long intermediate = z->num_elem();
-    const long long hidden = t->num_elem();
-    const float *w1_buf = W1->buf + offset * intermediate * hidden;
-    const float *b1_buf = b1->buf + offset * intermediate;
-    
-    Linear(t->buf, hidden, w1_buf, b1_buf, intermediate, z->buf);
-}
-
 void ExpertFFN1_Total(const Tensor *t, const Tensor *W1, const Tensor *b1,      
                     Tensor *z, const TensorI32 *topk_i, long long layer_offset) {
     const long long intermediate = z->shape[1];
     const long long hidden = t->num_elem();
     const int experts_per_token = z->shape[0];
     const long long num_experts = b1->shape[1];
-
-    /*
-    t->printShape("t");
-    W1->printShape("W1");
-    b1->printShape("b1");
-    z->printShape("z");
-    printf("hidden: %lld, intermediate: %lld, experts_per_token: %d, num_experts: %lld, layer_offset: %lld\n", hidden, intermediate, experts_per_token, num_experts, layer_offset);
-
-    printf("orig w1 pointer: %p, orig b1 pointer: %p, orig z pointer: %p\n", (void*)W1->buf, (void*)b1->buf, (void*)z->buf);
-    */
 
     for (int idx = 0; idx < experts_per_token; idx++) {
         int e = topk_i->buf[idx];
@@ -449,47 +428,18 @@ void ExpertFFN1_Total(const Tensor *t, const Tensor *W1, const Tensor *b1,
         const float *w1_buf = W1->buf + offset * intermediate * hidden;
         const float *b1_buf = b1->buf + offset * intermediate;
         float *z_buf = z->buf + 1ll * idx * intermediate;
-
-        /*
-        printf("expert id: %d, expert rank: %d\n", e, idx);
-        printf("offset: %lld, offset w1: %lld, offset b1: %lld\n", offset, offset * intermediate * hidden, offset * intermediate);
-        printf("new w1 pointer: %p, new b1 pointer: %p, new z pointer: %p\n", (void*)W1->buf, (void*)b1->buf, (void*)z->buf);
-        printf("w1_buf pointer: %p, b1_buf pointer: %p, z_buf pointer: %p\n", (void*)w1_buf, (void*)b1_buf, (void*)z_buf);
-        */
         
         Linear(t->buf, hidden, w1_buf, b1_buf, intermediate, z_buf);
-
-        // printf("Finish Linear\n");
     }
 }
 
 // Expert FFN 2: y = W2 * swiglu + b2
-void ExpertFFN2(const Tensor *swiglu, const Tensor *W2, const Tensor *b2,
-                Tensor *y, long long layer_offset, long long expert_offset) {
-    const long long offset = 1ll * (layer_offset * b2->shape[1] + expert_offset);
-    const long long intermediate = swiglu->num_elem();
-    const long long hidden = y->num_elem();
-    const float *w2_buf = W2->buf + offset * intermediate * hidden;
-    const float *b2_buf = b2->buf + offset * hidden;
-
-    Linear(swiglu->buf, intermediate, w2_buf, b2_buf, hidden, y->buf);
-}
-
 void ExpertFFN2_Total(const Tensor *swiglu, const Tensor *W2, const Tensor *b2,
                     Tensor *y, const TensorI32 *topk_i, long long layer_offset) {
     const long long intermediate = swiglu->shape[1];
     const long long hidden = y->shape[1];
     const int experts_per_token = y->shape[0];
     const int num_experts = b2->shape[1];
-
-    /*
-    swiglu->printShape("swiglu");
-    W2->printShape("W2");
-    b2->printShape("b2");
-    y->printShape("y");
-    printf("hidden: %lld, intermediate: %lld, experts_per_token: %d, num_experts: %d, layer_offset: %lld\n", hidden, intermediate, experts_per_token, num_experts, layer_offset);
-    printf("orig swiglu pointer: %p, orig w2 pointer: %p, orig b2 pointer: %p, orig y pointer: %p\n", (void*)swiglu->buf, (void*)W2->buf, (void*)b2->buf, (void*)y->buf);
-    */
     
     for (int idx = 0; idx < experts_per_token; idx++) {
         int e = topk_i->buf[idx];
@@ -499,17 +449,8 @@ void ExpertFFN2_Total(const Tensor *swiglu, const Tensor *W2, const Tensor *b2,
         const float *b2_buf = b2->buf + offset * hidden;
         const float *swiglu_buf = swiglu->buf + 1ll * idx * intermediate;
         float *y_buf = y->buf + 1ll * idx * hidden;
-        
-        /*
-        printf("expert id: %d, expert rank: %d\n", e, idx);
-        printf("offset: %lld, offset w2: %lld, offset b2: %lld\n", offset, offset * intermediate * hidden, offset * hidden);
-        printf("new swiglu pointer: %p, new w2 pointer: %p, new b2 pointer: %p, new y pointer: %p\n", (void*)swiglu->buf, (void*)W2->buf, (void*)b2->buf, (void*)y->buf);
-        printf("swiglu_buf pointer: %p, w2_buf pointer: %p, b2_buf pointer: %p, y_buf pointer: %p\n", (void*)swiglu_buf, (void*)w2_buf, (void*)b2_buf, (void*)y_buf);
-        */
 
         Linear(swiglu_buf, intermediate, w2_buf, b2_buf, hidden, y_buf);
-
-        // printf("Finish Linear\n");
     }
 }
 

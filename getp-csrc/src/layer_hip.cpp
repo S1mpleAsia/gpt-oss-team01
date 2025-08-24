@@ -745,7 +745,7 @@ __global__ void matmul_kernel_bf16_weights(const bf16 *W, const float *x, const 
     }
 }
 
-void MoEApplyTopKGPU(const float *t, const bf16 *W1, const bf16 *b1, const bf16 *W2, const bf16 *b2,
+void MoEApplyTopKGPU_wrapper(const float *t, const bf16 *W1, const bf16 *b1, const bf16 *W2, const bf16 *b2,
                      const int *topk_idx, const float *topk_vals,
                      float *work_gate_up,  // scratch: [2*inter]
                      float *e_agg_inout,   // out: [hidden]
@@ -810,6 +810,49 @@ void MoEApplyTopKGPU(const float *t, const bf16 *W1, const bf16 *b1, const bf16 
     // Giải phóng bộ nhớ tạm
     CHECK_HIP(hipFree(work_swiglu));
     CHECK_HIP(hipFree(expert_output));
+}
+
+void MoEApplyTopKGPU(Tensor *t, const Tensor *W1, const Tensor *b1,
+                    const Tensor *W2, const Tensor *b2, TensorI32 *topk_idx,
+                    Tensor *topk_vals, Tensor *gate_up, Tensor *e_agg,
+                    float clamp_limit, long long layer_offset, bool t_to_device,
+                    bool topk_idx_to_device, bool topk_vals_to_device,
+                    bool e_agg_from_device, hipStream_t stream) {
+    if (t_to_device) t->to_device(stream);
+    if (topk_idx_to_device) topk_idx->to_device(stream);
+    if (topk_vals_to_device) topk_vals->to_device(stream);
+
+    // TODO: add values here: hidden_dim, etc.
+    // Extract dimensions from tensor shapes
+    const int hidden_dim = t->shape[0];
+    const int inter_dim = W2->shape[2]; // W2 shape is [n_layers, n_experts, hidden, inter] -> we need inter
+    const int k = topk_idx->num_elem();
+    const int num_experts = b2->shape[1];
+    const long long offset = layer_offset * num_experts;
+    const long long inter_hidden = inter_dim * hidden_dim;
+
+    // Get raw device pointers from tensors
+    const float *t_ptr = (const float *)t->d_buf;
+    const bf16 *W1_ptr = (const bf16 *)W1->d_buf + 1ll * offset * 2 * inter_hidden;
+    const bf16 *b1_ptr = (const bf16 *)b1->d_buf + 1ll * offset * 2 * inter_dim;
+    const bf16 *W2_ptr = (const bf16 *)W2->d_buf + 1ll * offset * inter_hidden;
+    const bf16 *b2_ptr = (const bf16 *)b2->d_buf + 1ll * offset * hidden_dim;
+    const int *topk_idx_ptr = topk_idx->d_buf;
+    const float *topk_vals_ptr = (const float *)topk_vals->d_buf;
+    float *gate_up_ptr = (float *)gate_up->d_buf;
+    float *e_agg_ptr = (float *)e_agg->d_buf;
+
+    // Call the wrapper function with the extracted parameters and pointers
+    MoEApplyTopKGPU_wrapper(t_ptr, W1_ptr, b1_ptr, W2_ptr, b2_ptr,
+                            topk_idx_ptr, topk_vals_ptr,
+                            gate_up_ptr,  // work_gate_up scratch space
+                            e_agg_ptr,    // e_agg_inout accumulator
+                            hidden_dim, inter_dim, k, clamp_limit, stream);
+    
+    if (e_agg_from_device) {
+        e_agg->from_device(stream);
+        CHECK_HIP(hipStreamSynchronize(stream));
+    }
 }
 
 void ClassifierGemmGPU(const Tensor *W_out, Tensor *x, Tensor *logits,
