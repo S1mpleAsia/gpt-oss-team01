@@ -110,3 +110,5 @@ PROMPT: 'newlines:'
   PY decoded: 'newlines:'
   [ENCODE MATCH] [DECODE MATCH]
 ```
+
+Small

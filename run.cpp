@@ -18,11 +18,11 @@
 #include <unistd.h>
 #endif
 
-#include "tokenizer.hpp"
+// #include "tokenizer.hpp"
 
 // ----------------------------------------------------------------------------
 
-#include "getp-csrc/config.hpp"
+#include "getp-csrc/include/config_run.hpp"
 // typedef struct {
 //   // Model Config
 //   int vocab_size;  // vocabulary size

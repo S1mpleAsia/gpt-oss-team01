@@ -8,6 +8,7 @@ on:
       - staging
       - dev/duongvt
       - dev/mdung
+      - basecode
 
 jobs:
   pre-commit:
