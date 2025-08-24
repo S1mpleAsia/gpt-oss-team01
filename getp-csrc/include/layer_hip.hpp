@@ -7,7 +7,7 @@
 // ---------- Embedding ----------
 void embedding_lookup(Tensor *embedding,        // (vocab_size, hidden_dim)
                       int token_id, Tensor *x,  // (hidden_dim, )
-                      bool x_from_device, hipStream_t stream);
+                      bool x_from_device, hipStream_t stream = 0);
 
 void rmsnorm(Tensor *x, Tensor *w, Tensor *out, long long layer_offset, bool x_to_device,
              bool out_from_device, float eps = 1e-5f, hipStream_t stream = 0);
@@ -55,12 +55,19 @@ void router_gemm(const Tensor *w_router, Tensor *t, const Tensor *b_router, Tens
 void topk_softmax(Tensor *r, Tensor *topk_vals, TensorI32 *topk_idx, bool r_to_device,
                   bool topk_vals_from_device, bool topk_idx_from_device, hipStream_t stream = 0);
 
-// ---------- MoE apply TopK ----------
+// ---------- MoE apply TopK (batched) ----------
+/* Với mỗi expert e trong topk_idx:
+ *  z = W1[e] * t + b1[e]  (z tách thành gate/up)
+ *  swiglu = silu(gate_clamped) * (up_clamped + 1)
+ *  y = W2[e] * swiglu + b2[e]
+ *  e_agg += topk_vals[e] * y
+ * Có thể dùng gemm-strided-batched nếu layout tuần tự; nếu không, vòng for k nhỏ.
+ */
 void moe_apply_topk(Tensor *t, const Tensor *W1, const Tensor *b1, const Tensor *W2,
-                    const Tensor *b2, TensorI32 *topk_idx, Tensor *topk_vals, Tensor *gate_up,
-                    Tensor *e_agg, float clamp_limit, long long layer_offset, bool t_to_device,
-                    bool topk_idx_to_device, bool topk_vals_to_device, bool e_agg_from_device,
-                    hipStream_t stream = 0);
+                    const Tensor *b2, TensorI32 *topk_idx, Tensor *topk_vals, Tensor *mlp1_out,
+                    Tensor *gate_up, Tensor *tb3, Tensor *e_agg, float clamp_limit,
+                    long long layer_offset, bool t_to_device, bool topk_idx_to_device,
+                    bool topk_vals_to_device, bool e_agg_from_device, hipStream_t stream = 0);
 
 // ---------- Classifier (logits = W_out * x) ----------
 void classifier_gemm(const Tensor *W_out, Tensor *x, Tensor *logits, bool x_to_device,

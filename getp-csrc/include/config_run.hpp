@@ -99,3 +99,25 @@ typedef struct {
   float *data;        // memory mapped data pointer
   ssize_t file_size;  // size of the checkpoint file in bytes
 } Transformer;
+
+// ----------------------------------------------------------------------------
+// The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
+
+// ----------------------------------------------------------------------------
+// The Sampler, which takes logits and returns a sampled token
+// sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
+
+typedef struct {
+  float prob;
+  int index;
+} ProbIndex;  // struct used when sorting probabilities during top-p sampling
+
+typedef struct {
+  int vocab_size;
+  ProbIndex *probindex;  // buffer used in top-p sampling
+  float temperature;
+  float topp;
+  unsigned long long rng_state;
+} Sampler;
+
+int sample(Sampler *sampler, float *logits);

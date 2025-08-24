@@ -92,7 +92,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer, S
 
     // advance the state machine
     {
-      // GpuTimer("sample");
+      GpuTimer timer("sample");
       pos++;
       if (pos < num_prompt_tokens) {
         // if we are still processing the input prompt, force the next prompt
@@ -113,16 +113,16 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer, S
 
       // print the token as string, decode it with the Tokenizer object
       // should be removed
-      const char *piece = decode_piece(tokenizer, token, next);
-      safe_printf(piece);  // same as printf("%s", piece), but skips "unsafe" bytes
-      fflush(stdout);
+      // const char *piece = decode_piece(tokenizer, token, next);
+      // safe_printf(piece);  // same as printf("%s", piece), but skips "unsafe" bytes
+      // fflush(stdout);
 
       token = next;
     }
   }
 
   // should be removed
-  printf("\n");
+  // printf("\n");
 
   // Marker for end of sequence
   output_tokens[pos - num_prompt_tokens + 1] = -1;
