@@ -13,12 +13,6 @@ void RMSNormGPU(Tensor *x, Tensor *w, Tensor *out, long long layer_offset,
                 bool x_to_device, bool out_from_device, float eps = 1e-5f,
                 hipStream_t stream = 0);
 
-void QKVGemmGPU_Old(const float *w_qkv,  // (out, in)
-                const float *b_qkv,  // (out, )
-                const float *t,      // (in, )
-                float *out,          // (out, )
-                int hidden_dim, int head_dim, int in_features, int out_features,
-                hipStream_t stream);
 void QKVGemmGPU(Tensor *x, const Tensor *W_qkv, const Tensor *b_qkv, 
                 Tensor *qkv, long long layer_offset, bool x_to_device,
                 bool qkv_from_device, hipStream_t stream = 0);
@@ -90,21 +84,6 @@ void TopKSoftmaxGPU(Tensor *r, Tensor *topk_vals, TensorI32 *topk_idx,
  *  e_agg += topk_vals[e] * y
  * Có thể dùng gemm-strided-batched nếu layout tuần tự; nếu không, vòng for k nhỏ.
  */
-void MoEApplyTopKGPU_wrapper(
-  const float *t,          // [hidden]
-  const bf16 *W1,          // [n_layers? n_experts? 2*inter, hidden] - pass base for this layer
-  const bf16 *b1,          // [n_experts, 2*inter]
-  const bf16 *W2,          // [n_experts, hidden, inter]
-  const bf16 *b2,          // [n_experts, hidden]
-  const int *topk_idx,     // [k]
-  const float *topk_vals,  // [k] (đã softmax)
-  float *work_gate_up,     // [inter] scratch
-  float *e_agg_inout,      // [hidden] (accumulate)
-  int hidden_dim, int inter_dim,
-  int k,              // experts_per_token
-  float clamp_limit,  // swiglu_limit
-  hipStream_t stream);
-
 void MoEApplyTopKGPU(Tensor *t, const Tensor *W1, const Tensor *b1,
                     const Tensor *W2, const Tensor *b2, TensorI32 *topk_idx,
                     Tensor *topk_vals, Tensor *gate_up, Tensor *e_agg,

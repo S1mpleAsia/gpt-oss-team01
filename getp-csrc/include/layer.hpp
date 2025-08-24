@@ -69,14 +69,10 @@ void SwiGLU(const Tensor *gate /*[d]*/, const Tensor *up /*[d]*/,
             float clamp_limit, Tensor *out /*[d]*/);
 
 // Expert FFN 1: z = W1 * t + b1
-void ExpertFFN1(const Tensor *t, const Tensor *W1, const Tensor *b1,
-                Tensor *z, long long layer_offset, long long expert_offset);
 void ExpertFFN1_Total(const Tensor *t, const Tensor *W1, const Tensor *b1,      
                     Tensor *z, const TensorI32 *topk_i, long long layer_offset);
 
 // Expert FFN 2: y = W2 * swiglu + b2
-void ExpertFFN2(const Tensor *swiglu, const Tensor *W2, const Tensor *b2,
-                Tensor *y, long long layer_offset, long long expert_offset);
 void ExpertFFN2_Total(const Tensor *swiglu, const Tensor *W2, const Tensor *b2,
                     Tensor *y, const TensorI32 *topk_i, long long layer_offset);
 
