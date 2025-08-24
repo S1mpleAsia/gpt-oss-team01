@@ -15,7 +15,7 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
         // printf("Layer %d\n", l);
         // attention rmsnorm
         // RMSNorm(rs->x, weights->rms_attn_w, rs->t, 1ll * l);
-        RMSNormGPU(rs->x, weights->rms_attn_w, rs->t, 1ll * l, false, true);
+        RMSNormGPU(rs->x, weights->rms_attn_w, rs->t, 1ll * l, false, false);
 
         // key and value point to the kv cache
         long long loff = 1ll * l * loff_one; // kv cache layer offset
@@ -23,7 +23,7 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
         // QKV projection 
         // QKVProject(rs->t, weights->w_qkv, weights->b_qkv, rs->qkv, 1ll * l);
         QKVGemmGPU(rs->t, weights->w_qkv, weights->b_qkv, rs->qkv,
-                    1ll * l, true, false); // This kernel diverges the most
+                    1ll * l, false, false); // This kernel diverges the most
 
         // Separate q, k, v
         // SplitQKV(rs->qkv, p->head_dim, p->n_attn_heads, p->n_kv_heads, rs->q, rs->k, rs->v);
@@ -31,7 +31,7 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
         QKVEpilogueSplitRoPECacheGPU(
             rs->qkv, rs->q, rs->k, rs->v, cos_tensor, sin_tensor,
             p->head_dim, p->n_attn_heads, p->n_kv_heads, pos,
-            false, true, true, true
+            false, false, false, false
         );
 
         // Store k, v in cache
@@ -43,6 +43,7 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
         // multihead attention
         int kv_mul = p->n_attn_heads / p->n_kv_heads; // integer multiplier for GQA
 
+        /*
         AttnScoresAllHeads(rs->key_cache, rs->q, rs->att, weights->attn_sinks,
                             rs->mask, loff_one, 1ll * l, p->n_attn_heads,
                             kv_mul, p->head_dim, p->head_dim * p->n_kv_heads,
@@ -51,9 +52,18 @@ float *our_forward(Config *p, OurTransformerWeights *weights, OurRunState *rs, i
         AttnWeightedSumAllHeads(rs->value_cache, rs->q, rs->att, rs->tb, 
                                 loff, p->n_attn_heads, kv_mul, p->head_dim,
                                 p->head_dim * p->n_kv_heads, p->seq_len, pos);
+        */
+        SingleQueryAttentionGPU(rs->q, rs->key_cache, rs->value_cache, rs->mask,
+                                weights->attn_sinks, rs->tb, p->head_dim,
+                                p->n_attn_heads, kv_mul,
+                                p->head_dim * p->n_kv_heads, p->seq_len, p->sliding_window, pos, 1ll * l, false, false,
+                                false, false, true);
+
 
         // final matmul to get the output of the attention
-        AttnOutProject(rs->tb, weights->w_o, weights->b_o, rs->tb2, 1ll * l);
+        // AttnOutProject(rs->tb, weights->w_o, weights->b_o, rs->tb2, 1ll * l);
+        AttnOutProjectGPU(rs->tb, weights->w_o, weights->b_o, rs->tb2,
+                            1ll * l, true, true);
 
         // residual connection back into x
         // ResidualAdd(rs->x, rs->tb2);

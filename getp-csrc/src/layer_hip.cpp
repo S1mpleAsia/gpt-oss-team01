@@ -513,18 +513,87 @@ __global__ void attention_kernel(const float *q, const float *K_cache, const flo
     }
 }
 
-void SingleQueryAttentionGPU(const float *q, const float *K_cache, const float *V_cache,
-                             const float *mask_row, const float *attn_sink_per_head, float *tb,
-                             int head_dim, int n_q, int kv_mul, int kv_dim, int seq_len, int pos,
-                             hipStream_t stream) {
+void SingleQueryAttentionGPU(
+    Tensor *q, Tensor *K_cache, Tensor *V_cache, Tensor *mask,
+    Tensor *attn_sinks, Tensor *tb, int head_dim, int n_q, int kv_mul,
+    int kv_dim, int seq_len, int sliding_window, int pos,
+    long long layer_offset, bool q_to_device, bool k_cache_to_device,
+    bool v_cache_to_device, bool mask_to_device, bool tb_from_device,
+    hipStream_t stream
+) {     
+    if (q_to_device) q->to_device(stream);
+    if (k_cache_to_device) K_cache->to_device(stream);
+    if (v_cache_to_device) V_cache->to_device(stream);
+    if (mask_to_device) mask->to_device(stream);
+
+    // 1. Get raw device pointers from Tensor objects
+    const float *q_ptr = (float *)q->d_buf;
+    float *tb_ptr = (float *)tb->d_buf;
+
+    // 2. Calculate the offset to the current layer's KV cache
+    // This logic is identical to `loff = 1ll * l * loff_one` in model.cpp
+    long long cache_layer_offset_elements = 1ll * layer_offset * seq_len * kv_dim;
+    const float *K_cache_ptr = (const float *)K_cache->d_buf + cache_layer_offset_elements;
+    const float *V_cache_ptr = (const float *)V_cache->d_buf + cache_layer_offset_elements;
+
+    // 3. Calculate the pointer to the current row in the attention mask
+    const float *mask_row_ptr = nullptr;
+    // The mask is applied for specific layers with a sliding window, as in AttnScoresAllHeads
+    if (sliding_window > 0 && (layer_offset % 2 == 0)) {
+        if (mask != nullptr && mask->d_buf != nullptr) {
+            mask_row_ptr = (const float *)mask->d_buf + (long long)pos * seq_len;
+        }
+    }
+
+    // 4. Calculate the pointer to the current layer's attention sinks
+    const float *attn_sinks_ptr = (const float *)attn_sinks->d_buf + layer_offset * n_q;
+
+    /*
+    SingleQueryAttentionGPU(q_ptr, K_cache_ptr, V_cache_ptr, mask_row_ptr,
+                            attn_sinks_ptr, tb_ptr, head_dim, n_q, kv_mul,
+                            kv_dim, pos + 1, pos, stream);
+    */
+    
     dim3 grid_dim(n_q);
     dim3 block_dim(256);
 
     size_t shared_mem_size =
-        ((size_t)seq_len + 1) * sizeof(float) + (size_t)head_dim * sizeof(double);
+        ((size_t)pos + 2) * sizeof(float) + (size_t)head_dim * sizeof(double);
 
     attention_kernel<<<grid_dim, block_dim, shared_mem_size, stream>>>(
-        q, K_cache, V_cache, mask_row, attn_sink_per_head, tb, head_dim, n_q, kv_mul, kv_dim, seq_len);
+        q_ptr, K_cache_ptr, V_cache_ptr, mask_row_ptr, attn_sinks_ptr, tb_ptr, head_dim, n_q, kv_mul, kv_dim, pos + 1);
+    
+    if (tb_from_device) {
+        tb->from_device(stream);
+        CHECK_HIP(hipStreamSynchronize(stream));
+    }
+}
+
+void AttnOutProjectGPU(
+    Tensor *tb, const Tensor *W_o, const Tensor *b_o, Tensor *y,
+    long long layer_offset, bool tb_to_device, bool y_from_device,
+    hipStream_t stream
+) {
+    if (tb_to_device) tb->to_device(stream);
+
+    const long long n_q_hd = tb->num_elem();
+    const long long hidden = y->num_elem();
+    const float *w_o_ptr = (float *)W_o->d_buf + 1ll * layer_offset * n_q_hd * hidden;
+    const float *b_o_ptr = (float *)b_o->d_buf + 1ll * layer_offset * hidden;
+    const float *tb_ptr = (float *)tb->d_buf;
+    float *y_ptr = (float *)y->d_buf;
+    // Linear(tb->buf, n_q_hd, w_o_ptr, b_o_ptr, hidden, y->buf);
+    
+    dim3 block_dim(DEFAULT_BLOCK_SIZE);
+    dim3 grid_dim((hidden + block_dim.x - 1) / block_dim.x);
+    matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(
+        w_o_ptr, tb_ptr, b_o_ptr, y_ptr, hidden, n_q_hd
+    );
+
+    if (y_from_device) {
+        y->from_device(stream);
+        CHECK_HIP(hipStreamSynchronize(stream));
+    }
 }
 
 //================================================================================================

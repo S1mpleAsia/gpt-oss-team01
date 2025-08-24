@@ -49,16 +49,20 @@ void QKVEpilogueSplitRoPECacheGPU(
  *  Trả về tb (concat heads, size = n_q*hd). Sink chỉ đi vào mẫu số (denom),
  *  KHÔNG cộng vào tích lũy V.
  */
-void SingleQueryAttentionGPU(const float *q,                   // [n_q*hd]
-                             const float *K_cache,             // [seq_len*kv_dim]
-                             const float *V_cache,             // [seq_len*kv_dim]
-                             const float *mask_row,            // [seq_len] or nullptr
-                             const float *attn_sink_per_head,  // [n_q]
-                             float *tb,                        // [n_q*hd]
-                             int head_dim, int n_q,
-                             int kv_mul,  // n_q / n_kv
-                             int kv_dim,  // head_dim * n_kv
-                             int seq_len, int pos, hipStream_t stream);
+void SingleQueryAttentionGPU(
+  Tensor *q, Tensor *K_cache, Tensor *V_cache, Tensor *mask,
+  Tensor *attn_sinks, Tensor *tb, int head_dim, int n_q, int kv_mul,
+  int kv_dim, int seq_len, int sliding_window, int pos,
+  long long layer_offset, bool q_to_device, bool k_cache_to_device,
+  bool v_cache_to_device, bool mask_to_device, bool tb_from_device,
+  hipStream_t stream = 0
+);
+
+void AttnOutProjectGPU(
+  Tensor *tb, const Tensor *W_o, const Tensor *b_o, Tensor *y,
+  long long layer_offset, bool tb_to_device, bool y_from_device,
+  hipStream_t stream = 0
+);
 
 // ---------- Linear + bias + residual (epilogue nếu có Lt) ----------
 /* y = W [out,in] * x [in] + b  ;  x_out = x_resid + y */
