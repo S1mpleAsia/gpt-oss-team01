@@ -198,6 +198,53 @@ void rmsnorm(Tensor *x, Tensor *w, Tensor *out, long long layer_offset, bool x_t
   }
 }
 
+__device__ __forceinline__ float warp_reduce_sum(float v) {
+  for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+    v += __shfl_down(v, offset);
+  }
+
+  return v;
+}
+
+template <int WARPS_PER_BLOCK, int TILE>
+__global__ void gemv_kernel(const float *W, const float *x, const float *bias, float *out,
+                            int out_features, int in_features) {
+  extern __shared__ float local_x[];
+
+  const int lane = threadIdx.x;
+  const int w = threadIdx.y;
+  const int row = blockIdx.x * WARPS_PER_BLOCK + w;
+
+  if (row >= out_features)
+    return;
+
+  float acc = 0.0f;
+  const int row_base = row * in_features;
+
+  for (int k0 = 0; k0 < in_features; k0 += TILE) {
+    const int tile_len = min(TILE, in_features - k0);
+
+    for (int t = w * warpSize + lane; t < tile_len; t += WARPS_PER_BLOCK * warpSize) {
+      local_x[t] = x[k0 + t];
+    }
+    __syncthreads();
+
+    for (int t = lane; t < tile_len; t += warpSize) {
+      float wv = W[row_base + k0 + t];
+      acc += wv * local_x[t];
+    }
+    __syncthreads();
+  }
+
+  acc = warp_reduce_sum(acc);
+
+  if (lane == 0) {
+    if (bias)
+      acc += bias[row];
+    out[row] = acc;
+  }
+}
+
 // W (out, in) * x(in, ) -> y(out, )
 __global__ void matmul_kernel(const float *W, const float *x, const float *bias, float *out,
                               int out_features, int in_features) {
@@ -240,11 +287,15 @@ void qkv_gemm(Tensor *x, const Tensor *W_qkv, const Tensor *b_qkv, Tensor *qkv,
   const float *b_qkv_ptr = (float *)b_qkv->d_buf + 1ll * layer_offset * out_features;
   float *qkv_ptr = (float *)qkv->d_buf;
 
-  dim3 block_dim(DEFAULT_BLOCK_SIZE);
-  dim3 grid_dim((out_features + block_dim.x - 1) / block_dim.x);
+  constexpr int WARPS_PER_BLOCK = 16;
+  constexpr int TILE = 1024;
 
-  matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(w_qkv_ptr, x_ptr, b_qkv_ptr, qkv_ptr,
-                                                    out_features, in_features);
+  dim3 block_dim(warpSize, WARPS_PER_BLOCK);
+  dim3 grid_dim((out_features + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
+  size_t shmem_bytes = TILE * sizeof(float);
+
+  gemv_kernel<WARPS_PER_BLOCK, TILE><<<grid_dim, block_dim, shmem_bytes, stream>>>(
+    w_qkv_ptr, x_ptr, b_qkv_ptr, qkv_ptr, out_features, in_features);
 
   if (qkv_from_device) {
     qkv->from_device(stream);
@@ -590,10 +641,16 @@ void attn_out_project(Tensor *tb, const Tensor *W_o, const Tensor *b_o, Tensor *
   float *y_ptr = (float *)y->d_buf;
   // Linear(tb->buf, n_q_hd, w_o_ptr, b_o_ptr, hidden, y->buf);
 
-  dim3 block_dim(DEFAULT_BLOCK_SIZE);
-  dim3 grid_dim((hidden + block_dim.x - 1) / block_dim.x);
-  matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(w_o_ptr, tb_ptr, b_o_ptr, y_ptr, hidden,
-                                                    n_q_hd);
+  constexpr int WARPS_PER_BLOCK = 16;
+  constexpr int TILE = 1024;
+
+  dim3 block_dim(warpSize, WARPS_PER_BLOCK);
+  dim3 grid_dim((hidden + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
+  size_t shmem_bytes = TILE * sizeof(float);
+  gemv_kernel<WARPS_PER_BLOCK, TILE>
+    <<<grid_dim, block_dim, shmem_bytes, stream>>>(w_o_ptr, tb_ptr, b_o_ptr, y_ptr, hidden, n_q_hd);
+  // matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(w_o_ptr, tb_ptr, b_o_ptr, y_ptr, hidden,
+  //                                                   n_q_hd);
 
   if (y_from_device) {
     y->from_device(stream);
@@ -846,6 +903,7 @@ void moe_apply_topk(Tensor *t, const Tensor *W1, const Tensor *b1, const Tensor 
                     Tensor *gate_up, Tensor *tb3, Tensor *e_agg, float clamp_limit,
                     long long layer_offset, bool t_to_device, bool topk_idx_to_device,
                     bool topk_vals_to_device, bool e_agg_from_device, hipStream_t stream) {
+  GpuTimer("moe_apply_topk");
   if (t_to_device)
     t->to_device(stream);
   if (topk_idx_to_device)
@@ -931,10 +989,14 @@ void classifier_gemm(const Tensor *W_out, Tensor *x, Tensor *logits, bool x_to_d
   const float *x_ptr = (float *)x->d_buf;
   float *logits_ptr = (float *)logits->d_buf;
 
-  dim3 block_dim(DEFAULT_BLOCK_SIZE);
-  dim3 grid_dim((vocab_size + block_dim.x - 1) / block_dim.x);
-  matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(W_out_ptr, x_ptr, nullptr, logits_ptr,
-                                                    vocab_size, hidden_dim);
+  constexpr int WARPS_PER_BLOCK = 16;
+  constexpr int TILE = 1024;
+
+  dim3 block_dim(warpSize, WARPS_PER_BLOCK);
+  dim3 grid_dim((vocab_size + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
+  size_t shmem_bytes = TILE * sizeof(float);
+  gemv_kernel<WARPS_PER_BLOCK, TILE><<<grid_dim, block_dim, shmem_bytes, stream>>>(
+    W_out_ptr, x_ptr, nullptr, logits_ptr, vocab_size, hidden_dim);
 
   if (logits_from_device) {
     logits->from_device(stream);
