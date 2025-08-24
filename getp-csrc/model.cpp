@@ -278,13 +278,13 @@ float *hip_forward(DeviceTransformerWeights *w, DeviceRunState *rs, Config *conf
     // 2. Pre-attention RMSNorm
     RMSNormGPU(rs->x, w_rms_attn, rs->t, hidden_dim, 1e-5f, stream);
 
-    CHECK_HIP(hipStreamSynchronize(stream));
-    float *h_buffer = (float *)malloc(hidden_dim * sizeof(float));
-    CHECK_HIP(hipMemcpy(h_buffer, rs->t, hidden_dim * sizeof(float), hipMemcpyDeviceToHost));
+    // CHECK_HIP(hipStreamSynchronize(stream));
+    // float *h_buffer = (float *)malloc(hidden_dim * sizeof(float));
+    // CHECK_HIP(hipMemcpy(h_buffer, rs->t, hidden_dim * sizeof(float), hipMemcpyDeviceToHost));
 
-    for (int i = 0; i < 10; i++) {
-      printf("t[%d] = %f\n", i, h_buffer[i]);
-    }
+    // for (int i = 0; i < 10; i++) {
+    //   printf("t[%d] = %f\n", i, h_buffer[i]);
+    // }
 
     // 3. Compute Q, K, V
     // w_qkv (head_dim * (n_attn_head + 2 * n_kv_head), hidden_dim) @ rs->t (hidden_dim, ) + b_qkv => rs->qkv
@@ -296,7 +296,7 @@ float *hip_forward(DeviceTransformerWeights *w, DeviceRunState *rs, Config *conf
     // float *h_buffer = (float *)malloc(qkv_dim * sizeof(float));
     // CHECK_HIP(hipMemcpy(h_buffer, rs->qkv, qkv_dim * sizeof(float), hipMemcpyDeviceToHost));
 
-    // for (int i = 0; i < 10; i++) {
+    // for (int i = 0; i < qkv_dim; i++) {
     //   printf("qkv[%d] = %f\n", i, h_buffer[i]);
     // }
 
@@ -321,26 +321,29 @@ float *hip_forward(DeviceTransformerWeights *w, DeviceRunState *rs, Config *conf
     // CHECK_HIP(hipMemcpy(k_buffer, k_pos, kv_dim * sizeof(float), hipMemcpyDeviceToHost));
     // CHECK_HIP(hipMemcpy(v_buffer, v_pos, kv_dim * sizeof(float), hipMemcpyDeviceToHost));
 
-    // printf("Q vector (10 elements):\n");
-    // for (int i = 0; i < 10; i++) {
-    //   printf("\tq[%d] = %f\n", i, q_buffer[i]);
-    // }
+    // if (l == 0) {
+    //   printf("Q vector:\n");
+    //   for (int i = 0; i < q_dim; i++) {
+    //     printf("\tq[%d] = %f\n", i, q_buffer[i]);
+    //   }
 
-    // printf("K vector (10 elements):\n");
-    // for (int i = 0; i < 10; i++) {
-    //   printf("\tk[%d] = %f\n", i, k_buffer[i]);
-    // }
+    //   printf("K vector:\n");
+    //   for (int i = 0; i < kv_dim; i++) {
+    //     printf("\tk[%d] = %f\n", i, k_buffer[i]);
+    //   }
 
-    // printf("V vector (10 elements):\n");
-    // for (int i = 0; i < 10; i++) {
-    //   printf("\tv[%d] = %f\n", i, v_buffer[i]);
+    //   printf("V vector:\n");
+    //   for (int i = 0; i < kv_dim; i++) {
+    //     printf("\tv[%d] = %f\n", i, v_buffer[i]);
+    //   }
     // }
 
     // 5. Multi-Head Attention
     const float *k_cache = rs->key_cache + loff;
     const float *v_cache = rs->value_cache + loff;
-    const float *mask_row =
-      (config->sliding_window > 0) ? (rs->mask + (size_t)pos * config->seq_len) : nullptr;
+    const float *mask_row = (config->sliding_window > 0 && (l % 2 == 0))
+                              ? (rs->mask + (size_t)pos * config->seq_len)
+                              : nullptr;
 
     SingleQueryAttentionGPU(rs->q, k_cache, v_cache, mask_row, attn_sinks, rs->tb, head_dim,
                             n_q_heads, n_q_heads / n_kv_heads, kv_dim, pos + 1, pos, stream);
@@ -447,11 +450,19 @@ float *hip_forward(DeviceTransformerWeights *w, DeviceRunState *rs, Config *conf
   }
   // --- FINAL CLASSIFIER ---
 
+  // CHECK_HIP(hipStreamSynchronize(stream));
+  // float *h_buffer = (float *)malloc(hidden_dim * sizeof(float));
+  // CHECK_HIP(hipMemcpy(h_buffer, rs->x, hidden_dim * sizeof(float), hipMemcpyDeviceToHost));
+
+  // for (int i = 0; i < 10; i++) {
+  //   printf("x[%d] = %f\n", i, h_buffer[i]);
+  // }
+
   // 12. Final RMSNorm
   RMSNormGPU(rs->x, w->rms_out_w, rs->x, hidden_dim, 1e-5f, stream);
-  CHECK_HIP(hipStreamSynchronize(stream));
-  float *h_buffer = (float *)malloc(hidden_dim * sizeof(float));
-  CHECK_HIP(hipMemcpy(h_buffer, rs->x, hidden_dim * sizeof(float), hipMemcpyDeviceToHost));
+  // CHECK_HIP(hipStreamSynchronize(stream));
+  // float *h_buffer = (float *)malloc(hidden_dim * sizeof(float));
+  // CHECK_HIP(hipMemcpy(h_buffer, rs->x, hidden_dim * sizeof(float), hipMemcpyDeviceToHost));
 
   // for (int i = 0; i < 10; i++) {
   //   printf("x[%d] = %f\n", i, h_buffer[i]);

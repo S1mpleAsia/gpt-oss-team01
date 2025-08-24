@@ -5,7 +5,7 @@
 #ifndef GETP_RUN
 #define GETP_RUN
 
-// #define USE_CPU
+#define USE_CPU
 
 static DeviceContext ctx;
 
@@ -18,7 +18,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // - ...
 
   printf("Starting GPU warm-up...\n");
-  device_init_context(&ctx, &transformer->weights, &transformer->config, 0);
+  // device_init_context(&ctx, &transformer->weights, &transformer->config, 0);
 }
 
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
@@ -29,7 +29,7 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
   // - Unload model
   // - ...
   printf("Starting GPU finish process...\n");
-  device_free_context(&ctx);
+  // device_free_context(&ctx);
 }
 
 #ifdef USE_CPU

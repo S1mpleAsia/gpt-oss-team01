@@ -541,6 +541,11 @@ float *forward(Transformer *transformer, int token, int pos) {
     for (int i = 0; i < (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim; ++i) {
       s->qkv[i] += b_qkv[i];
     }
+
+    // for (int i = 0; i < head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads; i++) {
+    //   printf("qkv[%d] = %f\n", i, s->qkv[i]);
+    // }
+
     // Separate q, k, v
     memcpy(s->q, s->qkv, head_dim * p->n_attn_heads * sizeof(float));  // gate
     memcpy(s->k, s->qkv + head_dim * p->n_attn_heads,
@@ -564,19 +569,21 @@ float *forward(Transformer *transformer, int token, int pos) {
     free(cos_vals);
     free(sin_vals);
 
-    // printf("Q vector (10 elements):\n");
-    // for (int i = 0; i < 10; i++) {
-    //   printf("\tq[%d] = %f\n", i, s->q[i]);
-    // }
+    // if (l == 0) {
+    //   printf("Q vector:\n");
+    //   for (int i = 0; i < head_dim * p->n_attn_heads; i++) {
+    //     printf("\tq[%d] = %f\n", i, s->q[i]);
+    //   }
 
-    // printf("K vector (10 elements):\n");
-    // for (int i = 0; i < 10; i++) {
-    //   printf("\tk[%d] = %f\n", i, s->k[i]);
-    // }
+    //   printf("K vector:\n");
+    //   for (int i = 0; i < head_dim * p->n_kv_heads; i++) {
+    //     printf("\tk[%d] = %f\n", i, s->k[i]);
+    //   }
 
-    // printf("V vector (10 elements):\n");
-    // for (int i = 0; i < 10; i++) {
-    //   printf("\tv[%d] = %f\n", i, s->v[i]);
+    //   printf("V vector:\n");
+    //   for (int i = 0; i < head_dim * p->n_kv_heads; i++) {
+    //     printf("\tv[%d] = %f\n", i, s->v[i]);
+    //   }
     // }
 
     // multihead attention. iterate over all heads
@@ -755,11 +762,12 @@ float *forward(Transformer *transformer, int token, int pos) {
       x[i] += s->e_agg[i];
     }
   }
+  // for (int i = 0; i < 10; i++) {
+  //   printf("x[%d] = %f\n", i, s->x[i]);
+  // }
+
   // final rmsnorm
   rmsnorm(x, x, w->rms_out_w, hidden_dim);
-  for (int i = 0; i < 10; i++) {
-    printf("x[%d] = %f\n", i, s->x[i]);
-  }
 
   // classifier into logits
   matmul(s->logits, x, w->out, hidden_dim, p->vocab_size);

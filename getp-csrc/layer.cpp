@@ -25,146 +25,42 @@ void AddVectorGPU(float *x, const float *y, int n, hipStream_t stream) {
   AddVector_kernel<<<grid_dim, block_dim, 0, stream>>>(x, y, n);
 }
 
-__global__ void RMSNorm_kernel(const float *x, const float *w, float *out, int n, float eps) {
-  // Kernel này giả định n đủ nhỏ để tính toán trong một block duy nhất
-  __shared__ float s_variance;
-
-  // Pass 1: Tính tổng bình phương (sum of squares)
-  float sum_sq = 0.0f;
-  for (int i = threadIdx.x; i < n; i += blockDim.x) {
-    sum_sq += x[i] * x[i];
-  }
-
-  // Dùng shared memory để reduce tổng trong block
-  __shared__ float s_partials[DEFAULT_BLOCK_SIZE];
-  s_partials[threadIdx.x] = sum_sq;
-  __syncthreads();
-
-  // Thread 0 thực hiện phần reduce cuối cùng
-  if (threadIdx.x == 0) {
-    float total_sum_sq = 0.0f;
-    // Giả định blockDim.x <= DEFAULT_BLOCK_SIZE
-    for (int i = 0; i < blockDim.x; i++) {
-      total_sum_sq += s_partials[i];
-    }
-    float variance = total_sum_sq / n;
-    s_variance = rsqrtf(variance + eps);
-  }
-  __syncthreads();  // Đảm bảo mọi thread đều thấy s_variance
-
-  // Pass 2: Áp dụng chuẩn hóa
-  for (int i = threadIdx.x; i < n; i += blockDim.x) {
-    out[i] = x[i] * s_variance * w[i];
-  }
-}
-
-__global__ void rmsnorm_kernel_double_precision(const float *x, const float *w, float *out,
-                                                int hidden_dim, float eps) {
-  const int row = blockIdx.x;
+__global__ void rmsnorm_kernel(const float *x, const float *w, float *out, int hidden_dim,
+                               float eps) {
   const int tid = threadIdx.x;
   const int block_size = blockDim.x;
 
-  const float *x_row = x + row * hidden_dim;
-  const float *w_row = w + row * hidden_dim;
-  float *o_row = out + row * hidden_dim;
+  const float *x_row = x;
+  const float *w_row = w;
+  float *o_row = out;
 
-  // --- THAY ĐỔI 1: Sử dụng 'double' cho biến tích lũy ---
   double acc = 0.0;
-
-  // Vòng lặp tính tổng bình phương của mỗi thread
   for (int j = tid; j < hidden_dim; j += block_size) {
-    float v = x_row[j];
-    acc += v * v;  // Ép kiểu để phép nhân và cộng thực hiện ở double
+    double val = (double)x_row[j];
+    acc += val * val;
   }
 
-  // --- THAY ĐỔI 2: Dùng shared memory cho toàn bộ quá trình reduction ---
-  // (Thay thế cho warp shuffle và logic warp_sum phức tạp)
-  extern __shared__ double s_partials[];  // Khai báo dynamic shared memory
+  extern __shared__ double s_partials[];
   s_partials[tid] = acc;
-  __syncthreads();  // Đảm bảo mọi thread đã ghi xong tổng cục bộ của mình
+  __syncthreads();
 
-  // Thực hiện reduction song song trong shared memory
   for (int s = block_size / 2; s > 0; s >>= 1) {
     if (tid < s) {
       s_partials[tid] += s_partials[tid + s];
     }
-    __syncthreads();  // Đồng bộ sau mỗi vòng lặp reduction
+    __syncthreads();
   }
 
-  // --- THAY ĐỔI 3: Chỉ thread 0 tính toán kết quả cuối cùng ---
-  // Tạo một biến shared để lưu kết quả và chia sẻ cho các thread khác
   __shared__ double final_inv_rms;
   if (tid == 0) {
     double block_sum = s_partials[0];
     double mean = block_sum / hidden_dim;
-    mean = mean + 1e-5f;
-    final_inv_rms = 1.0f / sqrtf(mean);
+    final_inv_rms = 1.0f / sqrtf(mean + eps);
   }
-  __syncthreads();  // Đảm bảo mọi thread đều thấy giá trị final_inv_rms
+  __syncthreads();
 
-  // --- THAY ĐỔI 4: Tất cả các thread áp dụng chuẩn hóa ---
-  // Mỗi thread đọc giá trị inv_rms từ shared memory và thực hiện phép tính
   for (int j = tid; j < hidden_dim; j += block_size) {
-    o_row[j] = w_row[j] * (final_inv_rms * x_row[j]);
-  }
-}
-
-__global__ void rmsnorm_kernel(const float *x, const float *w, float *out, int hidden_dim,
-                               float eps) {
-  const int row = blockIdx.x;
-  const int tid = threadIdx.x;
-
-  const float *x_row = x + row * hidden_dim;
-  const float *w_row = w + row * hidden_dim;
-  float *o_row = out + row * hidden_dim;
-
-  float acc = 0.0f;
-
-  for (int j = tid; j < hidden_dim; j += blockDim.x) {
-    float v = x_row[j];
-    acc += v * v;
-  }
-
-  // Warp reduction
-  for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-    acc += __shfl_down(acc, offset);
-  }
-
-  // 32 * 64 = 2048 threads
-  __shared__ float warp_sum[32];
-  int lane = tid & (warpSize - 1);
-  int warp_id = (tid + warpSize - 1) / warpSize;
-
-  if (lane == 0)
-    warp_sum[warp_id] = acc;
-
-  __syncthreads();
-
-  __shared__ float block_sum;
-  if (warp_id == 0) {
-    int num_warps = (blockDim.x + warpSize - 1) / warpSize;
-    float val = (lane < num_warps) ? warp_sum[lane] : 0.0f;
-
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-      val += __shfl_down(val, offset);
-    }
-
-    if (lane == 0) {
-      block_sum = val;
-    }
-  }
-  __syncthreads();
-
-  __shared__ float inv_rms;
-  if (tid == 0) {
-    float mean = block_sum / (float)hidden_dim;
-    inv_rms = rsqrtf(mean + eps);
-  }
-
-  __syncthreads();
-
-  for (int j = tid; j < hidden_dim; j += blockDim.x) {
-    o_row[j] = w_row[j] * (x_row[j] * inv_rms);
+    o_row[j] = (float)(w_row[j] * (final_inv_rms * x_row[j]));
   }
 }
 
@@ -175,14 +71,14 @@ __global__ void rmsnorm_kernel(const float *x, const float *w, float *out, int h
 */
 void RMSNormGPU(const float *x, const float *w, float *out, int hidden_dim, float eps,
                 hipStream_t stream) {
-  constexpr int batch_size = 1;  // Change this when using batching
+  // constexpr int batch_size = 1;
   constexpr int num_threads = 256;
-  const dim3 block_dim(num_threads), grid_dim(batch_size);
+  const dim3 block_dim(num_threads);
+  const dim3 grid_dim(1);
 
   size_t shared_mem_size = num_threads * sizeof(double);
 
-  rmsnorm_kernel_double_precision<<<grid_dim, block_dim, shared_mem_size, stream>>>(
-    x, w, out, hidden_dim, eps);
+  rmsnorm_kernel<<<grid_dim, block_dim, shared_mem_size, stream>>>(x, w, out, hidden_dim, eps);
   CHECK_HIP(hipGetLastError());
   // RMSNorm_kernel<<<grid_dim, block_dim, 0, stream>>>(x, w, out, hidden_dim, eps);
 }
@@ -193,7 +89,8 @@ __global__ void matmul_kernel(const float *W, const float *x, const float *bias,
   int row = blockIdx.x * blockDim.x + threadIdx.x;
 
   if (row < out_features) {
-    float sum = 0.0f;
+    double sum = 0.0f;
+
     const float *W_row = W + (size_t)row * in_features;
     for (int i = 0; i < in_features; i++) {
       sum += W_row[i] * x[i];
@@ -252,10 +149,10 @@ __global__ void LinearBiasResidual_kernel(const float *W, const float *x, const 
   int row = blockIdx.x * blockDim.x + threadIdx.x;
 
   if (row < out_features) {
-    float sum = 0.0f;
+    double sum = 0.0;
     const float *W_row = W + (size_t)row * in_features;
     for (int i = 0; i < in_features; i++) {
-      sum += W_row[i] * x[i];
+      sum += (double)W_row[i] * x[i];
     }
     if (bias != nullptr) {
       sum += bias[row];
@@ -326,60 +223,52 @@ void BuildRopeTableGPU(int seq_len, int head_dim, float rope_theta, float scalin
   free(h_inv_freq);
 }
 
-__global__ void QKVEpilogueSplitRoPECache_kernel(float *qkv_out, float *q_out, float *k_pos,
-                                                 float *v_pos, const float *rope_cos_pos,
-                                                 const float *rope_sin_pos, int head_dim, int n_q,
-                                                 int n_kv) {
+__global__ void QKVEpilogueSplitRoPECache_kernel(
+  const float *__restrict__ qkv_out, float *__restrict__ q_out, float *__restrict__ k_pos,
+  float *__restrict__ v_pos, const float *__restrict__ rope_cos_pos,
+  const float *__restrict__ rope_sin_pos, int head_dim, int n_q, int n_kv) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-  // Tổng số chiều của Q, K, V
   int q_dims = n_q * head_dim;
   int k_dims = n_kv * head_dim;
   int v_dims = n_kv * head_dim;
+  int half = head_dim / 2;
 
-  if (idx < q_dims + k_dims + v_dims) {
-    float val = qkv_out[idx];
+  if (idx < q_dims) {
+    // ---- Q slice ----
+    int head_idx = idx / head_dim;
+    int dim_idx = idx % head_dim;
 
-    if (idx < q_dims) {  // Đây là phần tử của Q
-      int head_idx = idx / head_dim;
-      int dim_idx = idx % head_dim;
+    if (dim_idx < half) {
+      size_t q_base = head_idx * head_dim;
+      float x1 = qkv_out[q_base + dim_idx];
+      float x2 = qkv_out[q_base + half + dim_idx];
+      float c = rope_cos_pos[dim_idx];
+      float s = rope_sin_pos[dim_idx];
 
-      // Áp dụng RoPE cho Q
-      if (dim_idx % 2 == 0) {
-        int pair_dim_idx = dim_idx + 1;
-        int pair_idx = head_idx * head_dim + pair_dim_idx;
-        float val_pair = qkv_out[pair_idx];
-
-        int rope_idx = dim_idx / 2;
-        float cos_val = rope_cos_pos[rope_idx];
-        float sin_val = rope_sin_pos[rope_idx];
-
-        q_out[idx] = val * cos_val - val_pair * sin_val;
-        q_out[pair_idx] = val * sin_val + val_pair * cos_val;
-      }
-
-    } else if (idx < q_dims + k_dims) {  // Đây là phần tử của K
-      int k_idx = idx - q_dims;
-      int head_idx = k_idx / head_dim;
-      int dim_idx = k_idx % head_dim;
-
-      // Áp dụng RoPE cho K và ghi vào cache
-      if (dim_idx % 2 == 0) {
-        int pair_dim_idx = dim_idx + 1;
-        int pair_idx = q_dims + head_idx * head_dim + pair_dim_idx;
-        float val_pair = qkv_out[pair_idx];
-
-        int rope_idx = dim_idx / 2;
-        float cos_val = rope_cos_pos[rope_idx];
-        float sin_val = rope_sin_pos[rope_idx];
-
-        k_pos[k_idx] = val * cos_val - val_pair * sin_val;
-        k_pos[k_idx + 1] = val * sin_val + val_pair * cos_val;
-      }
-    } else {  // Đây là phần tử của V
-      int v_idx = idx - q_dims - k_dims;
-      v_pos[v_idx] = val;  // Chỉ cần copy V vào cache
+      q_out[q_base + dim_idx] = x1 * c - x2 * s;
+      q_out[q_base + half + dim_idx] = x2 * c + x1 * s;
     }
+  } else if (idx < q_dims + k_dims) {
+    // ---- K slice ----
+    int k_idx = idx - q_dims;
+    int head_idx = k_idx / head_dim;
+    int dim_idx = k_idx % head_dim;
+
+    if (dim_idx < half) {
+      size_t k_base = head_idx * head_dim;
+      size_t Koff = q_dims + k_base;
+      float x1 = qkv_out[Koff + dim_idx];
+      float x2 = qkv_out[Koff + half + dim_idx];
+      float c = rope_cos_pos[dim_idx];
+      float s = rope_sin_pos[dim_idx];
+
+      k_pos[k_base + dim_idx] = x1 * c - x2 * s;
+      k_pos[k_base + half + dim_idx] = x2 * c + x1 * s;
+    }
+  } else {
+    // ---- V slice: copy ----
+    int v_idx = idx - q_dims - k_dims;
+    v_pos[v_idx] = qkv_out[q_dims + k_dims + v_idx];
   }
 }
 
@@ -446,7 +335,7 @@ __global__ void attention_kernel(const float *q, const float *K_cache, const flo
 
     double denom = 0.0;
     for (int t = 0; t < softmax_len; t++) {
-      s_scores[t] = expf(s_scores[t] - (float)max_score);
+      s_scores[t] = expf(s_scores[t] - max_score);
       denom += s_scores[t];
     }
 
@@ -533,12 +422,12 @@ __global__ void TopKSoftmax_kernel(const float *r, int n_experts, int k, float *
 
   double denom = 0.0;
   for (int i = 0; i < k; ++i) {
-    denom += expf(temp_vals[i] - (float)max_val);
+    denom += expf(temp_vals[i] - max_val);
   }
 
   // Output results
   for (int i = 0; i < k; ++i) {
-    topk_vals[i] = expf(temp_vals[i] - (float)max_val) / (float)denom;
+    topk_vals[i] = expf(temp_vals[i] - max_val) / denom;
     topk_idx[i] = temp_idx[i];
   }
 }
