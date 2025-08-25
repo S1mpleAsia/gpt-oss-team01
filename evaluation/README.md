@@ -13,5 +13,5 @@
 - To run
 
 ```bash
-python eval.py -p ../data/input_test.txt -s ../data/output_test.txt -r refs_openai_gpt5.jsonl
+python eval.py -p ../data/input.txt -s ../data/output.txt -r refs_openai_gpt5.jsonl
 ```
