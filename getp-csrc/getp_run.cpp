@@ -18,6 +18,8 @@
 #ifndef GETP_RUN
 #define GETP_RUN
 
+// #define RUN_BATCH
+
 OurTransformerWeights *weights;
 OurRunState *rs;
 Config *p;
@@ -47,6 +49,7 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
   delete rs;
 }
 
+#ifndef RUN_BATCH
 long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
                                const char *input_seq, int *output_tokens, int steps) {
   // <|start|>: 200006
@@ -92,7 +95,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer, S
 
     // advance the state machine
     {
-      GpuTimer timer("sample");
+      // GpuTimer timer("sample");
       pos++;
       if (pos < num_prompt_tokens) {
         // if we are still processing the input prompt, force the next prompt
@@ -131,7 +134,6 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer, S
 
   return pos - num_prompt_tokens + 1;
 }
-// #endif
 
 long long inference(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
                     Requests *requests) {
@@ -144,5 +146,117 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer, Sampler *sam
   }
   return num_token_out;
 }
+#else
+
+long long batched_getp_generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
+                                const std::vector<const char *> &input_batch,
+                                const std::vector<int *> &output_batch, int steps) {
+  Config *p = &transformer->config;
+
+  const int batch_size = input_batch.size();
+  if (batch_size == 0)
+    return 0;
+
+  vector<vector<int>> batch_prompt_tokens(batch_size);
+  vector<int> num_prompt_tokens(batch_size);
+
+  for (int i = 0; i < batch_size; i++) {
+    const char *input_seq = input_batch[i] ? input_batch[i] : "";
+    int *prompt_tokens_buffer = (int *)malloc(strlen((input_seq) + 3) * sizeof(int));
+    int count = 0;
+    encode(tokenizer, input_seq, 1, 0, prompt_tokens_buffer, &count, p->initial_context_length);
+
+    if (count < 1) {
+      fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
+      exit(EXIT_FAILURE);
+    } else {
+      batch_prompt_tokens[i] = vector<int>(prompt_tokens_buffer, prompt_tokens_buffer + count);
+      num_prompt_tokens[i] = count;
+    }
+
+    free(prompt_tokens_buffer);
+  }
+
+  vector<int> current_tokens(batch_size);
+  vector<int> current_pos(batch_size, 0);
+  vector<bool> active(batch_size, true);
+  int active_count = batch_size;
+  long long total_generate_tokens = 0;
+
+  for (int i = 0; i < batch_size; i++) {
+    current_tokens[i] = batch_prompt_tokens[i][0];
+  }
+
+  for (int pos = 0; pos < steps && active_count > 0; ++pos) {
+    float *batch_logits =
+      forward_gpu_20b_batched(p, weights, rs, current_tokens.data(), pos, batch_size);
+
+#pragma omp parallel for
+    for (int i = 0; i < batch_size; i++) {
+      if (!active[i])
+        continue;
+
+      int next_token;
+      if (current_pos[i] < num_prompt_tokens[i] - 1) {
+        next_token = batch_prompt_tokens[i][current_pos[i] + 1];
+      } else {
+        float *logits = batch_logits + 1ll * i * p->vocab_size;
+        next_token = sample(sampler, logits);
+        output_batch[i][current_pos[i] - (num_prompt_tokens[i] - 1)] = next_token;
+      }
+
+      if (next_token == 199999 || next_token == 200002) {
+#pragma omp critical
+        {
+          if (active[i]) {
+            active[i] = false;
+            active_count--;
+          }
+        }
+      }
+
+      current_tokens[i] = next_token;
+      current_pos[i]++;
+    }
+  }
+
+  for (int i = 0; i < batch_size; i++) {
+    int generated_len = current_pos[i] - num_prompt_tokens[i];
+    if (generated_len < 0)
+      generated_len = 0;
+
+    output_batch[i][generated_len] = -1;
+    total_generate_tokens += generated_len;
+  }
+
+  return total_generate_tokens;
+}
+
+long long inference(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
+                    Requests *requests) {
+  long long num_token_out = 0;
+
+  for (int start_idx = 0; start_idx < requests->num_reqs; start_idx += BATCH_SIZE) {
+    int current_size = BATCH_SIZE;
+    if (start_idx + BATCH_SIZE > requests->num_reqs) {
+      current_size = requests->num_reqs - BATCH_SIZE;
+    }
+
+    vector<const char *> input_batch;
+    vector<int *> output_batch;
+
+    for (int i = 0; i < current_size; i++) {
+      input_batch.push_back(get_str_req_ptr(requests, start_idx + i));
+      output_batch.push_back(get_tok_gen_ptr(requests, start_idx + i));
+    }
+
+    // const char *input_seq = get_str_req_ptr(requests, idx);
+    // int *output_tokens = get_tok_gen_ptr(requests, idx);
+    num_token_out += batched_getp_generate(transformer, tokenizer, sampler, input_batch,
+                                           output_batch, requests->max_seq_len);
+  }
+  return num_token_out;
+}
+#endif
 
 #endif  // GETP_RUN

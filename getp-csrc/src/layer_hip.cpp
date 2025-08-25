@@ -7,7 +7,7 @@
 void embedding_lookup(Tensor *embedding,        // (vocab_size, hidden_dim)
                       int token_id, Tensor *x,  // (hidden_dim, )
                       bool x_from_device, hipStream_t stream) {
-  GpuTimer timer("embedding_lookup");
+  // GpuTimer timer("embedding_lookup");
   // Assure that embedding->dtype == x->dtype
   const size_t hidden_dim = x->shape[0];
   if (x->dtype == DType::BF16) {
@@ -171,7 +171,7 @@ __global__ void rmsnorm_kernel(const float *x, const float *w, float *out, int h
 
 void rmsnorm(Tensor *x, Tensor *w, Tensor *out, long long layer_offset, bool x_to_device,
              bool out_from_device, float eps, hipStream_t stream) {
-  GpuTimer timer("rmsnorm");
+  // GpuTimer timer("rmsnorm");
   if (x_to_device)
     x->to_device(stream);
 
@@ -275,7 +275,7 @@ void QKVGemmGPU_Old(const float *w_qkv, const float *b_qkv, const float *t, floa
 
 void qkv_gemm(Tensor *x, const Tensor *W_qkv, const Tensor *b_qkv, Tensor *qkv,
               long long layer_offset, bool x_to_device, bool qkv_from_device, hipStream_t stream) {
-  GpuTimer timer("qkv_gemm");
+  // GpuTimer timer("qkv_gemm");
   if (x_to_device)
     x->to_device(stream);
 
@@ -306,7 +306,7 @@ void qkv_gemm(Tensor *x, const Tensor *W_qkv, const Tensor *b_qkv, Tensor *qkv,
 void split_qkv(Tensor *qkv, int head_dim, int n_q, int n_kv, Tensor *q, Tensor *k, Tensor *v,
                bool qkv_to_device, bool q_from_device, bool k_from_device, bool v_from_device,
                hipStream_t stream) {
-  GpuTimer timer("split_qkv");
+  // GpuTimer timer("split_qkv");
   // Assume they are all copy on device for now
   if (qkv_to_device)
     qkv->to_device(stream);
@@ -338,7 +338,7 @@ __global__ void add_vector_kernel(float *y, const float *b, int len) {
 
 void add_vector(Tensor *y, Tensor *b, bool y_to_device, bool b_to_device, bool y_from_device,
                 hipStream_t stream) {
-  GpuTimer timer("add_vector");
+  // GpuTimer timer("add_vector");
   if (y_to_device)
     y->to_device(stream);
   if (b_to_device)
@@ -379,7 +379,7 @@ __global__ void linear_bias_residual_kernel(const float *W, const float *x, cons
 
 void linear_bias_residual(const float *W, const float *x, const float *bias, float *x_resid_inout,
                           int in_features, int out_features, hipStream_t stream) {
-  GpuTimer timer("linear_bias_residual");
+  // GpuTimer timer("linear_bias_residual");
   dim3 block_dim(DEFAULT_BLOCK_SIZE);
   dim3 grid_dim((out_features + block_dim.x - 1) / block_dim.x);
   linear_bias_residual_kernel<<<grid_dim, block_dim, 0, stream>>>(W, x, bias, x_resid_inout,
@@ -461,7 +461,7 @@ void qkv_split_rope(Tensor *qkv_out, Tensor *q_out, Tensor *k_pos, Tensor *v_pos
                     const Tensor *rope_cos_pos, const Tensor *rope_sin_pos, int head_dim, int n_q,
                     int n_kv, int pos, bool qkv_out_to_device, bool q_out_from_device,
                     bool k_pos_from_device, bool v_pos_from_device, hipStream_t stream) {
-  GpuTimer timer("qkv_split_rope");
+  // GpuTimer timer("qkv_split_rope");
   if (qkv_out_to_device)
     qkv_out->to_device(stream);
 
@@ -573,7 +573,7 @@ void single_query_attn(Tensor *q, Tensor *K_cache, Tensor *V_cache, Tensor *mask
                        int kv_dim, int seq_len, int sliding_window, int pos, long long layer_offset,
                        bool q_to_device, bool k_cache_to_device, bool v_cache_to_device,
                        bool mask_to_device, bool tb_from_device, hipStream_t stream) {
-  GpuTimer timer("single_query_attn");
+  // GpuTimer timer("single_query_attn");
   if (q_to_device)
     q->to_device(stream);
   if (k_cache_to_device)
@@ -629,7 +629,7 @@ void single_query_attn(Tensor *q, Tensor *K_cache, Tensor *V_cache, Tensor *mask
 void attn_out_project(Tensor *tb, const Tensor *W_o, const Tensor *b_o, Tensor *y,
                       long long layer_offset, bool tb_to_device, bool y_from_device,
                       hipStream_t stream) {
-  GpuTimer timer("attn_out_project");
+  // GpuTimer timer("attn_out_project");
   if (tb_to_device)
     tb->to_device(stream);
 
@@ -663,7 +663,7 @@ void attn_out_project(Tensor *tb, const Tensor *W_o, const Tensor *b_o, Tensor *
 //================================================================================================
 void router_gemm(const Tensor *w_router, Tensor *t, const Tensor *b_router, Tensor *router_score,
                  long long layer_offset, bool t_to_device, bool r_from_device, hipStream_t stream) {
-  GpuTimer timer("router_gemm");
+  // GpuTimer timer("router_gemm");
   if (t_to_device)
     t->to_device(stream);
 
@@ -743,7 +743,7 @@ __global__ void topk_softmax_kernel(const float *r, int n_experts, int k, float 
 
 void topk_softmax(Tensor *r, Tensor *topk_vals, TensorI32 *topk_idx, bool r_to_device,
                   bool topk_vals_from_device, bool topk_idx_from_device, hipStream_t stream) {
-  GpuTimer timer("topk_softmax");
+  // GpuTimer timer("topk_softmax");
   if (r_to_device)
     r->to_device(stream);
 
@@ -903,7 +903,7 @@ void moe_apply_topk(Tensor *t, const Tensor *W1, const Tensor *b1, const Tensor 
                     Tensor *gate_up, Tensor *tb3, Tensor *e_agg, float clamp_limit,
                     long long layer_offset, bool t_to_device, bool topk_idx_to_device,
                     bool topk_vals_to_device, bool e_agg_from_device, hipStream_t stream) {
-  GpuTimer("moe_apply_topk");
+  // GpuTimer("moe_apply_topk");
   if (t_to_device)
     t->to_device(stream);
   if (topk_idx_to_device)
@@ -978,7 +978,7 @@ void moe_apply_topk(Tensor *t, const Tensor *W1, const Tensor *b1, const Tensor 
 
 void classifier_gemm(const Tensor *W_out, Tensor *x, Tensor *logits, bool x_to_device,
                      bool logits_from_device, hipStream_t stream) {
-  GpuTimer timer("classifier");
+  // GpuTimer timer("classifier");
   if (x_to_device)
     x->to_device(stream);
 

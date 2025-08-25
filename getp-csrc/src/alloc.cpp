@@ -49,44 +49,48 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
 void our_init_run_state(RunState *s, Config *p, OurRunState *rs) {
   // Create Tensor wrappers for state buffers
-  rs->x = new Tensor({(size_t)p->hidden_dim}, s->x);
+  rs->x = new Tensor({BATCH_SIZE * (size_t)p->hidden_dim}, s->x);
 
-  rs->t = new Tensor({(size_t)p->hidden_dim}, s->t);
-  rs->tb = new Tensor({(size_t)p->head_dim * p->n_attn_heads}, s->tb);
-  rs->tb2 = new Tensor({(size_t)p->hidden_dim}, s->tb2);
+  rs->t = new Tensor({BATCH_SIZE * (size_t)p->hidden_dim}, s->t);
+  rs->tb = new Tensor({BATCH_SIZE * (size_t)p->head_dim * p->n_attn_heads}, s->tb);
+  rs->tb2 = new Tensor({BATCH_SIZE * (size_t)p->hidden_dim}, s->tb2);
 
-  rs->tb3 = new Tensor({(size_t)p->experts_per_token, (size_t)p->hidden_dim});
+  rs->tb3 = new Tensor({BATCH_SIZE * (size_t)p->experts_per_token, (size_t)p->hidden_dim});
 
-  rs->router_score = new Tensor({(size_t)p->n_experts}, s->router_score);
-  rs->topk_v = new Tensor({(size_t)p->experts_per_token}, s->topk_v);
-  rs->topk_i = new TensorI32({(size_t)p->experts_per_token}, s->topk_i);
+  rs->router_score = new Tensor({BATCH_SIZE * (size_t)p->n_experts}, s->router_score);
+  rs->topk_v = new Tensor({BATCH_SIZE * (size_t)p->experts_per_token}, s->topk_v);
+  rs->topk_i = new TensorI32({BATCH_SIZE * (size_t)p->experts_per_token}, s->topk_i);
 
   // rs->mlp1_out = new Tensor({2 * (size_t)p->intermediate_dim}, s->mlp1_out);
-  rs->mlp1_out = new Tensor({(size_t)p->experts_per_token, 2 * (size_t)p->intermediate_dim});
+  rs->mlp1_out =
+    new Tensor({BATCH_SIZE * (size_t)p->experts_per_token, 2 * (size_t)p->intermediate_dim});
 
   // rs->gate = new Tensor({(size_t)p->intermediate_dim}, s->gate);
   // rs->up = new Tensor({(size_t)p->intermediate_dim}, s->up);
-  rs->gate = new Tensor({(size_t)p->experts_per_token, (size_t)p->intermediate_dim});
-  rs->up = new Tensor({(size_t)p->experts_per_token, (size_t)p->intermediate_dim});
+  rs->gate = new Tensor({BATCH_SIZE * (size_t)p->experts_per_token, (size_t)p->intermediate_dim});
+  rs->up = new Tensor({BATCH_SIZE * (size_t)p->experts_per_token, (size_t)p->intermediate_dim});
 
   // rs->gate_up = new Tensor({(size_t)p->intermediate_dim}, s->gate_up);
-  rs->gate_up = new Tensor({(size_t)p->experts_per_token, (size_t)p->intermediate_dim});
+  rs->gate_up =
+    new Tensor({BATCH_SIZE * (size_t)p->experts_per_token, (size_t)p->intermediate_dim});
 
-  rs->e_agg = new Tensor({(size_t)p->hidden_dim}, s->e_agg);
-  rs->qkv =
-    new Tensor({((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim}, s->qkv);
-  rs->q = new Tensor({(size_t)p->n_attn_heads * p->head_dim}, s->q);
-  rs->k = new Tensor({(size_t)p->n_kv_heads * p->head_dim});
-  rs->v = new Tensor({(size_t)p->n_kv_heads * p->head_dim});
-  rs->att = new Tensor({(size_t)p->n_attn_heads, (size_t)p->seq_len}, s->att);
-  rs->logits = new Tensor({(size_t)p->vocab_size}, s->logits);
+  rs->e_agg = new Tensor({BATCH_SIZE * (size_t)p->hidden_dim}, s->e_agg);
+  rs->qkv = new Tensor(
+    {BATCH_SIZE * ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim}, s->qkv);
+  rs->q = new Tensor({BATCH_SIZE * (size_t)p->n_attn_heads * p->head_dim}, s->q);
+  rs->k = new Tensor({BATCH_SIZE * (size_t)p->n_kv_heads * p->head_dim});
+  rs->v = new Tensor({BATCH_SIZE * (size_t)p->n_kv_heads * p->head_dim});
+  rs->att = new Tensor({BATCH_SIZE * (size_t)p->n_attn_heads, (size_t)p->seq_len}, s->att);
+  rs->logits = new Tensor({BATCH_SIZE * (size_t)p->vocab_size}, s->logits);
 
   rs->key_cache = new Tensor(
-    {(size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim}, s->key_cache);
+    {BATCH_SIZE * (size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
+    s->key_cache);
   rs->value_cache = new Tensor(
-    {(size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim}, s->value_cache);
+    {BATCH_SIZE * (size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
+    s->value_cache);
 
-  rs->mask = new Tensor({(size_t)p->seq_len, (size_t)p->seq_len}, s->mask);
+  rs->mask = new Tensor({BATCH_SIZE * (size_t)p->seq_len, (size_t)p->seq_len}, s->mask);
 }
 
 void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunState *rs) {
