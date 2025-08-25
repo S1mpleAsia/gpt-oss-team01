@@ -83,12 +83,14 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer, S
     float *logits = forward_gpu_20b(p, weights, rs, token, pos);
     // float *logits = forward(transformer, token, pos); <---- real code from run.cpp
 
-    // printf("logits: ");
-    // for (int i = 0; i < 5; i++) {
-    //   printf("%.6f ", logits[i]);
-    // }
-    // printf("\n");
+  #ifdef PRINT_LOGITS
+    printf("logits: ");
+    for (int i = 0; i < 5; i++) {
+      printf("%.6f ", logits[i]);
+    }
+    printf("\n");
     // exit(1);
+  #endif
 
     // advance the state machine
     {
@@ -113,16 +115,20 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer, S
 
       // print the token as string, decode it with the Tokenizer object
       // should be removed
-      // const char *piece = decode_piece(tokenizer, token, next);
-      // safe_printf(piece);  // same as printf("%s", piece), but skips "unsafe" bytes
-      // fflush(stdout);
+    #ifdef PRINT_LOGITS
+      const char *piece = decode_piece(tokenizer, token, next);
+      safe_printf(piece);  // same as printf("%s", piece), but skips "unsafe" bytes
+      fflush(stdout);
+    #endif
 
       token = next;
     }
   }
 
   // should be removed
-  // printf("\n");
+  #ifdef PRINT_LOGITS
+    printf("\n");
+  #endif
 
   // Marker for end of sequence
   output_tokens[pos - num_prompt_tokens + 1] = -1;
@@ -131,17 +137,21 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer, S
 
   return pos - num_prompt_tokens + 1;
 }
+
 // #endif
 
 long long inference(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
                     Requests *requests) {
+  constexpr int BATCH_SIZE = 2;
+
   long long num_token_out = 0;
-  for (int idx = 0; idx < requests->num_reqs; ++idx) {
+
+  for (int idx = 0; idx < requests->num_reqs; idx++) {
     const char *input_seq = get_str_req_ptr(requests, idx);
     int *output_tokens = get_tok_gen_ptr(requests, idx);
-    num_token_out += simple_getp_generate(transformer, tokenizer, sampler, input_seq, output_tokens,
-                                          requests->max_seq_len);
+    num_token_out += simple_getp_generate(transformer, tokenizer, sampler, input_seq, output_tokens, requests->max_seq_len);
   }
+
   return num_token_out;
 }
 

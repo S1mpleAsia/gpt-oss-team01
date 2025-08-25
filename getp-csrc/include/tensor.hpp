@@ -15,6 +15,9 @@ struct DType {
   enum Type { FP32, BF16 };
 };
 
+// #define DEBUG
+#define PRINT_LOGITS
+
 #define CHECK_HIP(call)                                                                            \
   do {                                                                                             \
     hipError_t _st = (call);                                                                       \

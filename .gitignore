@@ -7,6 +7,7 @@
 logs/
 debug/*.txt
 run.sh
+test.sh
 
 data/*
 !data/input.txt
