@@ -2,6 +2,10 @@
 #include <cmath>
 #include <cstring>
 
+float *batch_forward_gpu_20b(Config *p, OurTransformerWeights *weights, OurRunState *rs, int *token, int *pos, int batch_size) {
+  return nullptr;
+}
+
 float *forward_gpu_20b(Config *p, OurTransformerWeights *weights, OurRunState *rs, int token,
                        int pos) {
   // copy the token embedding into x
