@@ -3,7 +3,7 @@
 #include <cstring>
 
 float *forward_gpu_20b_batched(Config *p, OurTransformerWeights *weights, OurRunState *rs,
-                               int *token, int pos, int batch_size) {
+                               int *tokens, int pos, int batch_size) {
   return forward_gpu_20b(p, weights, rs, token[0], pos);
 }
 

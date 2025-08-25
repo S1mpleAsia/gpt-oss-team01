@@ -9,7 +9,7 @@ void embedding_lookup(Tensor *embedding,        // (vocab_size, hidden_dim)
                       bool x_from_device, hipStream_t stream) {
   // GpuTimer timer("embedding_lookup");
   // Assure that embedding->dtype == x->dtype
-  const size_t hidden_dim = x->shape[0];
+  const size_t hidden_dim = x->shape[1];
   if (x->dtype == DType::BF16) {
     bf16 *src = (bf16 *)embedding->d_buf + (size_t)token_id * hidden_dim;
     CHECK_HIP(hipMemcpyAsync((bf16 *)x->d_buf, src, hidden_dim * sizeof(bf16),
@@ -23,39 +23,6 @@ void embedding_lookup(Tensor *embedding,        // (vocab_size, hidden_dim)
   if (x_from_device) {
     x->from_device(stream);
     CHECK_HIP(hipStreamSynchronize(stream));
-  }
-}
-
-__global__ void RMSNorm_kernel(const float *x, const float *w, float *out, int n, float eps) {
-  // Kernel này giả định n đủ nhỏ để tính toán trong một block duy nhất
-  __shared__ float s_variance;
-
-  // Pass 1: Tính tổng bình phương (sum of squares)
-  float sum_sq = 0.0f;
-  for (int i = threadIdx.x; i < n; i += blockDim.x) {
-    sum_sq += x[i] * x[i];
-  }
-
-  // Dùng shared memory để reduce tổng trong block
-  __shared__ float s_partials[DEFAULT_BLOCK_SIZE];
-  s_partials[threadIdx.x] = sum_sq;
-  __syncthreads();
-
-  // Thread 0 thực hiện phần reduce cuối cùng
-  if (threadIdx.x == 0) {
-    float total_sum_sq = 0.0f;
-    // Giả định blockDim.x <= DEFAULT_BLOCK_SIZE
-    for (int i = 0; i < blockDim.x; i++) {
-      total_sum_sq += s_partials[i];
-    }
-    float variance = total_sum_sq / n;
-    s_variance = rsqrtf(variance + eps);
-  }
-  __syncthreads();  // Đảm bảo mọi thread đều thấy s_variance
-
-  // Pass 2: Áp dụng chuẩn hóa
-  for (int i = threadIdx.x; i < n; i += blockDim.x) {
-    out[i] = x[i] * s_variance * w[i];
   }
 }
 
@@ -110,65 +77,6 @@ __global__ void rmsnorm_kernel_double_precision(const float *x, const float *w, 
   }
 }
 
-__global__ void rmsnorm_kernel(const float *x, const float *w, float *out, int hidden_dim,
-                               float eps) {
-  const int row = blockIdx.x;
-  const int tid = threadIdx.x;
-
-  const float *x_row = x + row * hidden_dim;
-  const float *w_row = w + row * hidden_dim;
-  float *o_row = out + row * hidden_dim;
-
-  float acc = 0.0f;
-
-  for (int j = tid; j < hidden_dim; j += blockDim.x) {
-    float v = x_row[j];
-    acc += v * v;
-  }
-
-  // Warp reduction
-  for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-    acc += __shfl_down(acc, offset);
-  }
-
-  // 32 * 64 = 2048 threads
-  __shared__ float warp_sum[32];
-  int lane = tid & (warpSize - 1);
-  int warp_id = (tid + warpSize - 1) / warpSize;
-
-  if (lane == 0)
-    warp_sum[warp_id] = acc;
-
-  __syncthreads();
-
-  __shared__ float block_sum;
-  if (warp_id == 0) {
-    int num_warps = (blockDim.x + warpSize - 1) / warpSize;
-    float val = (lane < num_warps) ? warp_sum[lane] : 0.0f;
-
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-      val += __shfl_down(val, offset);
-    }
-
-    if (lane == 0) {
-      block_sum = val;
-    }
-  }
-  __syncthreads();
-
-  __shared__ float inv_rms;
-  if (tid == 0) {
-    float mean = block_sum / (float)hidden_dim;
-    inv_rms = rsqrtf(mean + eps);
-  }
-
-  __syncthreads();
-
-  for (int j = tid; j < hidden_dim; j += blockDim.x) {
-    o_row[j] = w_row[j] * (x_row[j] * inv_rms);
-  }
-}
-
 void rmsnorm(Tensor *x, Tensor *w, Tensor *out, long long layer_offset, bool x_to_device,
              bool out_from_device, float eps, hipStream_t stream) {
   // GpuTimer timer("rmsnorm");
@@ -181,7 +89,7 @@ void rmsnorm(Tensor *x, Tensor *w, Tensor *out, long long layer_offset, bool x_t
 
   size_t shared_mem_size = num_threads * sizeof(double);
 
-  const int hidden_dim = x->shape[0];
+  const int hidden_dim = x->shape[1];
 
   const float *x_ptr = (float *)x->d_buf;
   const float *w_ptr = (float *)w->d_buf + 1ll * layer_offset * hidden_dim;
@@ -261,16 +169,6 @@ __global__ void matmul_kernel(const float *W, const float *x, const float *bias,
     }
     out[row] = sum;
   }
-}
-
-void QKVGemmGPU_Old(const float *w_qkv, const float *b_qkv, const float *t, float *out,
-                    int hidden_dim, int head_dim, int in_features, int out_features,
-                    hipStream_t stream) {
-  dim3 block_dim(DEFAULT_BLOCK_SIZE);
-  dim3 grid_dim((out_features + block_dim.x - 1) / block_dim.x);
-
-  matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(w_qkv, t, b_qkv, out, out_features,
-                                                    in_features);
 }
 
 void qkv_gemm(Tensor *x, const Tensor *W_qkv, const Tensor *b_qkv, Tensor *qkv,
@@ -912,7 +810,7 @@ void moe_apply_topk(Tensor *t, const Tensor *W1, const Tensor *b1, const Tensor 
     topk_vals->to_device(stream);
 
   // Extract dimensions from tensor shapes
-  const int hidden_dim = t->shape[0];
+  const int hidden_dim = t->shape[1];
   const int inter_dim = W2->shape[2];
   const int k = topk_idx->num_elem();
   const int num_experts = b2->shape[1];
