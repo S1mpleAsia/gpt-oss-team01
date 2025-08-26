@@ -7,7 +7,6 @@
 #include "tensor.hpp"
 #include "config_run.hpp"
 
-#define BATCH_SIZE 1
 Tensor *cos_tensor, *sin_tensor;
 
 typedef struct {

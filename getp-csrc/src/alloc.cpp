@@ -89,6 +89,7 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs) {
     {BATCH_SIZE, (size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
     s->value_cache);
 
+  // mask needs to be batch because they are not zero_allocated
   rs->mask = new Tensor({BATCH_SIZE, (size_t)p->seq_len, (size_t)p->seq_len}, s->mask);
 }
 

@@ -32,7 +32,7 @@ void qkv_split_rope_batched(Tensor *qkv_out,             // Shape: [batch_size, 
                             Tensor *v_pos,               // Shape: [batch_size, n_kv*hd]
                             const Tensor *rope_cos_pos,  // Shape: [seq_len, hd/2]
                             const Tensor *rope_sin_pos,  // Shape: [seq_len, hd/2]
-                            int head_dim, int n_q, int n_kv, int pos, bool qkv_out_from_device,
+                            int head_dim, int n_q, int n_kv, int pos, bool qkv_out_to_device,
                             bool q_out_from_device, bool k_out_from_device, bool v_out_from_device,
                             hipStream_t stream = 0);
 
@@ -61,8 +61,8 @@ void attn_out_project_batched(Tensor *tb,         // Shape: [batch_size, n_q*hd]
                               hipStream_t stream = 0);
 
 // ---------- Router GEMM ----------
-void router_gemm_batched(Tensor *t,               // Shape: [batch_size, hidden_dim]
-                         const Tensor *w_router,  // Shape: [n_experts, hidden_dim]
+void router_gemm_batched(const Tensor *w_router,  // Shape: [n_experts, hidden_dim]
+                         Tensor *t,               // Shape: [batch_size, hidden_dim]
                          const Tensor *b_router,  // Shape: [n_experts]
                          Tensor *router_scores,   // Shape: [batch_size, n_experts]
                          long long layer_offset, bool t_to_device, bool r_from_device,

@@ -11,6 +11,11 @@ using std::vector;
 
 typedef hip_bfloat16 bf16;
 
+#define RUN_BATCH
+#define BATCH_SIZE 1
+#define PRINT_LOGITS
+// #define TIME_GPU
+
 struct DType {
   enum Type { FP32, BF16 };
 };

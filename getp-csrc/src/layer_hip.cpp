@@ -201,32 +201,6 @@ void qkv_gemm(Tensor *x, const Tensor *W_qkv, const Tensor *b_qkv, Tensor *qkv,
   }
 }
 
-void split_qkv(Tensor *qkv, int head_dim, int n_q, int n_kv, Tensor *q, Tensor *k, Tensor *v,
-               bool qkv_to_device, bool q_from_device, bool k_from_device, bool v_from_device,
-               hipStream_t stream) {
-  // GpuTimer timer("split_qkv");
-  // Assume they are all copy on device for now
-  if (qkv_to_device)
-    qkv->to_device(stream);
-
-  size_t offset = 0;
-  memcpy_tensor(q, qkv, 0, offset, n_q * head_dim, false, true, stream);
-  offset += n_q * head_dim;
-  memcpy_tensor(k, qkv, 0, offset, n_kv * head_dim, false, true, stream);
-  offset += n_kv * head_dim;
-  memcpy_tensor(v, qkv, 0, offset, n_kv * head_dim, false, true, stream);
-
-  if (q_from_device)
-    q->from_device(stream);
-  if (k_from_device)
-    k->from_device(stream);
-  if (v_from_device)
-    v->from_device(stream);
-  if (q_from_device || k_from_device || v_from_device) {
-    CHECK_HIP(hipStreamSynchronize(stream));
-  }
-}
-
 __global__ void add_vector_kernel(float *y, const float *b, int len) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < len) {
@@ -572,10 +546,31 @@ void router_gemm(const Tensor *w_router, Tensor *t, const Tensor *b_router, Tens
   const float *t_ptr = (float *)t->d_buf;
   float *r_ptr = (float *)router_score->d_buf;
 
-  dim3 block_dim(DEFAULT_BLOCK_SIZE);
-  dim3 grid_dim((n_experts + block_dim.x - 1) / block_dim.x);
-  matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(w_router_ptr, t_ptr, b_router_ptr, r_ptr,
-                                                    n_experts, hidden);
+  // --- KERNEL SWAP ---
+
+  // Original matmul_kernel launch
+  // dim3 block_dim(DEFAULT_BLOCK_SIZE);
+  // dim3 grid_dim((n_experts + block_dim.x - 1) / block_dim.x);
+  // matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(...);
+
+  // New gemv_kernel launch
+  const int WARPS_PER_BLOCK = 4; // Tuning parameter
+  const int TILE = 256;          // Tuning parameter
+  const int warpSize = 64;       // Or 32, depending on GPU architecture
+
+  // Each block has `warpSize` threads in the x-dim and `WARPS_PER_BLOCK` in the y-dim
+  dim3 block_dim(warpSize, WARPS_PER_BLOCK);
+  
+  // Each block processes `WARPS_PER_BLOCK` output rows
+  dim3 grid_dim((n_experts + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
+  
+  // Specify dynamic shared memory size needed by the kernel
+  size_t shared_mem_size = TILE * sizeof(float);
+
+  gemv_kernel<WARPS_PER_BLOCK, TILE><<<grid_dim, block_dim, shared_mem_size, stream>>>(
+      w_router_ptr, t_ptr, b_router_ptr, r_ptr, n_experts, hidden);
+
+  // --- END KERNEL SWAP ---
 
   if (r_from_device) {
     router_score->from_device(stream);
