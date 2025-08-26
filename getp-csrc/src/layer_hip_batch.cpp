@@ -609,7 +609,7 @@ void router_gemm_batched(const Tensor *w_router,  // Shape: [n_experts, hidden_d
     // router_score shape: [batch_size, n_experts]
     const long long batch_size = t->shape[0];
     const long long hidden_dim = t->shape[1];
-    const long long n_experts = w_router->shape[0];
+    const long long n_experts = router_scores->shape[1];
 
     // Get raw device pointers for weights, biases, input, and output
     // Apply the layer offset to select the correct weights and biases for the current layer

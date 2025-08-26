@@ -53,12 +53,13 @@ float *forward_gpu_20b_batched(Config *p, OurTransformerWeights *weights, OurRun
     rmsnorm_batched(rs->x, weights->rms_ffn_w, rs->t, 1ll * l, false, false);
 
     // MoE routing
-    router_gemm_batched(weights->w_router, rs->t, weights->b_router,
-                rs->router_score, 1ll * l, false, false); // CORRECTLY RUN
     /*
     router_gemm_batched(weights->w_router, rs->t, weights->b_router,
-                rs->router_score, 1ll * l, false, false); // WRONG ANSWER
+                rs->router_score, 1ll * l, false, false); // CORRECTLY RUN
     */
+
+    router_gemm_batched(weights->w_router, rs->t, weights->b_router,
+                rs->router_score, 1ll * l, false, false); // WRONG ANSWER
 
     // Select top-k experts
     topk_softmax_batched(rs->router_score, rs->topk_v, rs->topk_i, false, false, false);
