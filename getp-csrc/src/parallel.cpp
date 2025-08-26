@@ -23,6 +23,8 @@ void Context::init(Transformer *transformer, const std::vector<int> &assigned_gp
     CHECK_HIP(hipSetDevice(gpu_id));
     CHECK_HIP(hipStreamCreate(&this->streams[i]));
     CHECK_HIP(hipEventCreate(&this->events[i]));
+    run_state[i] = new OurRunState();
+    weights[i] = new OurTransformerWeights();
   }
 
   for (int i = 0; i < REPLICA_SIZE; i++) {
@@ -40,7 +42,8 @@ void Context::init(Transformer *transformer, const std::vector<int> &assigned_gp
     int local_owner_idx = (i + 1) * TP;
     int global_owner_id = this->gpu_ids[local_owner_idx];
     CHECK_HIP(hipSetDevice(global_owner_id));
-    this->pipeline_buffers[i] = new Tensor({1, (size_t)p->hidden_dim}, this->streams[i]);
+    this->pipeline_buffers[i] =
+      new Tensor({1, (size_t)p->hidden_dim}, this->streams[local_owner_idx]);
   }
 
   for (int i = 0; i < REPLICA_SIZE; i++) {
