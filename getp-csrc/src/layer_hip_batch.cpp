@@ -389,7 +389,7 @@ __global__ void batched_attention_kernel(
     const float *q, const float *K_cache, const float *V_cache,
     const float *mask, const float *attn_sinks, float *tb,
     int head_dim, int n_q, int kv_mul, int kv_dim,
-    int batch_size, int pos, int total_seq_len /* Full dimension of K/V cache and mask */
+    int batch_size, int pos, int total_seq_len, int n_layers /* Full dimension of K/V cache and mask */
 ) {
     int head_idx = blockIdx.x;
     int batch_idx = blockIdx.y;
@@ -408,7 +408,7 @@ __global__ void batched_attention_kernel(
     float *tb_head = tb + (size_t)batch_idx * batch_q_stride + (size_t)head_idx * head_dim;
 
     // Stride for one full batch item in K/V cache
-    size_t batch_kv_stride = (size_t)total_seq_len * kv_dim;
+    size_t batch_kv_stride = 1ll * n_layers * total_seq_len * kv_dim;
     const float *K_cache_batch = K_cache + (size_t)batch_idx * batch_kv_stride;
     const float *V_cache_batch = V_cache + (size_t)batch_idx * batch_kv_stride;
     
@@ -498,6 +498,7 @@ void single_query_attn_batched(Tensor *q,           // Shape: [batch_size, n_q*h
     if (mask_to_device && mask != nullptr) mask->to_device(stream);
 
     const int batch_size = q->shape[0];
+    const int n_layers = attn_sinks->shape[0];
 
     // 1. Get raw device pointers from Tensor objects
     const float *q_ptr = (float *)q->d_buf;
@@ -508,9 +509,9 @@ void single_query_attn_batched(Tensor *q,           // Shape: [batch_size, n_q*h
     // to the start of the data for `layer_offset`.
     // The size of data for a single layer across all batches is not contiguous.
     // Assuming layout [batch, layer, seq, dim], the stride between layers is (seq_len * kv_dim).
-    long long layer_stride_in_batch = (long long)seq_len * kv_dim;
-    const float *K_cache_layer_ptr = (const float *)K_cache->d_buf + layer_offset * layer_stride_in_batch;
-    const float *V_cache_layer_ptr = (const float *)V_cache->d_buf + layer_offset * layer_stride_in_batch;
+    long long layer_stride = 1ll * n_layers * seq_len * kv_dim;
+    const float *K_cache_ptr = (const float *)K_cache->d_buf + 1ll * layer_offset * seq_len * kv_dim;
+    const float *V_cache_ptr = (const float *)V_cache->d_buf + 1ll * layer_offset * seq_len * kv_dim;
 
     // 3. Get pointer to the mask tensor if applicable
     const float *mask_ptr = nullptr;
@@ -532,9 +533,9 @@ void single_query_attn_batched(Tensor *q,           // Shape: [batch_size, n_q*h
     size_t shared_mem_size = ((size_t)pos + 2) * sizeof(float) + (size_t)head_dim * sizeof(double);
 
     batched_attention_kernel<<<grid_dim, block_dim, shared_mem_size, stream>>>(
-        q_ptr, K_cache_layer_ptr, V_cache_layer_ptr, mask_ptr, attn_sinks_ptr, tb_ptr,
+        q_ptr, K_cache_ptr, V_cache_ptr, mask_ptr, attn_sinks_ptr, tb_ptr,
         head_dim, n_q, kv_mul, kv_dim,
-        batch_size, pos, seq_len
+        batch_size, pos, seq_len, n_layers
     );
 
     if (tb_from_device) {

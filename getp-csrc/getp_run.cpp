@@ -93,15 +93,6 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer, S
     float *logits = forward_gpu_20b(p, weights, rs, token, pos);
     // float *logits = forward(transformer, token, pos); <---- real code from run.cpp
 
-    #ifdef PRINT_LOGITS
-      printf("logits: ");
-      for (int i = 0; i < 5; i++) {
-        printf("%.6f ", logits[i]);
-      }
-      printf("\n");
-      // exit(1);
-    #endif
-
     // advance the state machine
     {
       // GpuTimer timer("sample");
@@ -117,19 +108,29 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer, S
         output_tokens[pos - num_prompt_tokens] = next;
       }
 
+      // --- MODIFICATION START ---
+      // This single block replaces the two original PRINT_LOGITS blocks.
+      #ifdef PRINT_LOGITS
+        // Decode the next token to get its string representation
+        const char *piece = decode_piece(tokenizer, token, next);
+
+        // Print in the requested format
+        printf("batch id 0 --> ");
+        safe_printf(piece);
+        printf("logits: ");
+        for (int j = 0; j < 5; j++) {
+            printf("%.6f ", logits[j]);
+        }
+        printf("\n");
+        fflush(stdout);
+      #endif
+      // --- MODIFICATION END ---
+
       // data-dependent terminating condition: the EOS (=199999 or =200002) token
       // delimits sequences
       if (next == 199999 || next == 200002) {
         break;
       }
-
-      // print the token as string, decode it with the Tokenizer object
-      // should be removed
-      #ifdef PRINT_LOGITS
-        const char *piece = decode_piece(tokenizer, token, next);
-        safe_printf(piece);  // same as printf("%s", piece), but skips "unsafe" bytes
-        fflush(stdout);
-      #endif
 
       token = next;
     }
@@ -210,14 +211,6 @@ long long batched_getp_generate(Transformer *transformer, Tokenizer *tokenizer, 
         continue;
       
       float *logits = batch_logits + 1ll * i * p->vocab_size;
-      #ifdef PRINT_LOGITS
-        printf("logits: ");
-        for (int i = 0; i < 5; i++) {
-          printf("%.6f ", logits[i]);
-        }
-        printf("\n");
-        // exit(1);
-      #endif
 
       int next_token;
       if (current_pos[i] < num_prompt_tokens[i] - 1) {
@@ -226,6 +219,25 @@ long long batched_getp_generate(Transformer *transformer, Tokenizer *tokenizer, 
         next_token = sample(sampler, logits);
         output_batch[i][current_pos[i] - (num_prompt_tokens[i] - 1)] = next_token;
       }
+      
+      // Print the logits in the desired format if the flag is enabled
+      #ifdef PRINT_LOGITS
+        // Decode the next token to get its string representation
+        const char *piece = decode_piece(tokenizer, current_tokens[i], next_token);
+        
+        // Use a critical section for printing to prevent interleaved output
+        #pragma omp critical
+        {
+            printf("batch id %d --> ", i);
+            safe_printf(piece);
+            printf("logits: ");
+            for (int j = 0; j < 5; j++) {
+                printf("%.6f ", logits[j]);
+            }
+            printf("\n");
+            fflush(stdout);
+        }
+      #endif
 
       if (next_token == 199999 || next_token == 200002) {
       #pragma omp critical
@@ -236,13 +248,6 @@ long long batched_getp_generate(Transformer *transformer, Tokenizer *tokenizer, 
           }
         }
       }
-      // print the token as string, decode it with the Tokenizer object
-      // should be removed
-      #ifdef PRINT_LOGITS
-        const char *piece = decode_piece(tokenizer, current_tokens[i], next_token);
-        safe_printf(piece);  // same as printf("%s", piece), but skips "unsafe" bytes
-        fflush(stdout);
-      #endif
 
       current_tokens[i] = next_token;
       current_pos[i]++;

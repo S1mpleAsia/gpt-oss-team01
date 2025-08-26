@@ -24,6 +24,57 @@ Tensor::Tensor(const vector<size_t> &shape_, float *buf_, DType::Type dtype)
   to_device(0);  // Copy to device with default stream
 }
 
+/**
+ * @brief Constructs a Tensor, optionally allocating and replicating data along the batch dimension.
+ *
+ * If `batch_alloc` is true, this constructor allocates a new host buffer and copies the single-item
+ * data from `buf_` into each slice of the batch dimension. For example, if `shape_` is (2, 512, 4, 4),
+ * the data from `buf_` (assumed to be for shape (1, 512, 4, 4)) will be copied twice to fill the new buffer.
+ * The Tensor will "own" this new buffer and be responsible for freeing it.
+ *
+ * If `batch_alloc` is false, this constructor behaves like the standard one, simply pointing to the
+ * provided `buf_` without copying data or taking ownership.
+ *
+ * @param shape_ The desired shape of the tensor, including the batch dimension.
+ * @param buf_ A pointer to the host data for a single item.
+ * @param batch_alloc A flag to enable the batch replication logic.
+ * @param dtype The data type of the tensor (FP32 or BF16).
+ */
+Tensor::Tensor(const vector<size_t> &shape_, float *buf_, bool batch_alloc, DType::Type dtype) : shape(shape_), dtype(dtype) {
+  ndim = shape_.size();
+  size_t N_ = num_elem();
+
+  if (batch_alloc) {
+    // We are creating a new buffer, so this tensor owns it.
+    this->buf = (float *)malloc(N_ * sizeof(float));
+    if (!this->buf) {
+      fprintf(stderr, "Failed to allocate host memory for batched tensor.\n");
+      std::abort();
+    }
+
+    // Calculate the number of elements for a single item in the batch.
+    size_t single_item_elements = N_ / shape[0];
+    size_t single_item_bytes = single_item_elements * sizeof(float);
+
+    // Copy the single item's data into each batch slot.
+    for (size_t i = 0; i < shape[0]; ++i) {
+      float* destination_pointer = this->buf + (i * single_item_elements);
+      memcpy(destination_pointer, buf_, single_item_bytes);
+    }
+  } else {
+    // Not allocating a new buffer, just pointing to the existing one.
+    // This tensor does not own the buffer.
+    this->buf = buf_;
+  }
+
+  // Allocate device memory.
+  size_t d_size = (dtype == DType::FP32) ? N_ * sizeof(float) : N_ * sizeof(bf16);
+  CHECK_HIP(hipMalloc(&d_buf, d_size));
+
+  // Copy the (potentially newly created and populated) host buffer to the device.
+  to_device(0);
+}
+
 Tensor::~Tensor() {
   if (d_buf != nullptr) {
     CHECK_HIP(hipFree(d_buf));
