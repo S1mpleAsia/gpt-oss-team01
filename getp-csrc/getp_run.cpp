@@ -14,11 +14,55 @@
 #include "src/utils.cpp"
 #include "include/utils.hpp"
 #include "include/config.hpp"
+#include "include/parallel.hpp"
+#include "src/parallel.cpp"
+#include "vector"
 
 #ifndef GETP_RUN
 #define GETP_RUN
 
+#define NUM_REPLICAS 2
+#define TOTAL_GPUS 8
+
+Context context[NUM_REPLICAS];
+
+bool multi_gpu = false;
+long long getp_generate_120b(Context *context, Tokenizer *tokenizer, Sampler *sampler,
+                             const char *input_seq, int *output_tokens, int steps);
+
 // #define RUN_BATCH
+
+struct ThreadArgs {
+  int id;
+  Tokenizer *tokenizer;
+  Sampler *sampler;
+  Requests *reqs;
+  long long *total_token_out;
+  pthread_mutex_t *mutex;
+};
+
+void *thread_handler(void *arg) {
+  ThreadArgs *args = (ThreadArgs *)arg;
+  int id = args->id;
+  Context *ctx = &context[id];
+
+  int start_idx = (id == 0) ? 0 : args->reqs->num_reqs / 2;
+  int end_idx = (id == 0) ? args->reqs->num_reqs / 2 : args->reqs->num_reqs;
+  long long local_token_count = 0;
+
+  for (int i = start_idx; i < end_idx; i++) {
+    const char *input_seq = get_str_req_ptr(args->reqs, i);
+    int *output_tokens = get_tok_gen_ptr(args->reqs, i);
+    local_token_count += getp_generate_120b(ctx, args->tokenizer, args->sampler, input_seq,
+                                            output_tokens, args->reqs->max_seq_len);
+  }
+
+  pthread_mutex_lock(args->mutex);
+  *(args->total_token_out) += local_token_count;
+  pthread_mutex_lock(args->mutex);
+
+  return nullptr;
+}
 
 OurTransformerWeights *weights;
 OurRunState *rs;
@@ -31,10 +75,19 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // - Memory allocation
   // - Load model
   // - ...
-  weights = new OurTransformerWeights;
-  rs = new OurRunState;
-  p = &transformer->config;
-  our_init(transformer, weights, rs);
+
+  if (!multi_gpu) {
+    weights = new OurTransformerWeights;
+    rs = new OurRunState;
+    p = &transformer->config;
+    our_init(transformer, weights, rs);
+  } else {
+    std::vector<int> gpu_0 = {0, 1, 2, 3};
+    std::vector<int> gpu_1 = {4, 5, 6, 7};
+
+    context[0].init(transformer, gpu_0);
+    context[1].init(transformer, gpu_1);
+  }
 }
 
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
@@ -44,12 +97,64 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
   // - Memory deallocation
   // - Unload model
   // - ...
-  our_free(weights, rs);
-  delete weights;
-  delete rs;
+
+  if (!multi_gpu) {
+    our_free(weights, rs);
+    delete weights;
+    delete rs;
+  } else {
+    context[0].destroy();
+    context[1].destroy();
+  }
 }
 
 #ifndef RUN_BATCH
+long long getp_generate_120b(Context *context, Tokenizer *tokenizer, Sampler *sampler,
+                             const char *input_seq, int *output_tokens, int steps) {
+  // Encode the prompt
+  int num_prompt_tokens = 0;
+  int *prompt_tokens = (int *)malloc((strlen(input_seq) + 3) * sizeof(int));
+  encode(tokenizer, input_seq, -1, -1, prompt_tokens, &num_prompt_tokens,
+         context->transformer->config.initial_context_length);
+
+  if (num_prompt_tokens < 1) {
+    free(prompt_tokens);
+    return 0;
+  }
+
+  int token = prompt_tokens[0];
+  int pos = 0;
+  long long generated_tokens = 0;
+
+  while (pos < steps) {
+    // The main thread (this thread) orchestrates the forward pass on the context's GPUs
+    float *logits = forward_gpu_120b(context, token, pos);
+
+    int next_token;
+    if (pos < num_prompt_tokens - 1) {
+      next_token = prompt_tokens[pos + 1];
+    } else {
+      next_token = sample(sampler, logits);
+      if (generated_tokens < steps) {
+        output_tokens[generated_tokens++] = next_token;
+      }
+    }
+
+    if (next_token == 199999 || next_token == 200002) {
+      break;
+    }
+
+    token = next_token;
+    pos++;
+  }
+
+  if (generated_tokens < steps + 1) {
+    output_tokens[generated_tokens] = -1;  // End of sequence marker
+  }
+  free(prompt_tokens);
+  return generated_tokens;
+}
+
 long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
                                const char *input_seq, int *output_tokens, int steps) {
   // <|start|>: 200006
@@ -144,13 +249,39 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer, S
 
 long long inference(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
                     Requests *requests) {
-  long long num_token_out = 0;
-  for (int idx = 0; idx < requests->num_reqs; ++idx) {
-    const char *input_seq = get_str_req_ptr(requests, idx);
-    int *output_tokens = get_tok_gen_ptr(requests, idx);
-    num_token_out += simple_getp_generate(transformer, tokenizer, sampler, input_seq, output_tokens,
-                                          requests->max_seq_len);
+  if (!multi_gpu) {
+    long long num_token_out = 0;
+    for (int idx = 0; idx < requests->num_reqs; ++idx) {
+      const char *input_seq = get_str_req_ptr(requests, idx);
+      int *output_tokens = get_tok_gen_ptr(requests, idx);
+      num_token_out += simple_getp_generate(transformer, tokenizer, sampler, input_seq,
+                                            output_tokens, requests->max_seq_len);
+    }
+    return num_token_out;
   }
+
+  long long num_token_out = 0;
+  pthread_t threads[NUM_REPLICAS];
+  ThreadArgs args[NUM_REPLICAS];
+  pthread_mutex_t mutex;
+  pthread_mutex_init(&mutex, NULL);
+
+  for (int i = 0; i < NUM_REPLICAS; i++) {
+    args[i].id = i;
+    args[i].tokenizer = tokenizer;
+    args[i].sampler = sampler;
+    args[i].reqs = requests;
+    args[i].total_token_out = &num_token_out;
+    args[i].mutex = &mutex;
+
+    pthread_create(&threads[i], NULL, thread_handler, (void *)&args[i]);
+  }
+
+  for (int i = 0; i < NUM_REPLICAS; i++) {
+    pthread_join(threads[i], NULL);
+  }
+
+  pthread_mutex_destroy(&mutex);
   return num_token_out;
 }
 #else

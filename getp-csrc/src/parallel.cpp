@@ -40,7 +40,7 @@ void Context::init(Transformer *transformer, const std::vector<int> &assigned_gp
     int local_owner_idx = (i + 1) * TP;
     int global_owner_id = this->gpu_ids[local_owner_idx];
     CHECK_HIP(hipSetDevice(global_owner_id));
-    this->pipeline_buffers[i] = new Tensor({1, (size_t)p->hidden_dim, this->streams[i]});
+    this->pipeline_buffers[i] = new Tensor({1, (size_t)p->hidden_dim}, this->streams[i]);
   }
 
   for (int i = 0; i < REPLICA_SIZE; i++) {
@@ -189,7 +189,7 @@ void our_init_weights_120b(Context *ctx, int local_gpu_id) {
     w->w_o + 1ll * pp_rank * layers_per_stage * p->hidden_dim * attn_out_layer_size, stream);
 
   weights->b_o = new Tensor({(size_t)layers_per_stage, (size_t)p->hidden_dim},
-                            w->b_o + 1ll * layers_per_stage * p->hidden_dim, stream);
+                            w->b_o + 1ll * pp_rank * layers_per_stage * p->hidden_dim, stream);
 
   weights->attn_sinks =
     new Tensor({(size_t)layers_per_stage, (size_t)p->n_attn_heads},
@@ -270,12 +270,12 @@ float *forward_gpu_120b(Context *ctx, int token, int pos) {
       int src_gpu_global_id = ctx->gpu_ids[src_gpu_local_idx];
 
       CHECK_HIP(hipSetDevice(src_gpu_global_id));
-      hipEventRecord(ctx->events[src_gpu_local_idx], ctx->streams[src_gpu_local_idx]);
+      CHECK_HIP(hipEventRecord(ctx->events[src_gpu_local_idx], ctx->streams[src_gpu_local_idx]));
 
       for (int i = start_local_idx; i < end_local_idx; ++i) {
         int dst_gpu_global_id = ctx->gpu_ids[i];
         CHECK_HIP(hipSetDevice(dst_gpu_global_id));
-        hipStreamWaitEvent(ctx->streams[i], ctx->events[src_gpu_local_idx], 0);
+        CHECK_HIP(hipStreamWaitEvent(ctx->streams[i], ctx->events[src_gpu_local_idx], 0));
         CHECK_HIP(hipMemcpyPeerAsync(
           ctx->run_state[i]->x->d_buf, dst_gpu_global_id,
           ctx->pipeline_buffers[prev_stage_idx]->d_buf, src_gpu_global_id,
