@@ -7,9 +7,9 @@
 void embedding_lookup(Tensor *embedding,        // (vocab_size, hidden_dim)
                       int token_id, Tensor *x,  // (hidden_dim, )
                       bool x_from_device, hipStream_t stream) {
-  GpuTimer timer("embedding_lookup");
+  // GpuTimer timer("embedding_lookup");
   // Assure that embedding->dtype == x->dtype
-  const size_t hidden_dim = x->shape[0];
+  const size_t hidden_dim = x->shape[1];
   if (x->dtype == DType::BF16) {
     bf16 *src = (bf16 *)embedding->d_buf + (size_t)token_id * hidden_dim;
     CHECK_HIP(hipMemcpyAsync((bf16 *)x->d_buf, src, hidden_dim * sizeof(bf16),
@@ -23,39 +23,6 @@ void embedding_lookup(Tensor *embedding,        // (vocab_size, hidden_dim)
   if (x_from_device) {
     x->from_device(stream);
     CHECK_HIP(hipStreamSynchronize(stream));
-  }
-}
-
-__global__ void RMSNorm_kernel(const float *x, const float *w, float *out, int n, float eps) {
-  // Kernel này giả định n đủ nhỏ để tính toán trong một block duy nhất
-  __shared__ float s_variance;
-
-  // Pass 1: Tính tổng bình phương (sum of squares)
-  float sum_sq = 0.0f;
-  for (int i = threadIdx.x; i < n; i += blockDim.x) {
-    sum_sq += x[i] * x[i];
-  }
-
-  // Dùng shared memory để reduce tổng trong block
-  __shared__ float s_partials[DEFAULT_BLOCK_SIZE];
-  s_partials[threadIdx.x] = sum_sq;
-  __syncthreads();
-
-  // Thread 0 thực hiện phần reduce cuối cùng
-  if (threadIdx.x == 0) {
-    float total_sum_sq = 0.0f;
-    // Giả định blockDim.x <= DEFAULT_BLOCK_SIZE
-    for (int i = 0; i < blockDim.x; i++) {
-      total_sum_sq += s_partials[i];
-    }
-    float variance = total_sum_sq / n;
-    s_variance = rsqrtf(variance + eps);
-  }
-  __syncthreads();  // Đảm bảo mọi thread đều thấy s_variance
-
-  // Pass 2: Áp dụng chuẩn hóa
-  for (int i = threadIdx.x; i < n; i += blockDim.x) {
-    out[i] = x[i] * s_variance * w[i];
   }
 }
 
@@ -110,68 +77,9 @@ __global__ void rmsnorm_kernel_double_precision(const float *x, const float *w, 
   }
 }
 
-__global__ void rmsnorm_kernel(const float *x, const float *w, float *out, int hidden_dim,
-                               float eps) {
-  const int row = blockIdx.x;
-  const int tid = threadIdx.x;
-
-  const float *x_row = x + row * hidden_dim;
-  const float *w_row = w + row * hidden_dim;
-  float *o_row = out + row * hidden_dim;
-
-  float acc = 0.0f;
-
-  for (int j = tid; j < hidden_dim; j += blockDim.x) {
-    float v = x_row[j];
-    acc += v * v;
-  }
-
-  // Warp reduction
-  for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-    acc += __shfl_down(acc, offset);
-  }
-
-  // 32 * 64 = 2048 threads
-  __shared__ float warp_sum[32];
-  int lane = tid & (warpSize - 1);
-  int warp_id = (tid + warpSize - 1) / warpSize;
-
-  if (lane == 0)
-    warp_sum[warp_id] = acc;
-
-  __syncthreads();
-
-  __shared__ float block_sum;
-  if (warp_id == 0) {
-    int num_warps = (blockDim.x + warpSize - 1) / warpSize;
-    float val = (lane < num_warps) ? warp_sum[lane] : 0.0f;
-
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-      val += __shfl_down(val, offset);
-    }
-
-    if (lane == 0) {
-      block_sum = val;
-    }
-  }
-  __syncthreads();
-
-  __shared__ float inv_rms;
-  if (tid == 0) {
-    float mean = block_sum / (float)hidden_dim;
-    inv_rms = rsqrtf(mean + eps);
-  }
-
-  __syncthreads();
-
-  for (int j = tid; j < hidden_dim; j += blockDim.x) {
-    o_row[j] = w_row[j] * (x_row[j] * inv_rms);
-  }
-}
-
 void rmsnorm(Tensor *x, Tensor *w, Tensor *out, long long layer_offset, bool x_to_device,
              bool out_from_device, float eps, hipStream_t stream) {
-  GpuTimer timer("rmsnorm");
+  // GpuTimer timer("rmsnorm");
   if (x_to_device)
     x->to_device(stream);
 
@@ -181,7 +89,7 @@ void rmsnorm(Tensor *x, Tensor *w, Tensor *out, long long layer_offset, bool x_t
 
   size_t shared_mem_size = num_threads * sizeof(double);
 
-  const int hidden_dim = x->shape[0];
+  const int hidden_dim = x->shape[1];
 
   const float *x_ptr = (float *)x->d_buf;
   const float *w_ptr = (float *)w->d_buf + 1ll * layer_offset * hidden_dim;
@@ -195,6 +103,53 @@ void rmsnorm(Tensor *x, Tensor *w, Tensor *out, long long layer_offset, bool x_t
   if (out_from_device) {
     out->from_device(stream);
     CHECK_HIP(hipStreamSynchronize(stream));
+  }
+}
+
+__device__ __forceinline__ float warp_reduce_sum(float v) {
+  for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+    v += __shfl_down(v, offset);
+  }
+
+  return v;
+}
+
+template <int WARPS_PER_BLOCK, int TILE>
+__global__ void gemv_kernel(const float *W, const float *x, const float *bias, float *out,
+                            int out_features, int in_features) {
+  extern __shared__ float local_x[];
+
+  const int lane = threadIdx.x;
+  const int w = threadIdx.y;
+  const int row = blockIdx.x * WARPS_PER_BLOCK + w;
+
+  if (row >= out_features)
+    return;
+
+  float acc = 0.0f;
+  const int row_base = row * in_features;
+
+  for (int k0 = 0; k0 < in_features; k0 += TILE) {
+    const int tile_len = min(TILE, in_features - k0);
+
+    for (int t = w * warpSize + lane; t < tile_len; t += WARPS_PER_BLOCK * warpSize) {
+      local_x[t] = x[k0 + t];
+    }
+    __syncthreads();
+
+    for (int t = lane; t < tile_len; t += warpSize) {
+      float wv = W[row_base + k0 + t];
+      acc += wv * local_x[t];
+    }
+    __syncthreads();
+  }
+
+  acc = warp_reduce_sum(acc);
+
+  if (lane == 0) {
+    if (bias)
+      acc += bias[row];
+    out[row] = acc;
   }
 }
 
@@ -216,19 +171,9 @@ __global__ void matmul_kernel(const float *W, const float *x, const float *bias,
   }
 }
 
-void QKVGemmGPU_Old(const float *w_qkv, const float *b_qkv, const float *t, float *out,
-                    int hidden_dim, int head_dim, int in_features, int out_features,
-                    hipStream_t stream) {
-  dim3 block_dim(DEFAULT_BLOCK_SIZE);
-  dim3 grid_dim((out_features + block_dim.x - 1) / block_dim.x);
-
-  matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(w_qkv, t, b_qkv, out, out_features,
-                                                    in_features);
-}
-
 void qkv_gemm(Tensor *x, const Tensor *W_qkv, const Tensor *b_qkv, Tensor *qkv,
               long long layer_offset, bool x_to_device, bool qkv_from_device, hipStream_t stream) {
-  GpuTimer timer("qkv_gemm");
+  // GpuTimer timer("qkv_gemm");
   if (x_to_device)
     x->to_device(stream);
 
@@ -240,40 +185,18 @@ void qkv_gemm(Tensor *x, const Tensor *W_qkv, const Tensor *b_qkv, Tensor *qkv,
   const float *b_qkv_ptr = (float *)b_qkv->d_buf + 1ll * layer_offset * out_features;
   float *qkv_ptr = (float *)qkv->d_buf;
 
-  dim3 block_dim(DEFAULT_BLOCK_SIZE);
-  dim3 grid_dim((out_features + block_dim.x - 1) / block_dim.x);
+  constexpr int WARPS_PER_BLOCK = 16;
+  constexpr int TILE = 1024;
 
-  matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(w_qkv_ptr, x_ptr, b_qkv_ptr, qkv_ptr,
-                                                    out_features, in_features);
+  dim3 block_dim(warpSize, WARPS_PER_BLOCK);
+  dim3 grid_dim((out_features + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
+  size_t shmem_bytes = TILE * sizeof(float);
+
+  gemv_kernel<WARPS_PER_BLOCK, TILE><<<grid_dim, block_dim, shmem_bytes, stream>>>(
+    w_qkv_ptr, x_ptr, b_qkv_ptr, qkv_ptr, out_features, in_features);
 
   if (qkv_from_device) {
     qkv->from_device(stream);
-    CHECK_HIP(hipStreamSynchronize(stream));
-  }
-}
-
-void split_qkv(Tensor *qkv, int head_dim, int n_q, int n_kv, Tensor *q, Tensor *k, Tensor *v,
-               bool qkv_to_device, bool q_from_device, bool k_from_device, bool v_from_device,
-               hipStream_t stream) {
-  GpuTimer timer("split_qkv");
-  // Assume they are all copy on device for now
-  if (qkv_to_device)
-    qkv->to_device(stream);
-
-  size_t offset = 0;
-  memcpy_tensor(q, qkv, 0, offset, n_q * head_dim, false, true, stream);
-  offset += n_q * head_dim;
-  memcpy_tensor(k, qkv, 0, offset, n_kv * head_dim, false, true, stream);
-  offset += n_kv * head_dim;
-  memcpy_tensor(v, qkv, 0, offset, n_kv * head_dim, false, true, stream);
-
-  if (q_from_device)
-    q->from_device(stream);
-  if (k_from_device)
-    k->from_device(stream);
-  if (v_from_device)
-    v->from_device(stream);
-  if (q_from_device || k_from_device || v_from_device) {
     CHECK_HIP(hipStreamSynchronize(stream));
   }
 }
@@ -287,7 +210,7 @@ __global__ void add_vector_kernel(float *y, const float *b, int len) {
 
 void add_vector(Tensor *y, Tensor *b, bool y_to_device, bool b_to_device, bool y_from_device,
                 hipStream_t stream) {
-  GpuTimer timer("add_vector");
+  // GpuTimer timer("add_vector");
   if (y_to_device)
     y->to_device(stream);
   if (b_to_device)
@@ -328,7 +251,7 @@ __global__ void linear_bias_residual_kernel(const float *W, const float *x, cons
 
 void linear_bias_residual(const float *W, const float *x, const float *bias, float *x_resid_inout,
                           int in_features, int out_features, hipStream_t stream) {
-  GpuTimer timer("linear_bias_residual");
+  // GpuTimer timer("linear_bias_residual");
   dim3 block_dim(DEFAULT_BLOCK_SIZE);
   dim3 grid_dim((out_features + block_dim.x - 1) / block_dim.x);
   linear_bias_residual_kernel<<<grid_dim, block_dim, 0, stream>>>(W, x, bias, x_resid_inout,
@@ -410,7 +333,7 @@ void qkv_split_rope(Tensor *qkv_out, Tensor *q_out, Tensor *k_pos, Tensor *v_pos
                     const Tensor *rope_cos_pos, const Tensor *rope_sin_pos, int head_dim, int n_q,
                     int n_kv, int pos, bool qkv_out_to_device, bool q_out_from_device,
                     bool k_pos_from_device, bool v_pos_from_device, hipStream_t stream) {
-  GpuTimer timer("qkv_split_rope");
+  // GpuTimer timer("qkv_split_rope");
   if (qkv_out_to_device)
     qkv_out->to_device(stream);
 
@@ -522,7 +445,7 @@ void single_query_attn(Tensor *q, Tensor *K_cache, Tensor *V_cache, Tensor *mask
                        int kv_dim, int seq_len, int sliding_window, int pos, long long layer_offset,
                        bool q_to_device, bool k_cache_to_device, bool v_cache_to_device,
                        bool mask_to_device, bool tb_from_device, hipStream_t stream) {
-  GpuTimer timer("single_query_attn");
+  // GpuTimer timer("single_query_attn");
   if (q_to_device)
     q->to_device(stream);
   if (k_cache_to_device)
@@ -578,7 +501,7 @@ void single_query_attn(Tensor *q, Tensor *K_cache, Tensor *V_cache, Tensor *mask
 void attn_out_project(Tensor *tb, const Tensor *W_o, const Tensor *b_o, Tensor *y,
                       long long layer_offset, bool tb_to_device, bool y_from_device,
                       hipStream_t stream) {
-  GpuTimer timer("attn_out_project");
+  // GpuTimer timer("attn_out_project");
   if (tb_to_device)
     tb->to_device(stream);
 
@@ -590,10 +513,16 @@ void attn_out_project(Tensor *tb, const Tensor *W_o, const Tensor *b_o, Tensor *
   float *y_ptr = (float *)y->d_buf;
   // Linear(tb->buf, n_q_hd, w_o_ptr, b_o_ptr, hidden, y->buf);
 
-  dim3 block_dim(DEFAULT_BLOCK_SIZE);
-  dim3 grid_dim((hidden + block_dim.x - 1) / block_dim.x);
-  matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(w_o_ptr, tb_ptr, b_o_ptr, y_ptr, hidden,
-                                                    n_q_hd);
+  constexpr int WARPS_PER_BLOCK = 16;
+  constexpr int TILE = 1024;
+
+  dim3 block_dim(warpSize, WARPS_PER_BLOCK);
+  dim3 grid_dim((hidden + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
+  size_t shmem_bytes = TILE * sizeof(float);
+  gemv_kernel<WARPS_PER_BLOCK, TILE>
+    <<<grid_dim, block_dim, shmem_bytes, stream>>>(w_o_ptr, tb_ptr, b_o_ptr, y_ptr, hidden, n_q_hd);
+  // matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(w_o_ptr, tb_ptr, b_o_ptr, y_ptr, hidden,
+  //                                                   n_q_hd);
 
   if (y_from_device) {
     y->from_device(stream);
@@ -606,7 +535,7 @@ void attn_out_project(Tensor *tb, const Tensor *W_o, const Tensor *b_o, Tensor *
 //================================================================================================
 void router_gemm(const Tensor *w_router, Tensor *t, const Tensor *b_router, Tensor *router_score,
                  long long layer_offset, bool t_to_device, bool r_from_device, hipStream_t stream) {
-  GpuTimer timer("router_gemm");
+  // GpuTimer timer("router_gemm");
   if (t_to_device)
     t->to_device(stream);
 
@@ -617,10 +546,31 @@ void router_gemm(const Tensor *w_router, Tensor *t, const Tensor *b_router, Tens
   const float *t_ptr = (float *)t->d_buf;
   float *r_ptr = (float *)router_score->d_buf;
 
-  dim3 block_dim(DEFAULT_BLOCK_SIZE);
-  dim3 grid_dim((n_experts + block_dim.x - 1) / block_dim.x);
-  matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(w_router_ptr, t_ptr, b_router_ptr, r_ptr,
-                                                    n_experts, hidden);
+  // --- KERNEL SWAP ---
+
+  // Original matmul_kernel launch
+  // dim3 block_dim(DEFAULT_BLOCK_SIZE);
+  // dim3 grid_dim((n_experts + block_dim.x - 1) / block_dim.x);
+  // matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(...);
+
+  // New gemv_kernel launch
+  const int WARPS_PER_BLOCK = 4; // Tuning parameter
+  const int TILE = 256;          // Tuning parameter
+  const int warpSize = 64;       // Or 32, depending on GPU architecture
+
+  // Each block has `warpSize` threads in the x-dim and `WARPS_PER_BLOCK` in the y-dim
+  dim3 block_dim(warpSize, WARPS_PER_BLOCK);
+  
+  // Each block processes `WARPS_PER_BLOCK` output rows
+  dim3 grid_dim((n_experts + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
+  
+  // Specify dynamic shared memory size needed by the kernel
+  size_t shared_mem_size = TILE * sizeof(float);
+
+  gemv_kernel<WARPS_PER_BLOCK, TILE><<<grid_dim, block_dim, shared_mem_size, stream>>>(
+      w_router_ptr, t_ptr, b_router_ptr, r_ptr, n_experts, hidden);
+
+  // --- END KERNEL SWAP ---
 
   if (r_from_device) {
     router_score->from_device(stream);
@@ -686,7 +636,7 @@ __global__ void topk_softmax_kernel(const float *r, int n_experts, int k, float 
 
 void topk_softmax(Tensor *r, Tensor *topk_vals, TensorI32 *topk_idx, bool r_to_device,
                   bool topk_vals_from_device, bool topk_idx_from_device, hipStream_t stream) {
-  GpuTimer timer("topk_softmax");
+  // GpuTimer timer("topk_softmax");
   if (r_to_device)
     r->to_device(stream);
 
@@ -846,6 +796,7 @@ void moe_apply_topk(Tensor *t, const Tensor *W1, const Tensor *b1, const Tensor 
                     Tensor *gate_up, Tensor *tb3, Tensor *e_agg, float clamp_limit,
                     long long layer_offset, bool t_to_device, bool topk_idx_to_device,
                     bool topk_vals_to_device, bool e_agg_from_device, hipStream_t stream) {
+  // GpuTimer("moe_apply_topk");
   if (t_to_device)
     t->to_device(stream);
   if (topk_idx_to_device)
@@ -854,7 +805,7 @@ void moe_apply_topk(Tensor *t, const Tensor *W1, const Tensor *b1, const Tensor 
     topk_vals->to_device(stream);
 
   // Extract dimensions from tensor shapes
-  const int hidden_dim = t->shape[0];
+  const int hidden_dim = t->shape[1];
   const int inter_dim = W2->shape[2];
   const int k = topk_idx->num_elem();
   const int num_experts = b2->shape[1];
@@ -920,7 +871,7 @@ void moe_apply_topk(Tensor *t, const Tensor *W1, const Tensor *b1, const Tensor 
 
 void classifier_gemm(const Tensor *W_out, Tensor *x, Tensor *logits, bool x_to_device,
                      bool logits_from_device, hipStream_t stream) {
-  GpuTimer timer("classifier");
+  // GpuTimer timer("classifier");
   if (x_to_device)
     x->to_device(stream);
 
@@ -931,10 +882,14 @@ void classifier_gemm(const Tensor *W_out, Tensor *x, Tensor *logits, bool x_to_d
   const float *x_ptr = (float *)x->d_buf;
   float *logits_ptr = (float *)logits->d_buf;
 
-  dim3 block_dim(DEFAULT_BLOCK_SIZE);
-  dim3 grid_dim((vocab_size + block_dim.x - 1) / block_dim.x);
-  matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(W_out_ptr, x_ptr, nullptr, logits_ptr,
-                                                    vocab_size, hidden_dim);
+  constexpr int WARPS_PER_BLOCK = 16;
+  constexpr int TILE = 1024;
+
+  dim3 block_dim(warpSize, WARPS_PER_BLOCK);
+  dim3 grid_dim((vocab_size + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
+  size_t shmem_bytes = TILE * sizeof(float);
+  gemv_kernel<WARPS_PER_BLOCK, TILE><<<grid_dim, block_dim, shmem_bytes, stream>>>(
+    W_out_ptr, x_ptr, nullptr, logits_ptr, vocab_size, hidden_dim);
 
   if (logits_from_device) {
     logits->from_device(stream);

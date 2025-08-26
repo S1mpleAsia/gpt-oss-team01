@@ -16,10 +16,6 @@ void qkv_gemm(Tensor *x, const Tensor *W_qkv, const Tensor *b_qkv, Tensor *qkv,
               long long layer_offset, bool x_to_device, bool qkv_from_device,
               hipStream_t stream = 0);
 
-void split_qkv(Tensor *qkv, int head_dim, int n_q, int n_kv, Tensor *q, Tensor *k, Tensor *v,
-               bool qkv_to_device, bool q_from_device, bool k_from_device, bool v_from_device,
-               hipStream_t stream = 0);  // (Not used)
-
 void add_vector(Tensor *y, Tensor *b, bool y_to_device, bool b_to_device, bool y_from_device,
                 hipStream_t stream = 0);
 

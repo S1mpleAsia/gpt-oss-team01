@@ -6,8 +6,7 @@
 .vscode/
 logs/
 debug/*.txt
-run.sh
-test.sh
+*.sh
 
 data/*
 !data/input.txt

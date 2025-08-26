@@ -11,6 +11,11 @@ using std::vector;
 
 typedef hip_bfloat16 bf16;
 
+#define RUN_BATCH
+#define BATCH_SIZE 2
+#define PRINT_LOGITS
+// #define TIME_GPU
+
 struct DType {
   enum Type { FP32, BF16 };
 };
@@ -37,6 +42,7 @@ struct Tensor {
 
   Tensor(const vector<size_t> &shape_, DType::Type dtype = DType::FP32);
   Tensor(const vector<size_t> &shape_, float *buf_, DType::Type dtype = DType::FP32);
+  Tensor(const vector<size_t> &shape_, float *buf_, bool batch_alloc, DType::Type dtype = DType::FP32);
   ~Tensor();
 
   size_t num_elem() const;

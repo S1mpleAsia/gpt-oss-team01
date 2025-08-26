@@ -183,10 +183,6 @@ def main():
     args = parseCLI()
     # process submission file, which is lines of token ids
     subm = process_submission_data(args.prompts, args.submission)
-
-    print(args.prompts)
-    print(args.submission)
-
     refs = load_jsonl(args.references)
     if not validate_references(refs, pathlib.Path("schema.json")):
         print("Exiting due to schema validation failure.")

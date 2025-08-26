@@ -5,7 +5,8 @@
 #include "utils.hpp"
 #include "config.hpp"
 
-float *batch_forward_gpu_20b(Config *p, OurTransformerWeights *weights, OurRunState *rs, int *token, int *pos, int batch_size);
+float *forward_gpu_20b_batched(Config *p, OurTransformerWeights *weights, OurRunState *rs,
+                               int *tokens, int pos, int batch_size);
 float *forward_gpu_20b(Config *p, OurTransformerWeights *weights, OurRunState *rs, int token,
                        int pos);
 float *forward_cpu_20b(Config *p, OurTransformerWeights *weights, OurRunState *rs, int token,
