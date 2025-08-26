@@ -264,7 +264,7 @@ long long batched_getp_generate(Transformer *transformer, Tokenizer *tokenizer, 
     if (generated_len < 0)
       generated_len = 0;
 
-    output_batch[i][generated_len] = -1;
+    output_batch[i][generated_len + 1] = -1;
     total_generate_tokens += generated_len;
   }
 
