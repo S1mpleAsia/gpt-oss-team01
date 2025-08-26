@@ -2,7 +2,7 @@
 #include "../include/tensor.hpp"
 #include <stdexcept>
 
-Tensor::Tensor(const vector<size_t> &shape_, DType::Type dtype)
+Tensor::Tensor(const vector<size_t> &shape_, hipStream_t stream, DType::Type dtype)
     : shape(shape_), dtype(dtype), owns_host_buf(true) {
   ndim = shape_.size();
   size_t N_ = num_elem();
@@ -10,10 +10,10 @@ Tensor::Tensor(const vector<size_t> &shape_, DType::Type dtype)
 
   size_t d_size = (dtype == DType::FP32) ? N_ * sizeof(float) : N_ * sizeof(bf16);
   CHECK_HIP(hipMalloc(&d_buf, d_size));
-  CHECK_HIP(hipMemsetAsync(d_buf, 0, d_size, 0));
+  CHECK_HIP(hipMemsetAsync(d_buf, 0, d_size, stream));
 }
 
-Tensor::Tensor(const vector<size_t> &shape_, float *buf_, DType::Type dtype)
+Tensor::Tensor(const vector<size_t> &shape_, float *buf_, hipStream_t stream, DType::Type dtype)
     : shape(shape_), buf(buf_), dtype(dtype), owns_host_buf(false) {
   ndim = shape_.size();
   size_t N_ = num_elem();
@@ -21,7 +21,7 @@ Tensor::Tensor(const vector<size_t> &shape_, float *buf_, DType::Type dtype)
   size_t d_size = (dtype == DType::FP32) ? N_ * sizeof(float) : N_ * sizeof(bf16);
   CHECK_HIP(hipMalloc(&d_buf, d_size));
 
-  to_device(0);  // Copy to device with default stream
+  to_device(stream);  // Copy to device with default stream
 }
 
 Tensor::~Tensor() {
@@ -101,20 +101,21 @@ void Tensor::printShape(const std::string &descr) const {
 
 /* INT TENSOR */
 // tensor.cpp (modifications for TensorI32)
-TensorI32::TensorI32(const vector<size_t> &shape_) : shape(shape_), owns_host_buf(true) {
+TensorI32::TensorI32(const vector<size_t> &shape_, hipStream_t stream)
+    : shape(shape_), owns_host_buf(true) {
   ndim = shape_.size();
   size_t N_ = num_elem();
   buf = (int *)calloc(N_, sizeof(int));
   CHECK_HIP(hipMalloc(&d_buf, N_ * sizeof(int)));
-  CHECK_HIP(hipMemsetAsync(d_buf, 0, N_ * sizeof(int), 0));
+  CHECK_HIP(hipMemsetAsync(d_buf, 0, N_ * sizeof(int), stream));
 }
 
-TensorI32::TensorI32(const vector<size_t> &shape_, int *buf_)
+TensorI32::TensorI32(const vector<size_t> &shape_, int *buf_, hipStream_t stream)
     : shape(shape_), buf(buf_), owns_host_buf(false) {
   ndim = shape_.size();
   size_t N_ = num_elem();
   CHECK_HIP(hipMalloc(&d_buf, N_ * sizeof(int)));
-  to_device(0);  // Copy to device with default stream
+  to_device(stream);  // Copy to device with default stream
 }
 
 TensorI32::~TensorI32() {

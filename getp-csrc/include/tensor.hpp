@@ -32,8 +32,9 @@ struct Tensor {
   DType::Type dtype;
   bool owns_host_buf;
 
-  Tensor(const vector<size_t> &shape_, DType::Type dtype = DType::FP32);
-  Tensor(const vector<size_t> &shape_, float *buf_, DType::Type dtype = DType::FP32);
+  Tensor(const vector<size_t> &shape_, hipStream_t stream = 0, DType::Type dtype = DType::FP32);
+  Tensor(const vector<size_t> &shape_, float *buf_, hipStream_t stream = 0,
+         DType::Type dtype = DType::FP32);
   ~Tensor();
 
   size_t num_elem() const;
@@ -52,8 +53,8 @@ struct TensorI32 {
   int *d_buf = nullptr;  // Device buffer
   bool owns_host_buf;
 
-  TensorI32(const vector<size_t> &shape_);
-  TensorI32(const vector<size_t> &shape_, int *buf_);
+  TensorI32(const vector<size_t> &shape_, hipStream_t stream = 0);
+  TensorI32(const vector<size_t> &shape_, int *buf_, hipStream_t stream = 0);
   ~TensorI32();
 
   size_t num_elem() const;

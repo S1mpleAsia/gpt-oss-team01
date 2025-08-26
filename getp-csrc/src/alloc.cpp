@@ -32,16 +32,16 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
   weights->w_mlp1 = new Tensor({(size_t)p->n_layers, (size_t)p->n_experts,
                                 2 * (size_t)p->intermediate_dim, (size_t)p->hidden_dim},
-                               w->w_mlp1, DType::BF16);
+                               w->w_mlp1, 0, DType::BF16);
   weights->b_mlp1 =
     new Tensor({(size_t)p->n_layers, (size_t)p->n_experts, 2 * (size_t)p->intermediate_dim},
-               w->b_mlp1, DType::BF16);
+               w->b_mlp1, 0, DType::BF16);
 
   weights->w_mlp2 = new Tensor(
     {(size_t)p->n_layers, (size_t)p->n_experts, (size_t)p->hidden_dim, (size_t)p->intermediate_dim},
-    w->w_mlp2, DType::BF16);
+    w->w_mlp2, 0, DType::BF16);
   weights->b_mlp2 = new Tensor({(size_t)p->n_layers, (size_t)p->n_experts, (size_t)p->hidden_dim},
-                               w->b_mlp2, DType::BF16);
+                               w->b_mlp2, 0, DType::BF16);
 
   weights->rms_out_w = new Tensor({(size_t)p->hidden_dim}, w->rms_out_w);
   weights->out = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->out);
