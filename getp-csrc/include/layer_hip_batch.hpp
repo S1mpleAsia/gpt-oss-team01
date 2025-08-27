@@ -112,7 +112,10 @@ void moe_apply_topk_batched(
 );
 
 // ---------- Classifier & Residuals ----------
-void classifier_gemm_batched(const Tensor *W_out,  // Shape: [vocab_size, hidden_dim]
-                             Tensor *x,            // Shape: [batch_size, hidden_dim]
-                             Tensor *logits,       // Shape: [batch_size, vocab_size]
-                             bool x_to_device, bool logits_from_device, hipStream_t stream = 0);
+void classifier_gemm_batched(
+  const Tensor *W_out,  // Shape: [vocab_size, hidden_dim]
+  Tensor *x,            // Shape: [batch_size, hidden_dim]
+  Tensor *logits,       // Shape: [batch_size, vocab_size]
+  bool x_to_device, bool logits_from_device, int cur_batch_size,
+  hipStream_t stream = 0
+);

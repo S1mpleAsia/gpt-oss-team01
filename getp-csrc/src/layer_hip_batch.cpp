@@ -37,10 +37,12 @@ __device__ float block_reduce_sum(float val) {
     return val; // The final sum is in lane 0 of the first warp
 }
 
-void embedding_lookup_batched(Tensor *embedding,  // Shape: [vocab_size, hidden_dim]
-                              int *tokens,        // Shape: [batch_size]
-                              Tensor *x,          // Shape: [batch_size, hidden_dim]
-                              bool x_from_device, hipStream_t stream) {
+void embedding_lookup_batched(
+  Tensor *embedding,  // Shape: [vocab_size, hidden_dim]
+  int *tokens,        // Shape: [batch_size]
+  Tensor *x,          // Shape: [batch_size, hidden_dim]
+  bool x_from_device, int cur_batch_size, hipStream_t stream
+) {
   GpuTimer timer("embedding_lookup");
 
   const size_t hidden_dim = x->shape[1];
@@ -105,11 +107,13 @@ __global__ void rmsnorm_kernel(
   }
 }
 
-void rmsnorm_batched(Tensor *x,    // Shape: [batch_size, hidden_dim]
-                     Tensor *w,    // Shape: [hidden_dim]
-                     Tensor *out,  // Shape: [batch_size, hidden_dim]
-                     long long layer_offset, bool x_to_device, bool out_from_device,
-                     float eps, hipStream_t stream) {
+void rmsnorm_batched(
+  Tensor *x,    // Shape: [batch_size, hidden_dim]
+  Tensor *w,    // Shape: [hidden_dim]
+  Tensor *out,  // Shape: [batch_size, hidden_dim]
+  long long layer_offset, bool x_to_device, bool out_from_device,
+  int cur_batch_size, float eps, hipStream_t stream
+) {
   GpuTimer timer("rmsnorm");
   if (x_to_device) {
     x->to_device(stream);
@@ -222,12 +226,14 @@ __global__ void batched_matmul_kernel(
   out_batch[row] = sum; // Write to the correct batch in 'out'
 }
 
-void qkv_gemm_batched(Tensor *x,            // Shape: [batch_size, hidden_dim]
-                      const Tensor *W_qkv,  // Shape: [out_features, hidden_dim]
-                      const Tensor *b_qkv,  // Shape: [out_features]
-                      Tensor *qkv,          // Shape: [batch_size, out_features]
-                      long long layer_offset, bool x_to_device, bool qkv_from_device,
-                      hipStream_t stream) {
+void qkv_gemm_batched(
+  Tensor *x,            // Shape: [batch_size, hidden_dim]
+  const Tensor *W_qkv,  // Shape: [out_features, hidden_dim]
+  const Tensor *b_qkv,  // Shape: [out_features]
+  Tensor *qkv,          // Shape: [batch_size, out_features]
+  long long layer_offset, bool x_to_device, bool qkv_from_device,
+  int cur_batch_size, hipStream_t stream
+) {
   GpuTimer timer("qkv_gemm");
   if (x_to_device) {
     x->to_device(stream);
@@ -390,10 +396,12 @@ __global__ void add_vector_kernel_batched(float *y, const float *b, int len) {
   }
 }
 
-void add_vector_batched(Tensor *y,  // Shape: [batch_size, hidden_dim]
-                        Tensor *b,  // Shape: [batch_size, hidden_dim]
-                        bool y_to_device, bool b_to_device, bool y_from_device,
-                        hipStream_t stream) {
+void add_vector_batched(
+  Tensor *y,  // Shape: [batch_size, hidden_dim]
+  Tensor *b,  // Shape: [batch_size, hidden_dim]
+  bool y_to_device, bool b_to_device, bool y_from_device,
+  hipStream_t stream
+) {
    GpuTimer timer("add_vector");
   if (y_to_device)
     y->to_device(stream);
@@ -544,17 +552,18 @@ __global__ void batched_attention_kernel_opt(
     }
 }
 
-void single_query_attn_batched(Tensor *q,           // [B, n_q*hd]
-                               Tensor *K_cache,     // [B, L, S, kv_dim]
-                               Tensor *V_cache,     // [B, L, S, kv_dim]
-                               Tensor *mask,        // [B, S, S] or nullptr
-                               Tensor *attn_sinks,  // [L, n_q]
-                               Tensor *tb,          // [B, n_q*hd]
-                               int head_dim, int n_q, int kv_mul, int kv_dim, int seq_len,
-                               int sliding_window, int pos, long long layer_offset,
-                               bool q_to_device, bool k_cache_to_device, bool v_cache_to_device,
-                               bool mask_to_device, bool tb_from_device, hipStream_t stream)
-{
+void single_query_attn_batched(
+  Tensor *q,           // Shape: [batch_size, n_q*hd]
+  Tensor *K_cache,     // Shape: [batch_size, layer, seq_len, kv_dim]
+  Tensor *V_cache,     // Shape: [batch_size, layer, seq_len, kv_dim]
+  Tensor *mask,        // Shape: [batch_size, seq_len, seq_len]
+  Tensor *attn_sinks,  // Shape: [n_layers, n_attn_heads]
+  Tensor *tb,          // Shape: [batch_size, n_q*hd]
+  int head_dim, int n_q, int kv_mul, int kv_dim, int seq_len,
+  int sliding_window, int pos, long long layer_offset, bool q_to_device,
+  bool k_cache_to_device, bool v_cache_to_device, bool mask_to_device,
+  bool tb_from_device, int cur_batch_size, hipStream_t stream
+) {
     GpuTimer timer("single_query_attn_batched");
     if (q_to_device)            q->to_device(stream);
     if (k_cache_to_device)      K_cache->to_device(stream);
@@ -787,12 +796,13 @@ __global__ void batched_topk_softmax_kernel(
   }
 }
 
-void topk_softmax_batched(Tensor *r,            // Shape: [batch_size, n_experts]
-                          Tensor *topk_vals,    // Shape: [batch_size, k]
-                          TensorI32 *topk_idx,  // Shape: [batch_size, k]
-                          bool r_to_device, bool topk_vals_from_device, bool topk_idx_from_device,
-                          hipStream_t stream) 
-{
+void topk_softmax_batched(
+  Tensor *r,            // Shape: [batch_size, n_experts]
+  Tensor *topk_vals,    // Shape: [batch_size, k]
+  TensorI32 *topk_idx,  // Shape: [batch_size, k]
+  bool r_to_device, bool topk_vals_from_device, bool topk_idx_from_device,
+  int cur_batch_size, hipStream_t stream
+) {
     GpuTimer timer("topk_softmax_batched");
   if (r_to_device) {
     r->to_device(stream);
@@ -932,21 +942,6 @@ __global__ void moe_mm_bf16w_xcached(
             out_vec[row] = y;
         }
     }
-
-    // Inner loop for the dot product remains the same.
-    double sum = 0.0;
-    for (int i = 0; i < in_features; i++) {
-      float w_val = static_cast<float>(W_row[i]);
-      sum += (double)w_val * x_cur[i];
-    }
-
-    if (bias != nullptr) {
-      sum += static_cast<float>(bias[expert_b_offset + row]);
-    }
-    
-    // Output is shaped [batch_size, k, out_features], so global_idx maps directly.
-    out[global_idx] = (float)sum;
-  }
 }
 
 // SwiGLU over interleaved [gate, up]; NK=B*k samples
@@ -1014,10 +1009,10 @@ void moe_apply_topk_batched(
   Tensor *gate_up,      // [B,k,I]
   Tensor *tb3,          // [B,k,H]
   Tensor *e_agg,        // [B,H]
-  float clamp_limit, long long layer_offset,
-  bool t_to_device, bool topk_idx_to_device, bool topk_vals_to_device,
-  bool e_agg_from_device, hipStream_t stream)
-{
+  float clamp_limit, long long layer_offset, bool t_to_device,
+  bool topk_idx_to_device, bool topk_vals_to_device, bool e_agg_from_device,
+  int cur_batch_size, hipStream_t stream
+) {
     GpuTimer timer("moe_apply_topk_batched");
     if (t_to_device)           t->to_device(stream);
     if (topk_idx_to_device)    topk_idx->to_device(stream);
@@ -1094,10 +1089,13 @@ void moe_apply_topk_batched(
 }
 
 // ---------- Classifier & Residuals ----------
-void classifier_gemm_batched(const Tensor *W_out,  // Shape: [vocab_size, hidden_dim]
-                             Tensor *x,            // Shape: [batch_size, hidden_dim]
-                             Tensor *logits,       // Shape: [batch_size, vocab_size]
-                             bool x_to_device, bool logits_from_device, hipStream_t stream) {
+void classifier_gemm_batched(
+  const Tensor *W_out,  // Shape: [vocab_size, hidden_dim]
+  Tensor *x,            // Shape: [batch_size, hidden_dim]
+  Tensor *logits,       // Shape: [batch_size, vocab_size]
+  bool x_to_device, bool logits_from_device, int cur_batch_size,
+  hipStream_t stream
+) {
    GpuTimer timer("classifier_batched");
     if (x_to_device) {
         x->to_device(stream);
