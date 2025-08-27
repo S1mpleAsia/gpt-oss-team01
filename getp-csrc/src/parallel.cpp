@@ -19,12 +19,15 @@ void Context::init(Transformer *transformer, const std::vector<int> &assigned_gp
   }
 
   for (int i = 0; i < REPLICA_SIZE; i++) {
+    run_state[i] = new OurRunState();
+    weights[i] = new OurTransformerWeights();
+  }
+
+  for (int i = 0; i < REPLICA_SIZE; i++) {
     int gpu_id = this->gpu_ids[i];
     CHECK_HIP(hipSetDevice(gpu_id));
     CHECK_HIP(hipStreamCreate(&this->streams[i]));
     CHECK_HIP(hipEventCreate(&this->events[i]));
-    run_state[i] = new OurRunState();
-    weights[i] = new OurTransformerWeights();
   }
 
   for (int i = 0; i < REPLICA_SIZE; i++) {
@@ -43,7 +46,7 @@ void Context::init(Transformer *transformer, const std::vector<int> &assigned_gp
     int global_owner_id = this->gpu_ids[local_owner_idx];
     CHECK_HIP(hipSetDevice(global_owner_id));
     this->pipeline_buffers[i] =
-      new Tensor({1, (size_t)p->hidden_dim}, this->streams[local_owner_idx]);
+      new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, this->streams[local_owner_idx]);
   }
 
   for (int i = 0; i < REPLICA_SIZE; i++) {
@@ -81,7 +84,7 @@ void Context::init(Transformer *transformer, const std::vector<int> &assigned_gp
     CHECK_HIP(hipStreamSynchronize(this->streams[i]));
   }
 
-  printf("Context initialized successully\n");
+  // printf("Context initialized successully\n");
   fflush(stdout);
 }
 
@@ -89,13 +92,70 @@ void Context::destroy() {
   for (int i = 0; i < REPLICA_SIZE; i++) {
     int gpu_id = this->gpu_ids[i];
     CHECK_HIP(hipSetDevice(gpu_id));
-    CHECK_HIP(hipStreamDestroy(this->streams[i]));
-    CHECK_HIP(hipEventDestroy(this->events[i]));
+    if (this->streams[i])
+      CHECK_HIP(hipStreamSynchronize(this->streams[i]));
+  }
 
-    // free run states and weights
+  for (int i = 0; i < REPLICA_SIZE; i++) {
+    int gpu_id = this->gpu_ids[i];
+    CHECK_HIP(hipSetDevice(gpu_id));
+
+    // free run states (chỉ khi bạn đã new trong init)
+    if (this->run_state[i]) {
+      auto rs = this->run_state[i];
+      delete rs->x;
+      delete rs->t;
+      delete rs->tb;
+      delete rs->tb2;
+      delete rs->tb3;
+      delete rs->router_score;
+      delete rs->topk_v;
+      delete rs->topk_i;
+      delete rs->mlp1_out;
+      delete rs->gate;
+      delete rs->up;
+      delete rs->gate_up;
+      delete rs->e_agg;
+      delete rs->qkv;
+      delete rs->q;
+      delete rs->k;
+      delete rs->v;
+      delete rs->att;
+      delete rs->logits;
+      delete rs->key_cache;
+      delete rs->value_cache;
+      delete rs->mask;
+      delete this->run_state[i];
+      this->run_state[i] = nullptr;
+    }
+
+    if (this->weights[i]) {
+      auto w = this->weights[i];
+      delete w->token_embedding_table;
+      delete w->rms_attn_w;
+      delete w->rms_ffn_w;
+      delete w->w_qkv;
+      delete w->b_qkv;
+      delete w->w_o;
+      delete w->b_o;
+      delete w->attn_sinks;
+      delete w->w_router;
+      delete w->b_router;
+      delete w->w_mlp1;
+      delete w->b_mlp1;
+      delete w->w_mlp2;
+      delete w->b_mlp2;
+      delete w->out;
+      delete w->rms_out_w;
+      delete this->weights[i];
+      this->weights[i] = nullptr;
+    }
 
     delete this->cos_tensor[i];
     delete this->sin_tensor[i];
+
+    CHECK_HIP(hipStreamDestroy(this->streams[i]));
+    CHECK_HIP(hipEventDestroy(this->events[i]));
   }
 
   for (int i = 0; i < PP - 1; i++) {
@@ -163,17 +223,19 @@ void our_init_weights_120b(Context *ctx, int local_gpu_id) {
   hipStream_t stream = ctx->streams[local_gpu_id];
 
   int pp_rank = ctx->comm_groups[local_gpu_id].pp_rank;
-  int ep_rank = ctx->comm_groups[local_gpu_id].local_rank;
   int tp_rank = ctx->comm_groups[local_gpu_id].tp_rank;
+  int ep_rank = 0;
   int layers_per_stage = p->n_layers / PP;
 
   size_t qkv_layer_size =
     ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * (size_t)p->head_dim;
   size_t attn_out_layer_size = (size_t)p->n_attn_heads * p->head_dim;
 
+  // Embedding
   weights->token_embedding_table =
     new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->token_embedding_table, stream);
 
+  // RMS
   weights->rms_attn_w =
     new Tensor({(size_t)layers_per_stage * p->hidden_dim},
                w->rms_attn_w + 1ll * pp_rank * layers_per_stage * p->hidden_dim, stream);
@@ -181,12 +243,14 @@ void our_init_weights_120b(Context *ctx, int local_gpu_id) {
     new Tensor({(size_t)layers_per_stage * p->hidden_dim},
                w->rms_ffn_w + 1ll * pp_rank * layers_per_stage * p->hidden_dim, stream);
 
+  // QKV / bias
   weights->w_qkv = new Tensor(
     {(size_t)layers_per_stage, qkv_layer_size, (size_t)p->hidden_dim},
     w->w_qkv + 1ll * pp_rank * layers_per_stage * qkv_layer_size * p->hidden_dim, stream);
   weights->b_qkv = new Tensor({(size_t)layers_per_stage, qkv_layer_size},
                               w->b_qkv + 1ll * pp_rank * layers_per_stage * qkv_layer_size, stream);
 
+  // O proj + bias
   weights->w_o = new Tensor(
     {(size_t)layers_per_stage, (size_t)p->hidden_dim, attn_out_layer_size},
     w->w_o + 1ll * pp_rank * layers_per_stage * p->hidden_dim * attn_out_layer_size, stream);
@@ -194,18 +258,23 @@ void our_init_weights_120b(Context *ctx, int local_gpu_id) {
   weights->b_o = new Tensor({(size_t)layers_per_stage, (size_t)p->hidden_dim},
                             w->b_o + 1ll * pp_rank * layers_per_stage * p->hidden_dim, stream);
 
+  // Attn sinks + Router
   weights->attn_sinks =
     new Tensor({(size_t)layers_per_stage, (size_t)p->n_attn_heads},
                w->attn_sinks + 1ll * pp_rank * layers_per_stage * p->n_attn_heads, stream);
+
+  // w_router
   weights->w_router = new Tensor(
-    {(size_t)layers_per_stage, (size_t)p->hidden_dim, (size_t)p->n_experts},
-    w->w_router + 1ll * pp_rank * layers_per_stage * p->hidden_dim * p->n_experts, stream);
+    {(size_t)layers_per_stage, (size_t)p->n_experts, (size_t)p->hidden_dim},
+    w->w_router + 1ll * pp_rank * layers_per_stage * p->n_experts * p->hidden_dim, stream);
   weights->b_router =
     new Tensor({(size_t)layers_per_stage, (size_t)p->n_experts},
                w->b_router + 1ll * pp_rank * layers_per_stage * p->n_experts, stream);
 
+  // MoE MLP sharding: EP in stage, TP with inter-dim
   size_t sharded_intermediate_dim = p->intermediate_dim / TP;
-  int experts_per_gpu = p->n_experts / REPLICA_SIZE;
+  int experts_per_gpu = p->n_experts;
+
   long long mlp1_full_layer_size = 1ll * p->n_experts * 2 * p->intermediate_dim * p->hidden_dim;
   long long mlp2_full_layer_size = 1ll * p->n_experts * p->hidden_dim * p->intermediate_dim;
 
@@ -225,7 +294,7 @@ void our_init_weights_120b(Context *ctx, int local_gpu_id) {
                               (tp_rank * 2 * sharded_intermediate_dim);
 
   weights->b_mlp1 =
-    new Tensor({(size_t)layers_per_stage, (size_t)experts_per_gpu, 2 * (size_t)p->intermediate_dim},
+    new Tensor({(size_t)layers_per_stage, (size_t)experts_per_gpu, 2 * sharded_intermediate_dim},
                b_mlp1_start_shard, stream, DType::BF16);
 
   float *w_mlp2_stage_start = w->w_mlp2 + 1ll * pp_rank * layers_per_stage * mlp2_full_layer_size;
@@ -250,6 +319,8 @@ void our_init_weights_120b(Context *ctx, int local_gpu_id) {
 }
 
 float *forward_gpu_120b(Context *ctx, int token, int pos) {
+  // printf("PP = %d\n", PP);
+  fflush(stdout);
   Config *p = &ctx->transformer->config;
   int layer_per_stages = p->n_layers / PP;
 
@@ -259,6 +330,7 @@ float *forward_gpu_120b(Context *ctx, int token, int pos) {
     CHECK_HIP(hipSetDevice(gpu_id));
     embedding_lookup(ctx->weights[i]->token_embedding_table, token, ctx->run_state[i]->x, false,
                      ctx->streams[i]);
+    // printf("gpu_id: %d - Done embedding lookup\n", gpu_id);
   }
 
   for (int l = 0; l < p->n_layers; l++) {
@@ -267,24 +339,33 @@ float *forward_gpu_120b(Context *ctx, int token, int pos) {
     int start_local_idx = current_stage_idx * stage0_size;
     int end_local_idx = start_local_idx + stage0_size;
 
-    if (current_stage_idx > 0) {
-      int prev_stage_idx = current_stage_idx - 1;
-      int src_gpu_local_idx = prev_stage_idx * stage0_size;
-      int src_gpu_global_id = ctx->gpu_ids[src_gpu_local_idx];
+    // printf("==== stage: %d - layer: %d ====\n", current_stage_idx, l);
 
-      CHECK_HIP(hipSetDevice(src_gpu_global_id));
-      CHECK_HIP(hipEventRecord(ctx->events[src_gpu_local_idx], ctx->streams[src_gpu_local_idx]));
+    if (current_stage_idx > 0 && local_layer_idx == 0) {
+      int leader_idx = start_local_idx;  // leader của stage hiện tại
+      int leader_global_id = ctx->gpu_ids[leader_idx];
 
-      for (int i = start_local_idx; i < end_local_idx; ++i) {
-        int dst_gpu_global_id = ctx->gpu_ids[i];
-        CHECK_HIP(hipSetDevice(dst_gpu_global_id));
-        CHECK_HIP(hipStreamWaitEvent(ctx->streams[i], ctx->events[src_gpu_local_idx], 0));
-        CHECK_HIP(hipMemcpyPeerAsync(
-          ctx->run_state[i]->x->d_buf, dst_gpu_global_id,
-          ctx->pipeline_buffers[prev_stage_idx]->d_buf, src_gpu_global_id,
-          ctx->run_state[i]->x->num_elem() * ctx->run_state[i]->x->get_dtype_size(),
-          ctx->streams[i]));
+      // chỉ leader nhận từ pipeline buffer
+      CHECK_HIP(hipSetDevice(leader_global_id));
+      CHECK_HIP(hipStreamWaitEvent(
+        ctx->streams[leader_idx], ctx->events[(current_stage_idx * stage0_size) - stage0_size], 0));
+
+      size_t nbytes =
+        ctx->run_state[leader_idx]->x->num_elem() * ctx->run_state[leader_idx]->x->get_dtype_size();
+
+      CHECK_HIP(hipMemcpyAsync(ctx->run_state[leader_idx]->x->d_buf,
+                               ctx->pipeline_buffers[current_stage_idx - 1]->d_buf, nbytes,
+                               hipMemcpyDeviceToDevice, ctx->streams[leader_idx]));
+
+      // broadcast từ leader sang các GPU khác trong stage
+      for (int i = start_local_idx + 1; i < end_local_idx; i++) {
+        int dst_global_id = ctx->gpu_ids[i];
+        CHECK_HIP(hipSetDevice(dst_global_id));
+        CHECK_HIP(hipMemcpyPeerAsync(ctx->run_state[i]->x->d_buf, dst_global_id,
+                                     ctx->run_state[leader_idx]->x->d_buf, leader_global_id, nbytes,
+                                     ctx->streams[i]));
       }
+      // printf("stage %d - pipeline recv\n", current_stage_idx);
     }
 
     for (int i = start_local_idx; i < end_local_idx; i++) {
@@ -293,26 +374,36 @@ float *forward_gpu_120b(Context *ctx, int token, int pos) {
       OurTransformerWeights *w = ctx->weights[i];
 
       rmsnorm(s->x, w->rms_attn_w, s->t, local_layer_idx, false, false, 1e-5f, ctx->streams[i]);
+      // printf("stage %d - Done rmsnorm 1\n", current_stage_idx);
+
       qkv_gemm(s->t, w->w_qkv, w->b_qkv, s->qkv, local_layer_idx, false, false, ctx->streams[i]);
+      // printf("stage %d - Done qkv_gemm\n", current_stage_idx);
+
       qkv_split_rope(s->qkv, s->q, s->k, s->v, ctx->cos_tensor[i], ctx->sin_tensor[i], p->head_dim,
                      p->n_attn_heads, p->n_kv_heads, pos, false, false, false, false,
                      ctx->streams[i]);
+      // printf("stage %d - Done qkv_split_rope\n", current_stage_idx);
 
-      long long kv_cache_offset =
-        (long long)local_layer_idx * p->seq_len * p->n_kv_heads * p->head_dim +
-        (long long)pos * p->n_kv_heads * p->head_dim;
+      long long kv_cache_offset = (long long)l * p->seq_len * p->n_kv_heads * p->head_dim +
+                                  (long long)pos * p->n_kv_heads * p->head_dim;
       memcpy_tensor(s->key_cache, s->k, kv_cache_offset, 0, s->k->num_elem(), false, true,
                     ctx->streams[i]);
       memcpy_tensor(s->value_cache, s->v, kv_cache_offset, 0, s->v->num_elem(), false, true,
                     ctx->streams[i]);
+      // printf("stage %d - Done memcpy_tensor\n", current_stage_idx);
 
       single_query_attn(s->q, s->key_cache, s->value_cache, s->mask, w->attn_sinks, s->tb,
                         p->head_dim, p->n_attn_heads, p->n_attn_heads / p->n_kv_heads,
                         p->n_kv_heads * p->head_dim, p->seq_len, p->sliding_window, pos,
                         local_layer_idx, false, false, false, false, false, ctx->streams[i]);
+      // printf("stage %d - Done single_query_attn\n", current_stage_idx);
+
       attn_out_project(s->tb, w->w_o, w->b_o, s->tb2, local_layer_idx, false, false,
                        ctx->streams[i]);
+      // printf("stage %d - Done attn_out_project\n", current_stage_idx);
+
       add_vector(s->x, s->tb2, false, false, false, ctx->streams[i]);
+      // printf("stage %d - Done add_vector 1\n", current_stage_idx);
     }
 
     for (int i = start_local_idx; i < end_local_idx; i++) {
@@ -320,37 +411,66 @@ float *forward_gpu_120b(Context *ctx, int token, int pos) {
       OurRunState *s = ctx->run_state[i];
       OurTransformerWeights *w = ctx->weights[i];
       rmsnorm(s->x, w->rms_ffn_w, s->t, local_layer_idx, false, false, 1e-5f, ctx->streams[i]);
-      router_gemm(s->t, w->w_router, w->b_router, s->router_score, local_layer_idx, false, false,
+      // printf("stage %d - Done rmsnorm 2\n", current_stage_idx);
+
+      router_gemm(w->w_router, s->t, w->b_router, s->router_score, local_layer_idx, false, false,
                   ctx->streams[i]);
+      // printf("stage %d - Done router_gemm\n", current_stage_idx);
+
+      // topk_select(s->router_score, s->topk_i, s->topk_v, p->experts_per_token, ctx->streams[i]);
+      // topk_softmax_inplace(s->topk_v, ctx->streams[i]);
+      topk_softmax(s->router_score, s->topk_v, s->topk_i, false, false, false, ctx->streams[i]);
+      // printf("stage %d - Done topk_softmax\n", current_stage_idx);
+
+      // Route the tokens to their corresponding top-k experts
+      moe_apply_topk(s->t, w->w_mlp1, w->b_mlp1, w->w_mlp2, w->b_mlp2, s->topk_i, s->topk_v,
+                     s->mlp1_out, s->gate_up, s->tb3, s->e_agg, p->swiglu_limit,
+                     1ll * local_layer_idx, false, false, false, false);
+      // printf("stage %d - Done moe_apply_topk\n", current_stage_idx);
+
+      add_vector(s->x, s->e_agg, false, false, false, ctx->streams[i]);
+      // printf("stage %d - Done add_vector 2\n", current_stage_idx);
     }
 
     // --- Pipeline Send ---
     if ((l + 1) % layer_per_stages == 0 && current_stage_idx < PP - 1) {
-      // Chỉ cần một GPU trong stage gửi là đủ
-      int src_gpu_local_idx = start_local_idx;
-      int src_gpu_global_id = ctx->gpu_ids[src_gpu_local_idx];
-      CHECK_HIP(hipSetDevice(src_gpu_global_id));
-      CHECK_HIP(hipMemcpyAsync(ctx->pipeline_buffers[current_stage_idx]->d_buf,
-                               ctx->run_state[src_gpu_local_idx]->x->d_buf,
-                               ctx->run_state[src_gpu_local_idx]->x->num_elem() *
-                                 ctx->run_state[src_gpu_local_idx]->x->get_dtype_size(),
-                               hipMemcpyDeviceToDevice, ctx->streams[src_gpu_local_idx]));
+      int leader_idx = start_local_idx;  // leader stage này
+      int leader_global_id = ctx->gpu_ids[leader_idx];
+
+      int next_leader_idx = (current_stage_idx + 1) * stage0_size;
+      int next_leader_global_id = ctx->gpu_ids[next_leader_idx];
+
+      size_t nbytes =
+        ctx->run_state[leader_idx]->x->num_elem() * ctx->run_state[leader_idx]->x->get_dtype_size();
+
+      CHECK_HIP(hipSetDevice(leader_global_id));
+      CHECK_HIP(hipEventRecord(ctx->events[leader_idx], ctx->streams[leader_idx]));
+
+      CHECK_HIP(hipSetDevice(next_leader_global_id));
+      CHECK_HIP(hipStreamWaitEvent(ctx->streams[next_leader_idx], ctx->events[leader_idx], 0));
+
+      CHECK_HIP(hipMemcpyPeerAsync(ctx->pipeline_buffers[current_stage_idx]->d_buf,
+                                   next_leader_global_id, ctx->run_state[leader_idx]->x->d_buf,
+                                   leader_global_id, nbytes, ctx->streams[next_leader_idx]));
+
+      CHECK_HIP(hipEventRecord(ctx->events[next_leader_idx], ctx->streams[next_leader_idx]));
+      // printf("stage %d - Pipeline send\n", current_stage_idx);
     }
   }
 
-  int last_gpu_local_idx = REPLICA_SIZE - 1;
-  int last_gpu_global_id = ctx->gpu_ids[last_gpu_local_idx];
+  int last_local_idx = REPLICA_SIZE - 1;
 
-  OurRunState *s_final = ctx->run_state[last_gpu_local_idx];
-  OurTransformerWeights *w_final = ctx->weights[last_gpu_local_idx];
+  OurRunState *s_final = ctx->run_state[last_local_idx];
+  OurTransformerWeights *w_final = ctx->weights[last_local_idx];
 
+  CHECK_HIP(hipSetDevice(ctx->gpu_ids[last_local_idx]));
   rmsnorm(s_final->x, w_final->rms_out_w, s_final->x, 0, false, false, 1e-5f,
-          ctx->streams[last_gpu_local_idx]);
-  classifier_gemm(s_final->x, w_final->out, s_final->logits, false, true,
-                  ctx->streams[last_gpu_local_idx]);
+          ctx->streams[last_local_idx]);
+  classifier_gemm(w_final->out, s_final->x, s_final->logits, false, true,
+                  ctx->streams[last_local_idx]);
 
-  CHECK_HIP(hipStreamSynchronize(ctx->streams[last_gpu_local_idx]));
-  s_final->logits->from_device(ctx->streams[last_gpu_local_idx]);
+  CHECK_HIP(hipStreamSynchronize(ctx->streams[last_local_idx]));
+  s_final->logits->from_device(ctx->streams[last_local_idx]);
 
   return s_final->logits->buf;
 }

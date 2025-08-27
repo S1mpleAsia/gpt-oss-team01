@@ -5,9 +5,9 @@
 #include "config.hpp"
 #include <hip/hip_runtime.h>
 
-#define REPLICA_SIZE 4
+#define REPLICA_SIZE 2
 #define PP 2
-#define TP 2
+#define TP 1
 
 struct CommGroups {
   int local_rank;

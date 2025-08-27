@@ -21,12 +21,11 @@
 #ifndef GETP_RUN
 #define GETP_RUN
 
-#define NUM_REPLICAS 2
-#define TOTAL_GPUS 8
+#define NUM_REPLICAS 1
 
 Context context[NUM_REPLICAS];
 
-bool multi_gpu = false;
+bool multi_gpu = true;
 long long getp_generate_120b(Context *context, Tokenizer *tokenizer, Sampler *sampler,
                              const char *input_seq, int *output_tokens, int steps);
 
@@ -82,11 +81,12 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     p = &transformer->config;
     our_init(transformer, weights, rs);
   } else {
-    std::vector<int> gpu_0 = {0, 1, 2, 3};
-    std::vector<int> gpu_1 = {4, 5, 6, 7};
+    printf("Multi GPU here...\n");
+    std::vector<int> gpu_0 = {0, 1};
+    // std::vector<int> gpu_1 = {2, 3};
 
     context[0].init(transformer, gpu_0);
-    context[1].init(transformer, gpu_1);
+    // context[1].init(transformer, gpu_1);
   }
 }
 
@@ -103,56 +103,105 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     delete weights;
     delete rs;
   } else {
+    printf("Destroy multi GPU\n");
     context[0].destroy();
-    context[1].destroy();
+    // context[1].destroy();
   }
 }
 
 #ifndef RUN_BATCH
 long long getp_generate_120b(Context *context, Tokenizer *tokenizer, Sampler *sampler,
                              const char *input_seq, int *output_tokens, int steps) {
-  // Encode the prompt
+  // <|start|>: 200006
+  // <|end|>: 200007
+  // <|return|>: 200002
+  // <|message|>: 200008
+  // <|channel|>: 200005
+  // <|constrain|>: 200003
+  // <|endoftext|>: 199999
+
+  // Inference here
+  const char *empty_prompt = "";
+  if (input_seq == NULL) {
+    input_seq = empty_prompt;
+  }
+
+  // encode the (string) prompt into tokens sequence
   int num_prompt_tokens = 0;
-  int *prompt_tokens = (int *)malloc((strlen(input_seq) + 3) * sizeof(int));
+  int *prompt_tokens =
+    (int *)malloc((strlen(input_seq) + 3) * sizeof(int));  // +3 for '\0', ?BOS, ?EOS
   encode(tokenizer, input_seq, -1, -1, prompt_tokens, &num_prompt_tokens,
          context->transformer->config.initial_context_length);
-
   if (num_prompt_tokens < 1) {
-    free(prompt_tokens);
-    return 0;
+    fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
+    exit(EXIT_FAILURE);
   }
 
-  int token = prompt_tokens[0];
-  int pos = 0;
-  long long generated_tokens = 0;
+  // start the main loop
+  int next;                      // will store the next token in the sequence
+  int token = prompt_tokens[0];  // kick off with the first token in the prompt
+  int pos = 0;                   // position in the sequence
+
+  // print the very first token
+  // should be removed
+  const char *first_piece = decode_piece(tokenizer, 200006, token);
+  safe_printf(first_piece);
+  fflush(stdout);
 
   while (pos < steps) {
-    // The main thread (this thread) orchestrates the forward pass on the context's GPUs
+    // forward the transformer to get logits for the next token
+    // printf("Generate token %d\n", pos);
+    fflush(stdout);
     float *logits = forward_gpu_120b(context, token, pos);
+    // float *logits = forward(transformer, token, pos); <---- real code from run.cpp
 
-    int next_token;
-    if (pos < num_prompt_tokens - 1) {
-      next_token = prompt_tokens[pos + 1];
-    } else {
-      next_token = sample(sampler, logits);
-      if (generated_tokens < steps) {
-        output_tokens[generated_tokens++] = next_token;
+    // printf("logits: ");
+    // for (int i = 0; i < 5; i++) {
+    //   printf("%.6f ", logits[i]);
+    // }
+    // printf("\n");
+    // exit(1);
+
+    // advance the state machine
+    {
+      // GpuTimer timer("sample");
+      pos++;
+      if (pos < num_prompt_tokens) {
+        // if we are still processing the input prompt, force the next prompt
+        // token
+        next = prompt_tokens[pos];
+      } else {
+        // otherwise sample the next token from the logits
+        next = sample(sampler, logits);
+        // save the output token, it will be printed to file
+        output_tokens[pos - num_prompt_tokens] = next;
       }
-    }
 
-    if (next_token == 199999 || next_token == 200002) {
-      break;
-    }
+      // data-dependent terminating condition: the EOS (=199999 or =200002) token
+      // delimits sequences
+      if (next == 199999 || next == 200002) {
+        break;
+      }
 
-    token = next_token;
-    pos++;
+      // print the token as string, decode it with the Tokenizer object
+      // should be removed
+      const char *piece = decode_piece(tokenizer, token, next);
+      safe_printf(piece);  // same as printf("%s", piece), but skips "unsafe" bytes
+      fflush(stdout);
+
+      token = next;
+    }
   }
 
-  if (generated_tokens < steps + 1) {
-    output_tokens[generated_tokens] = -1;  // End of sequence marker
-  }
+  // should be removed
+  printf("\n");
+
+  // Marker for end of sequence
+  output_tokens[pos - num_prompt_tokens + 1] = -1;
+
   free(prompt_tokens);
-  return generated_tokens;
+
+  return pos - num_prompt_tokens + 1;
 }
 
 long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
@@ -258,31 +307,40 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer, Sampler *sam
                                             output_tokens, requests->max_seq_len);
     }
     return num_token_out;
+  } else {
+    long long num_token_out = 0;
+    for (int idx = 0; idx < requests->num_reqs; ++idx) {
+      const char *input_seq = get_str_req_ptr(requests, idx);
+      int *output_tokens = get_tok_gen_ptr(requests, idx);
+      num_token_out += getp_generate_120b(&context[0], tokenizer, sampler, input_seq, output_tokens,
+                                          requests->max_seq_len);
+    }
+    return num_token_out;
   }
 
-  long long num_token_out = 0;
-  pthread_t threads[NUM_REPLICAS];
-  ThreadArgs args[NUM_REPLICAS];
-  pthread_mutex_t mutex;
-  pthread_mutex_init(&mutex, NULL);
+  // long long num_token_out = 0;
+  // pthread_t threads[NUM_REPLICAS];
+  // ThreadArgs args[NUM_REPLICAS];
+  // pthread_mutex_t mutex;
+  // pthread_mutex_init(&mutex, NULL);
 
-  for (int i = 0; i < NUM_REPLICAS; i++) {
-    args[i].id = i;
-    args[i].tokenizer = tokenizer;
-    args[i].sampler = sampler;
-    args[i].reqs = requests;
-    args[i].total_token_out = &num_token_out;
-    args[i].mutex = &mutex;
+  // for (int i = 0; i < NUM_REPLICAS; i++) {
+  //   args[i].id = i;
+  //   args[i].tokenizer = tokenizer;
+  //   args[i].sampler = sampler;
+  //   args[i].reqs = requests;
+  //   args[i].total_token_out = &num_token_out;
+  //   args[i].mutex = &mutex;
 
-    pthread_create(&threads[i], NULL, thread_handler, (void *)&args[i]);
-  }
+  //   pthread_create(&threads[i], NULL, thread_handler, (void *)&args[i]);
+  // }
 
-  for (int i = 0; i < NUM_REPLICAS; i++) {
-    pthread_join(threads[i], NULL);
-  }
+  // for (int i = 0; i < NUM_REPLICAS; i++) {
+  //   pthread_join(threads[i], NULL);
+  // }
 
-  pthread_mutex_destroy(&mutex);
-  return num_token_out;
+  // pthread_mutex_destroy(&mutex);
+  // return num_token_out;
 }
 #else
 
