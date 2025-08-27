@@ -4,8 +4,62 @@
 #include <iostream>
 #include <algorithm>
 
-void all_reduce(Context *ctx, int gpu_id, Tensor *data);
-void all_to_all(Context *ctx, int gpu_id, Tensor *send_buffer, Tensor *recv_buffer);
+// __global__ void add_arrays_kernel(float *local, const float *remote, size_t n) {
+//   int idx = blockIdx.x * blockDim.x + threadIdx.x;
+//   if (idx < n) {
+//     local[idx] += remote[idx];
+//   }
+// }
+
+// void all_reduce(Context *ctx, int local_idx, Tensor *data) {
+//   CommGroups *cg = &ctx->comm_groups[local_idx];
+//   if (cg->tp_group.size() <= 1)
+//     return;
+
+//   int gpu_id = ctx->gpu_ids[local_idx];
+//   CHECK_HIP(hipSetDevice(gpu_id));
+
+//   size_t count = data->num_elem();
+//   float *d_ptr = (float *)data->d_buf;
+
+//   // Simple all-reduce using peer-to-peer copies and addition
+//   for (int peer_idx = 0; peer_idx < ctx->gpu_ids.size(); peer_idx++) {
+//     if (ctx->comm_groups[peer_idx].pp_rank == cg->pp_rank &&
+//         ctx->comm_groups[peer_idx].tp_rank != cg->tp_rank) {
+//       int peer_gpu = ctx->gpu_ids[peer_idx];
+//       float *peer_ptr = (float *)ctx->run_state[peer_idx]->e_agg->d_buf;
+
+//       // Create temporary buffer for peer data
+//       float *temp_buf;
+//       CHECK_HIP(hipMalloc(&temp_buf, count * sizeof(float)));
+
+//       // Copy from peer
+//       CHECK_HIP(hipMemcpyPeerAsync(temp_buf, gpu_id, peer_ptr, peer_gpu, count * sizeof(float),
+//                                    ctx->streams[local_idx]));
+//       CHECK_HIP(hipStreamSynchronize(ctx->streams[local_idx]));
+
+//       // Add to local buffer using the kernel
+//       dim3 block(256);
+//       dim3 grid((count + block.x - 1) / block.x);
+//       add_arrays_kernel<<<grid, block, 0, ctx->streams[local_idx]>>>(d_ptr, temp_buf, count);
+
+//       CHECK_HIP(hipFree(temp_buf));
+//     }
+//   }
+
+//   // Broadcast the result back to all GPUs in TP group
+//   for (int peer_idx = 0; peer_idx < ctx->gpu_ids.size(); peer_idx++) {
+//     if (ctx->comm_groups[peer_idx].pp_rank == cg->pp_rank &&
+//         ctx->comm_groups[peer_idx].tp_rank != cg->tp_rank) {
+//       int peer_gpu = ctx->gpu_ids[peer_idx];
+//       float *peer_ptr = (float *)ctx->run_state[peer_idx]->e_agg->d_buf;
+
+//       CHECK_HIP(hipMemcpyPeerAsync(peer_ptr, peer_gpu, d_ptr, gpu_id, count * sizeof(float),
+//                                    ctx->streams[local_idx]));
+//     }
+//   }
+//   CHECK_HIP(hipStreamSynchronize(ctx->streams[local_idx]));
+// }
 
 void Context::init(Transformer *transformer, const std::vector<int> &assigned_gpu_ids) {
   this->transformer = transformer;
@@ -319,8 +373,6 @@ void our_init_weights_120b(Context *ctx, int local_gpu_id) {
 }
 
 float *forward_gpu_120b(Context *ctx, int token, int pos) {
-  // printf("PP = %d\n", PP);
-  fflush(stdout);
   Config *p = &ctx->transformer->config;
   int layer_per_stages = p->n_layers / PP;
 
@@ -345,7 +397,6 @@ float *forward_gpu_120b(Context *ctx, int token, int pos) {
       int leader_idx = start_local_idx;  // leader của stage hiện tại
       int leader_global_id = ctx->gpu_ids[leader_idx];
 
-      // chỉ leader nhận từ pipeline buffer
       CHECK_HIP(hipSetDevice(leader_global_id));
       CHECK_HIP(hipStreamWaitEvent(ctx->streams[leader_idx], ctx->events[leader_idx], 0));
 
@@ -356,7 +407,6 @@ float *forward_gpu_120b(Context *ctx, int token, int pos) {
                                ctx->pipeline_buffers[current_stage_idx - 1]->d_buf, nbytes,
                                hipMemcpyDeviceToDevice, ctx->streams[leader_idx]));
 
-      // broadcast từ leader sang các GPU khác trong stage
       for (int i = start_local_idx + 1; i < end_local_idx; i++) {
         int dst_global_id = ctx->gpu_ids[i];
         CHECK_HIP(hipSetDevice(dst_global_id));
@@ -367,6 +417,7 @@ float *forward_gpu_120b(Context *ctx, int token, int pos) {
       // printf("stage %d - pipeline recv\n", current_stage_idx);
     }
 
+    // Attention layers
     for (int i = start_local_idx; i < end_local_idx; i++) {
       CHECK_HIP(hipSetDevice(ctx->gpu_ids[i]));
       OurRunState *s = ctx->run_state[i];
@@ -383,8 +434,9 @@ float *forward_gpu_120b(Context *ctx, int token, int pos) {
                      ctx->streams[i]);
       // printf("stage %d - Done qkv_split_rope\n", current_stage_idx);
 
-      long long kv_cache_offset = (long long)l * p->seq_len * p->n_kv_heads * p->head_dim +
-                                  (long long)pos * p->n_kv_heads * p->head_dim;
+      long long kv_cache_offset =
+        (long long)local_layer_idx * p->seq_len * p->n_kv_heads * p->head_dim +
+        (long long)pos * p->n_kv_heads * p->head_dim;
       memcpy_tensor(s->key_cache, s->k, kv_cache_offset, 0, s->k->num_elem(), false, true,
                     ctx->streams[i]);
       memcpy_tensor(s->value_cache, s->v, kv_cache_offset, 0, s->v->num_elem(), false, true,
@@ -405,12 +457,13 @@ float *forward_gpu_120b(Context *ctx, int token, int pos) {
       // printf("stage %d - Done add_vector 1\n", current_stage_idx);
     }
 
+    // MoE FFN layers
     for (int i = start_local_idx; i < end_local_idx; i++) {
       hipStream_t stream = ctx->streams[i];
-
       CHECK_HIP(hipSetDevice(ctx->gpu_ids[i]));
       OurRunState *s = ctx->run_state[i];
       OurTransformerWeights *w = ctx->weights[i];
+
       rmsnorm(s->x, w->rms_ffn_w, s->t, local_layer_idx, false, false, 1e-5f, ctx->streams[i]);
       // printf("stage %d - Done rmsnorm 2\n", current_stage_idx);
 
@@ -445,18 +498,25 @@ float *forward_gpu_120b(Context *ctx, int token, int pos) {
       memset_tensor(s->e_agg, 0, false, true, stream);
 
       moe_mlp1(W1_ptr, t_ptr, b1_ptr, mlp1_out_ptr, topk_idx_ptr, k, inter_dim, hidden_dim, stream);
-
       moe_swiglu(mlp1_out_ptr, gate_up_ptr, k, inter_dim, p->swiglu_limit, stream);
-
       moe_mlp2(W2_ptr, gate_up_ptr, b2_ptr, tb3_ptr, topk_idx_ptr, k, hidden_dim, inter_dim,
                stream);
-
       moe_agg(tb3_ptr, topk_vals_ptr, e_agg_ptr, k, hidden_dim, stream);
-      // printf("stage %d - Done moe_apply_topk\n", current_stage_idx);
 
-      add_vector(s->x, s->e_agg, false, false, false, ctx->streams[i]);
-      // printf("stage %d - Done add_vector 2\n", current_stage_idx);
+      add_vector(ctx->run_state[i]->x, ctx->run_state[i]->e_agg, false, false, false,
+                 ctx->streams[i]);
     }
+
+    // for (int i = start_local_idx; i < end_local_idx; i++) {
+    //   CHECK_HIP(hipSetDevice(ctx->gpu_ids[i]));
+    //   all_reduce(ctx, i, ctx->run_state[i]->e_agg);
+    // }
+
+    // for (int i = start_local_idx; i < end_local_idx; i++) {
+    //   CHECK_HIP(hipSetDevice(ctx->gpu_ids[i]));
+    //   add_vector(ctx->run_state[i]->x, ctx->run_state[i]->e_agg, false, false, false,
+    //              ctx->streams[i]);
+    // }
 
     // --- Pipeline Send ---
     if ((l + 1) % layer_per_stages == 0 && current_stage_idx < PP - 1) {
