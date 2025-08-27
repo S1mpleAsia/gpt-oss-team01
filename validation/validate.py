@@ -23,3 +23,4 @@ def compare_files(output_path, output_test_path):
 
 # Example usage
 compare_files('../data/output.txt', '../data/output_test.txt')
+
