@@ -22,4 +22,4 @@ def compare_files(output_path, output_test_path):
                 break
 
 # Example usage
-compare_files('output.txt', 'output_test.txt')
+compare_files('../data/output.txt', '../data/output_test.txt')
