@@ -69,6 +69,20 @@ void moe_apply_topk(Tensor *t, const Tensor *W1, const Tensor *b1, const Tensor 
                     long long layer_offset, bool t_to_device, bool topk_idx_to_device,
                     bool topk_vals_to_device, bool e_agg_from_device, hipStream_t stream = 0);
 
+static inline void moe_mlp1(const bf16 *W1_ptr, const float *t_ptr, const bf16 *b1_ptr,
+                            float *mlp1_out_ptr, const int *topk_idx_ptr, int k, int inter_dim,
+                            int hidden_dim, hipStream_t stream);
+
+static inline void moe_swiglu(const float *mlp1_out_ptr, float *gate_up_ptr, int k, int inter_dim,
+                              float clamp_limit, hipStream_t stream);
+
+static inline void moe_mlp2(const bf16 *W2_ptr, const float *gate_up_ptr, const bf16 *b2_ptr,
+                            float *tb3_ptr, const int *topk_idx_ptr, int k, int hidden_dim,
+                            int inter_dim, hipStream_t stream);
+
+static inline void moe_agg(const float *tb3_ptr, const float *topk_vals_ptr, float *e_agg_ptr,
+                           int k, int hidden_dim, hipStream_t stream);
+
 // ---------- Classifier (logits = W_out * x) ----------
 void classifier_gemm(const Tensor *W_out, Tensor *x, Tensor *logits, bool x_to_device,
                      bool logits_from_device, hipStream_t stream = 0);

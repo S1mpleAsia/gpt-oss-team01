@@ -84,7 +84,7 @@ void Context::init(Transformer *transformer, const std::vector<int> &assigned_gp
     CHECK_HIP(hipStreamSynchronize(this->streams[i]));
   }
 
-  // printf("Context initialized successully\n");
+  printf("Context initialized successully\n");
   fflush(stdout);
 }
 
@@ -347,8 +347,7 @@ float *forward_gpu_120b(Context *ctx, int token, int pos) {
 
       // chỉ leader nhận từ pipeline buffer
       CHECK_HIP(hipSetDevice(leader_global_id));
-      CHECK_HIP(hipStreamWaitEvent(
-        ctx->streams[leader_idx], ctx->events[(current_stage_idx * stage0_size) - stage0_size], 0));
+      CHECK_HIP(hipStreamWaitEvent(ctx->streams[leader_idx], ctx->events[leader_idx], 0));
 
       size_t nbytes =
         ctx->run_state[leader_idx]->x->num_elem() * ctx->run_state[leader_idx]->x->get_dtype_size();
@@ -407,6 +406,8 @@ float *forward_gpu_120b(Context *ctx, int token, int pos) {
     }
 
     for (int i = start_local_idx; i < end_local_idx; i++) {
+      hipStream_t stream = ctx->streams[i];
+
       CHECK_HIP(hipSetDevice(ctx->gpu_ids[i]));
       OurRunState *s = ctx->run_state[i];
       OurTransformerWeights *w = ctx->weights[i];
@@ -417,15 +418,40 @@ float *forward_gpu_120b(Context *ctx, int token, int pos) {
                   ctx->streams[i]);
       // printf("stage %d - Done router_gemm\n", current_stage_idx);
 
-      // topk_select(s->router_score, s->topk_i, s->topk_v, p->experts_per_token, ctx->streams[i]);
-      // topk_softmax_inplace(s->topk_v, ctx->streams[i]);
       topk_softmax(s->router_score, s->topk_v, s->topk_i, false, false, false, ctx->streams[i]);
       // printf("stage %d - Done topk_softmax\n", current_stage_idx);
 
-      // Route the tokens to their corresponding top-k experts
-      moe_apply_topk(s->t, w->w_mlp1, w->b_mlp1, w->w_mlp2, w->b_mlp2, s->topk_i, s->topk_v,
-                     s->mlp1_out, s->gate_up, s->tb3, s->e_agg, p->swiglu_limit,
-                     1ll * local_layer_idx, false, false, false, false);
+      const int hidden_dim = s->t->shape[1];
+      const int inter_dim = w->w_mlp2->shape[3];
+      const int k = s->topk_i->num_elem();
+      const int num_experts = w->b_mlp2->shape[1];
+      const long long layer_offset = (long long)local_layer_idx;
+      const long long offset = layer_offset * num_experts;
+      const long long inter_hidden = (long long)inter_dim * hidden_dim;
+
+      // Lấy con trỏ thô trên device từ các tensor
+      const float *t_ptr = (const float *)s->t->d_buf;
+      const bf16 *W1_ptr = (const bf16 *)w->w_mlp1->d_buf + offset * 2 * inter_hidden;
+      const bf16 *b1_ptr = (const bf16 *)w->b_mlp1->d_buf + offset * 2 * inter_dim;
+      const bf16 *W2_ptr = (const bf16 *)w->w_mlp2->d_buf + offset * inter_hidden;
+      const bf16 *b2_ptr = (const bf16 *)w->b_mlp2->d_buf + offset * hidden_dim;
+      const int *topk_idx_ptr = s->topk_i->d_buf;
+      const float *topk_vals_ptr = (const float *)s->topk_v->d_buf;
+      float *mlp1_out_ptr = (float *)s->mlp1_out->d_buf;
+      float *tb3_ptr = (float *)s->tb3->d_buf;
+      float *gate_up_ptr = (float *)s->gate_up->d_buf;
+      float *e_agg_ptr = (float *)s->e_agg->d_buf;
+
+      memset_tensor(s->e_agg, 0, false, true, stream);
+
+      moe_mlp1(W1_ptr, t_ptr, b1_ptr, mlp1_out_ptr, topk_idx_ptr, k, inter_dim, hidden_dim, stream);
+
+      moe_swiglu(mlp1_out_ptr, gate_up_ptr, k, inter_dim, p->swiglu_limit, stream);
+
+      moe_mlp2(W2_ptr, gate_up_ptr, b2_ptr, tb3_ptr, topk_idx_ptr, k, hidden_dim, inter_dim,
+               stream);
+
+      moe_agg(tb3_ptr, topk_vals_ptr, e_agg_ptr, k, hidden_dim, stream);
       // printf("stage %d - Done moe_apply_topk\n", current_stage_idx);
 
       add_vector(s->x, s->e_agg, false, false, false, ctx->streams[i]);
@@ -454,6 +480,8 @@ float *forward_gpu_120b(Context *ctx, int token, int pos) {
                                    leader_global_id, nbytes, ctx->streams[next_leader_idx]));
 
       CHECK_HIP(hipEventRecord(ctx->events[next_leader_idx], ctx->streams[next_leader_idx]));
+      CHECK_HIP(hipSetDevice(leader_global_id));
+      CHECK_HIP(hipStreamWaitEvent(ctx->streams[leader_idx], ctx->events[next_leader_idx], 0));
       // printf("stage %d - Pipeline send\n", current_stage_idx);
     }
   }

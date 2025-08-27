@@ -874,6 +874,60 @@ void moe_apply_topk(Tensor *t, const Tensor *W1, const Tensor *b1, const Tensor 
   }
 }
 
+static inline void moe_mlp1(const bf16 *W1_ptr, const float *t_ptr, const bf16 *b1_ptr,
+                            float *mlp1_out_ptr, const int *topk_idx_ptr, int k, int inter_dim,
+                            int hidden_dim, hipStream_t stream) {
+  size_t total_threads = (size_t)k * 2 * inter_dim;
+  dim3 grid_dim((total_threads + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE);
+  dim3 block_dim(DEFAULT_BLOCK_SIZE);
+
+  moe_matmul_kernel_bf16_weights<<<grid_dim, block_dim, 0, stream>>>(
+    W1_ptr, t_ptr, b1_ptr, mlp1_out_ptr, topk_idx_ptr, k, 2 * inter_dim, hidden_dim, false);
+}
+
+/**
+ * @brief Bước 2: Áp dụng hàm kích hoạt SwiGLU.
+ * Tính toán: swiglu = silu(gate) * up
+ */
+static inline void moe_swiglu(const float *mlp1_out_ptr, float *gate_up_ptr, int k, int inter_dim,
+                              float clamp_limit, hipStream_t stream) {
+  size_t total_threads = (size_t)k * inter_dim;
+  dim3 grid_dim((total_threads + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE);
+  dim3 block_dim(DEFAULT_BLOCK_SIZE);
+
+  SwiGLU_kernel<<<grid_dim, block_dim, 0, stream>>>(mlp1_out_ptr, gate_up_ptr, k * inter_dim,
+                                                    clamp_limit);
+}
+
+/**
+ * @brief Bước 3: Thực hiện phép nhân ma trận (GEMM) thứ hai.
+ * Tính toán: y = W2 * swiglu + b2
+ */
+static inline void moe_mlp2(const bf16 *W2_ptr, const float *gate_up_ptr, const bf16 *b2_ptr,
+                            float *tb3_ptr, const int *topk_idx_ptr, int k, int hidden_dim,
+                            int inter_dim, hipStream_t stream) {
+  size_t total_threads = (size_t)k * hidden_dim;
+  dim3 grid_dim((total_threads + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE);
+  dim3 block_dim(DEFAULT_BLOCK_SIZE);
+
+  moe_matmul_kernel_bf16_weights<<<grid_dim, block_dim, 0, stream>>>(
+    W2_ptr, gate_up_ptr, b2_ptr, tb3_ptr, topk_idx_ptr, k, hidden_dim, inter_dim, true);
+}
+
+/**
+ * @brief Bước 4: Tích lũy có trọng số các kết quả đầu ra của expert.
+ * Tính toán: e_agg_inout += weight * y
+ */
+static inline void moe_agg(const float *tb3_ptr, const float *topk_vals_ptr, float *e_agg_ptr,
+                           int k, int hidden_dim, hipStream_t stream) {
+  size_t total_threads = (size_t)k * hidden_dim;
+  dim3 grid_dim((total_threads + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE);
+  dim3 block_dim(DEFAULT_BLOCK_SIZE);
+
+  batched_weighted_accumulate_kernel<<<grid_dim, block_dim, 0, stream>>>(tb3_ptr, topk_vals_ptr,
+                                                                         e_agg_ptr, k, hidden_dim);
+}
+
 void classifier_gemm(const Tensor *W_out, Tensor *x, Tensor *logits, bool x_to_device,
                      bool logits_from_device, hipStream_t stream) {
   // GpuTimer timer("classifier");

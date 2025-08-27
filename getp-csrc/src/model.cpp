@@ -16,6 +16,8 @@ float *forward_gpu_20b(Config *p, OurTransformerWeights *weights, OurRunState *r
 
   // forward all the layers
   for (int l = 0; l < p->n_layers; l++) {
+    // printf("==== stage: %d - layer: %d ====\n", (l < 12) ? 0 : 1, l);
+
     // attention rmsnorm
     rmsnorm(rs->x, weights->rms_attn_w, rs->t, 1ll * l, false, false);
 
@@ -59,10 +61,54 @@ float *forward_gpu_20b(Config *p, OurTransformerWeights *weights, OurRunState *r
     // Select top-k experts
     topk_softmax(rs->router_score, rs->topk_v, rs->topk_i, false, false, false);
 
+    if (l == 12) {
+      int topk_vals[4];
+      CHECK_HIP(hipMemcpy(topk_vals, rs->topk_i->d_buf, 4 * sizeof(int), hipMemcpyDeviceToHost));
+      printf("Layer 12 topk_i: %d %d %d %d\n", topk_vals[0], topk_vals[1], topk_vals[2],
+             topk_vals[3]);
+
+      float topk_weights[4];
+      CHECK_HIP(
+        hipMemcpy(topk_weights, rs->topk_v->d_buf, 4 * sizeof(float), hipMemcpyDeviceToHost));
+      printf("Layer 12 topk_v: %.6f %.6f %.6f %.6f\n", topk_weights[0], topk_weights[1],
+             topk_weights[2], topk_weights[3]);
+    }
+
     // Route the tokens to their corresponding top-k experts
-    moe_apply_topk(rs->t, weights->w_mlp1, weights->b_mlp1, weights->w_mlp2, weights->b_mlp2,
-                   rs->topk_i, rs->topk_v, rs->mlp1_out, rs->gate_up, rs->tb3, rs->e_agg,
-                   p->swiglu_limit, 1ll * l, false, false, false, false);
+    const int hidden_dim = rs->t->shape[1];
+    const int inter_dim = weights->w_mlp2->shape[3];
+    const int k = rs->topk_i->num_elem();
+    const int num_experts = weights->b_mlp2->shape[1];
+    const long long layer_offset = (long long)l;
+    const long long offset = layer_offset * num_experts;
+    const long long inter_hidden = (long long)inter_dim * hidden_dim;
+
+    // Lấy con trỏ thô trên device từ các tensor
+    const float *t_ptr = (const float *)rs->t->d_buf;
+    const bf16 *W1_ptr = (const bf16 *)weights->w_mlp1->d_buf + offset * 2 * inter_hidden;
+    const bf16 *b1_ptr = (const bf16 *)weights->b_mlp1->d_buf + offset * 2 * inter_dim;
+    const bf16 *W2_ptr = (const bf16 *)weights->w_mlp2->d_buf + offset * inter_hidden;
+    const bf16 *b2_ptr = (const bf16 *)weights->b_mlp2->d_buf + offset * hidden_dim;
+    const int *topk_idx_ptr = rs->topk_i->d_buf;
+    const float *topk_vals_ptr = (const float *)rs->topk_v->d_buf;
+    float *mlp1_out_ptr = (float *)rs->mlp1_out->d_buf;
+    float *tb3_ptr = (float *)rs->tb3->d_buf;
+    float *gate_up_ptr = (float *)rs->gate_up->d_buf;
+    float *e_agg_ptr = (float *)rs->e_agg->d_buf;
+
+    memset_tensor(rs->e_agg, 0, false, true, 0);
+
+    moe_mlp1(W1_ptr, t_ptr, b1_ptr, mlp1_out_ptr, topk_idx_ptr, k, inter_dim, hidden_dim, 0);
+
+    moe_swiglu(mlp1_out_ptr, gate_up_ptr, k, inter_dim, p->swiglu_limit, 0);
+
+    moe_mlp2(W2_ptr, gate_up_ptr, b2_ptr, tb3_ptr, topk_idx_ptr, k, hidden_dim, inter_dim, 0);
+
+    moe_agg(tb3_ptr, topk_vals_ptr, e_agg_ptr, k, hidden_dim, 0);
+
+    // moe_apply_topk(rs->t, weights->w_mlp1, weights->b_mlp1, weights->w_mlp2, weights->b_mlp2,
+    //                rs->topk_i, rs->topk_v, rs->mlp1_out, rs->gate_up, rs->tb3, rs->e_agg,
+    //                p->swiglu_limit, 1ll * l, false, false, false, false);
 
     // residual connection
     add_vector(rs->x, rs->e_agg, false, false, false);  // equals residual add
