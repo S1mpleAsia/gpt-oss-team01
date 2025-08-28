@@ -82,7 +82,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     our_init(transformer, weights, rs);
   } else {
     printf("Multi GPU here...\n");
-    std::vector<int> gpu_0 = {0, 1};
+    std::vector<int> gpu_0 = {0, 1, 2, 3};
     // std::vector<int> gpu_1 = {2, 3};
 
     context[0].init(transformer, gpu_0);
@@ -244,8 +244,8 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer, S
 
   while (pos < steps) {
     // forward the transformer to get logits for the next token
-    float *logits = forward_gpu_20b(p, weights, rs, token, pos);
-    // float *logits = forward(transformer, token, pos); <---- real code from run.cpp
+    // float *logits = forward_gpu_20b(p, weights, rs, token, pos);
+    float *logits = forward(transformer, token, pos);
 
     // printf("logits: ");
     // for (int i = 0; i < 5; i++) {

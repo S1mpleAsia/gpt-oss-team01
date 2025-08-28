@@ -5,9 +5,9 @@
 #include "config.hpp"
 #include <hip/hip_runtime.h>
 
-#define REPLICA_SIZE 2
+#define REPLICA_SIZE 4
 #define PP 2
-#define TP 1
+#define TP 2
 
 struct CommGroups {
   int local_rank;
@@ -28,7 +28,10 @@ struct Context {
   Tensor *cos_tensor[REPLICA_SIZE];
   Tensor *sin_tensor[REPLICA_SIZE];
 
-  hipEvent_t events[REPLICA_SIZE];
+  hipEvent_t events[REPLICA_SIZE];  // Used for pipeline only
+  hipEvent_t tp_ready_event[REPLICA_SIZE];
+  hipEvent_t tp_reduce_done_event[REPLICA_SIZE];
+  hipEvent_t pipe_recv_ready_event[REPLICA_SIZE];
 
   Transformer *transformer;
 

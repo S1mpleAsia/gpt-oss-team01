@@ -52,7 +52,7 @@ typedef struct {
   Tensor *t;             // same, but inside a residual branch (hidden_dim, )
   Tensor *tb;            // (head_dim * n_attn_heads, )
   Tensor *tb2;           // (hidden_dim, )
-  Tensor *tb3;           // (n_experts, hidden_dim)
+  Tensor *tb3;           // (experts_per_token, hidden_dim)
   Tensor *router_score;  // router score (n_experts, )
   Tensor *topk_v;        // topk expert weights (experts_per_token, )
   TensorI32 *topk_i;     // topk expert indices (experts_per_token, )
