@@ -7,7 +7,11 @@
 #include "tensor.hpp"
 #include "config_run.hpp"
 
-Tensor *cos_tensor, *sin_tensor;
+#define RUN_BATCH
+#define BATCH_SIZE 16
+// #define PRINT_LOGITS
+// #define TIME_GPU
+// #define DEBUG
 
 typedef struct {
   // token_embedding_table - embedding.weight
@@ -46,6 +50,9 @@ typedef struct {
 } OurTransformerWeights;
 
 typedef struct {
+  Tensor *cos_tensor;
+  Tensor *sin_tensor;
+
   // current wave of activations
   Tensor *x;             // activation at current time stamp (hidden_dim, )
   Tensor *t;             // same, but inside a residual branch (hidden_dim, )

@@ -24,8 +24,9 @@ float *forward_gpu_20b_batched(Config *p, OurTransformerWeights *weights, OurRun
     qkv_gemm_batched(rs->t, weights->w_qkv, weights->b_qkv, rs->qkv, 1ll * l, false, false);  // This kernel diverges the most
 
     // Separate q, k, v + RoPE
-    qkv_split_rope_batched(rs->qkv, rs->q, rs->k, rs->v, cos_tensor, sin_tensor, p->head_dim,
-                   p->n_attn_heads, p->n_kv_heads, pos, false, false, false, false);
+    qkv_split_rope_batched(rs->qkv, rs->q, rs->k, rs->v, rs->cos_tensor,
+                          rs->sin_tensor, p->head_dim, p->n_attn_heads,
+                          p->n_kv_heads, pos, false, false, false, false);
 
     // Store k, v in cache
     #pragma omp parallel for
@@ -98,8 +99,9 @@ float *forward_gpu_20b(Config *p, OurTransformerWeights *weights, OurRunState *r
              false);  // This kernel diverges the most
 
     // Separate q, k, v + RoPE
-    qkv_split_rope(rs->qkv, rs->q, rs->k, rs->v, cos_tensor, sin_tensor, p->head_dim,
-                   p->n_attn_heads, p->n_kv_heads, pos, false, false, false, false);
+    qkv_split_rope(rs->qkv, rs->q, rs->k, rs->v, rs->cos_tensor,
+                  rs->sin_tensor, p->head_dim, p->n_attn_heads, p->n_kv_heads,
+                  pos, false, false, false, false);
 
     // Store k, v in cache
     memcpy_tensor(rs->key_cache, rs->k, loff + 1ll * pos * p->n_kv_heads * p->head_dim, 0,
@@ -168,8 +170,8 @@ float *forward_cpu_20b(Config *p, OurTransformerWeights *weights, OurRunState *r
 
     // Separate q, k, v + apply RoPE
     SplitQKV(rs->qkv, p->head_dim, p->n_attn_heads, p->n_kv_heads, rs->q, rs->k, rs->v);
-    ApplyRotary(rs->q, cos_tensor, sin_tensor, p->n_attn_heads, p->head_dim, pos);
-    ApplyRotary(rs->k, cos_tensor, sin_tensor, p->n_kv_heads, p->head_dim, pos);
+    ApplyRotary(rs->q, rs->cos_tensor, rs->sin_tensor, p->n_attn_heads, p->head_dim, pos);
+    ApplyRotary(rs->k, rs->cos_tensor, rs->sin_tensor, p->n_kv_heads, p->head_dim, pos);
 
     // Store k, v in cache
     memcpy(rs->key_cache->buf + loff + 1ll * pos * p->n_kv_heads * p->head_dim, rs->k->buf,

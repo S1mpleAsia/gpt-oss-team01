@@ -86,6 +86,10 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs) {
 
   // mask needs to be batch because they are not zero_allocated
   rs->mask = new Tensor({BATCH_SIZE, (size_t)p->seq_len, (size_t)p->seq_len}, s->mask, true);
+
+  rs->cos_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2});
+  rs->sin_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2});
+  RopePrecomputeCS(p, rs->cos_tensor, rs->sin_tensor);
 }
 
 void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunState *rs) {
@@ -95,11 +99,6 @@ void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunSt
 
   our_init_weights(w, p, weights);
   our_init_run_state(s, p, rs);
-
-  cos_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2});
-  sin_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2});
-
-  RopePrecomputeCS(p, cos_tensor, sin_tensor);
 }
 
 void our_free(OurTransformerWeights *weights, OurRunState *rs) {
@@ -145,6 +144,6 @@ void our_free(OurTransformerWeights *weights, OurRunState *rs) {
   delete rs->mask;
 
   // Others
-  delete cos_tensor;
-  delete sin_tensor;
+  delete rs->cos_tensor;
+  delete rs->sin_tensor;
 }
