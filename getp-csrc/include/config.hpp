@@ -13,6 +13,11 @@
 // #define TIME_GPU
 // #define DEBUG
 
+#define DP 2
+#define PP 1
+#define TP 1
+#define TOTAL_GPUS_NEEDED ((DP) * (PP) * (TP))
+
 typedef struct {
   // token_embedding_table - embedding.weight
   Tensor *token_embedding_table;  // (vocab_size, hidden_dim) (in, out)
@@ -79,3 +84,5 @@ typedef struct {
   Tensor *value_cache;  // (layer, seq_len, kv_dim)
   Tensor *mask;
 } OurRunState;
+
+

@@ -31,6 +31,14 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // - Memory allocation
   // - Load model
   // - ...
+  int actualGPUs = 0;
+  CHECK_HIP(hipGetDeviceCount(&actualGPUs));
+
+  if (TOTAL_GPUS_NEEDED != actualGPUs) {
+    fprintf(stderr, "Error: Required %d GPUs, but only %d available.\n", TOTAL_GPUS_NEEDED, actualGPUs);
+    return EXIT_FAILURE;
+  }
+
   weights = new OurTransformerWeights;
   rs = new OurRunState;
   p = &transformer->config;
