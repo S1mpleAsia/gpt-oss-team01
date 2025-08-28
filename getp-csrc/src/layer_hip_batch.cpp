@@ -12,6 +12,21 @@ __device__ __forceinline__ float warp_reduce_sum_batched(float v) {
   }
   return v;
 }
+// bf16 helpers
+__device__ __forceinline__ float bf16_to_f32(bf16 v) {
+    // bf16 -> f32 by left-shift then reinterpret
+    uint32_t u = (uint32_t)v << 16;
+    return __int_as_float((int)u);
+}
+
+__device__ __forceinline__ void bf16x2_to_f32(uint32_t packed, float &f0, float &f1) {
+    // packed = [hi:bf16 | lo:bf16]
+    uint32_t lo =  packed        & 0xFFFFu;
+    uint32_t hi = (packed >> 16) & 0xFFFFu;
+    f0 = __int_as_float((int)(lo << 16));
+    f1 = __int_as_float((int)(hi << 16));
+}
+
 
 __device__ float block_reduce_sum(float val) {
     // A block can have multiple warps.
@@ -37,17 +52,16 @@ __device__ float block_reduce_sum(float val) {
     return val; // The final sum is in lane 0 of the first warp
 }
 
-void embedding_lookup_batched(
-  Tensor *embedding,  // Shape: [vocab_size, hidden_dim]
-  int *tokens,        // Shape: [batch_size]
-  Tensor *x,          // Shape: [batch_size, hidden_dim]
-  bool x_from_device, int cur_batch_size, hipStream_t stream
-) {
+void embedding_lookup_batched(Tensor *embedding,  // Shape: [vocab_size, hidden_dim]
+                              int *tokens,        // Shape: [batch_size]
+                              Tensor *x,          // Shape: [batch_size, hidden_dim]
+                              bool x_from_device, hipStream_t stream) {
   GpuTimer timer("embedding_lookup");
 
+  const int batch_size = x->shape[0];
   const size_t hidden_dim = x->shape[1];
 
-  for (int i = 0; i < cur_batch_size; i++) {
+  for (int i = 0; i < batch_size; i++) {
     if (x->dtype == DType::BF16) {
       bf16 *src = (bf16 *)embedding->d_buf + (size_t)tokens[i] * hidden_dim;
       bf16 *dst = (bf16 *)x->d_buf + 1ll * i * hidden_dim;
@@ -66,10 +80,8 @@ void embedding_lookup_batched(
   }
 }
 
-__global__ void rmsnorm_kernel(
-  const float *x, const float *w, float *out, int hidden_dim,
-  float eps
-) {
+__global__ void rmsnorm_kernel(const float *x, const float *w, float *out, int hidden_dim,
+                               float eps) {
   const int batch_idx = blockIdx.x;
   const int tid = threadIdx.x;
   const int block_size = blockDim.x;
@@ -107,21 +119,20 @@ __global__ void rmsnorm_kernel(
   }
 }
 
-void rmsnorm_batched(
-  Tensor *x,    // Shape: [batch_size, hidden_dim]
-  Tensor *w,    // Shape: [hidden_dim]
-  Tensor *out,  // Shape: [batch_size, hidden_dim]
-  long long layer_offset, bool x_to_device, bool out_from_device,
-  int cur_batch_size, float eps, hipStream_t stream
-) {
+void rmsnorm_batched(Tensor *x,    // Shape: [batch_size, hidden_dim]
+                     Tensor *w,    // Shape: [hidden_dim]
+                     Tensor *out,  // Shape: [batch_size, hidden_dim]
+                     long long layer_offset, bool x_to_device, bool out_from_device,
+                     float eps, hipStream_t stream) {
   GpuTimer timer("rmsnorm");
   if (x_to_device) {
     x->to_device(stream);
   }
 
+  const int batch_size = x->shape[0];
   const int hidden_dim = x->shape[1];
 
-  const dim3 grid_dim(cur_batch_size);
+  const dim3 grid_dim(batch_size);
   const dim3 block_dim(256);
   size_t shared_mem_size = block_dim.x * sizeof(double);
 
@@ -130,7 +141,7 @@ void rmsnorm_batched(
   float *out_ptr = (float *)out->d_buf;
 
   rmsnorm_kernel<<<grid_dim, block_dim, shared_mem_size, stream>>>(x_ptr, w_ptr, out_ptr,
-           hidden_dim, eps);
+                                                                   hidden_dim, eps);
   CHECK_HIP(hipGetLastError());
 
   if (out_from_device) {
@@ -141,99 +152,91 @@ void rmsnorm_batched(
 
 // ---------- QKV GEMM ----------
 
-// Renamed and modified kernel to handle batches (GEMM)
-template <int WARPS_PER_BLOCK, int TILE>
+template<int WARPS_PER_BLOCK, int TILE, int VEC = 4>
 __global__ void gemm_kernel_batched(
-  const float *W, const float *x, const float *bias, float *out,
-  int out_features, int in_features, int batch_size
-) {
-  extern __shared__ float local_x[];
+    const float* __restrict__ W,     // [out_features, in_features]
+    const float* __restrict__ x,     // [B, in_features]
+    const float* __restrict__ bias,  // [out_features] or nullptr
+    float* __restrict__ out,         // [B, out_features]
+    int out_features, int in_features, int batch_size)
+{
+    extern __shared__ float s_x[];   // TILE floats
 
-  // --- MODIFIED: Identify batch index from the grid's y-dimension ---
-  const int batch_idx = blockIdx.y;
-  if (batch_idx >= batch_size) {
-    return;
-  }
+    const int b = blockIdx.y;
+    if (b >= batch_size) return;
 
-  const int lane = threadIdx.x;
-  const int w = threadIdx.y;
-  const int row = blockIdx.x * WARPS_PER_BLOCK + w;
+    const int lane = threadIdx.x;        // 0..warpSize-1 (MI250 wave = 64)
+    const int warp = threadIdx.y;        // 0..WARPS_PER_BLOCK-1
+    const int row  = blockIdx.x * WARPS_PER_BLOCK + warp;
+    if (row >= out_features) return;
 
-  if (row >= out_features) {
-    return;
-  }
+    const float* __restrict__ x_b    = x   + (size_t)b * in_features;
+    float*       __restrict__ out_b  = out + (size_t)b * out_features;
+    const float* __restrict__ W_row  = W   + (size_t)row * in_features;
 
-  // --- MODIFIED: Offset input and output pointers by batch index ---
-  const float *x_batch = x + 1ll * batch_idx * in_features;
-  float *out_batch = out + 1ll * batch_idx * out_features;
+    float acc = 0.0f;
 
-  float acc = 0.0f;
-  const int row_base = row * in_features;
+    // Process input in TILE chunks (cooperatively load x into LDS)
+    for (int k0 = 0; k0 < in_features; k0 += TILE) {
+        const int tile_len = min(TILE, in_features - k0);
 
-  for (int k0 = 0; k0 < in_features; k0 += TILE) {
-    const int tile_len = min(TILE, in_features - k0);
+        // all warps load x tile
+        for (int t = warp * warpSize + lane; t < tile_len; t += WARPS_PER_BLOCK * warpSize)
+            s_x[t] = x_b[k0 + t];
+        __syncthreads();
 
-    // Load a tile of the current input vector into shared memory
-    for (int t = w * warpSize + lane; t < tile_len; t += WARPS_PER_BLOCK * warpSize) {
-      local_x[t] = x_batch[k0 + t]; // Read from batched input
+        // main vectorized loop (only if aligned & tile_len >= VEC)
+        int vec_elems = (tile_len / VEC) * VEC;
+
+        // assure the base is 16B aligned for float4 reads
+        bool vec_ok = ((reinterpret_cast<uintptr_t>(W_row + k0) & 0xF) == 0);
+
+        if (vec_ok) {
+            // each lane handles VEC elements at a time
+            int t = lane * VEC;
+            for (; t < vec_elems; t += warpSize * VEC) {
+                // load 4 weights
+                const float4 w4 = *reinterpret_cast<const float4*>(W_row + k0 + t);
+                // read 4 x's from shared (shared bandwidth is high; scalar reads are fine)
+                const float x0 = s_x[t + 0];
+                const float x1 = s_x[t + 1];
+                const float x2 = s_x[t + 2];
+                const float x3 = s_x[t + 3];
+                acc = fmaf(w4.x, x0, acc);
+                acc = fmaf(w4.y, x1, acc);
+                acc = fmaf(w4.z, x2, acc);
+                acc = fmaf(w4.w, x3, acc);
+            }
+            // tail of the tile
+            for (; t < tile_len; ++t)
+                acc = fmaf(W_row[k0 + t], s_x[t], acc);
+        } else {
+            // unaligned / short tile path (perfectly safe)
+            for (int t = lane; t < tile_len; t += warpSize)
+                acc = fmaf(W_row[k0 + t], s_x[t], acc);
+        }
+
+        __syncthreads();
     }
-    __syncthreads();
 
-    // Compute dot product for the tile
-    for (int t = lane; t < tile_len; t += warpSize) {
-      float wv = W[row_base + k0 + t];
-      acc += wv * local_x[t];
+    // warp reduction
+    #pragma unroll
+    for (int offs = warpSize >> 1; offs > 0; offs >>= 1)
+        acc += __shfl_down(acc, offs);
+
+    if (lane == 0) {
+        float v = acc;
+        if (bias) v += bias[row];
+        out_b[row] = v;
     }
-    __syncthreads();
-  }
-
-  acc = warp_reduce_sum_batched(acc);
-
-  if (lane == 0) {
-    if (bias) {
-      acc += bias[row];
-    }
-    out_batch[row] = acc; // Write to batched output
-  }
 }
 
-__global__ void batched_matmul_kernel(
-  const float *W, const float *x, const float *bias, float *out,
-  int out_features, int in_features, int batch_size
-) {
-  // --- MODIFIED: Use a 2D grid for batching ---
-  int row = blockIdx.x * blockDim.x + threadIdx.x;
-  int batch_idx = blockIdx.y;
-
-  // Bounds check for both output features and batch size
-  if (row >= out_features || batch_idx >= batch_size) {
-    return;
-  }
-
-  // --- MODIFIED: Offset input and output pointers by batch index ---
-  const float *x_batch = x + (size_t)batch_idx * in_features;
-  float *out_batch = out + (size_t)batch_idx * out_features;
-  
-  // --- Core logic remains the same, but uses the new batched pointers ---
-  float sum = 0.0f;
-  const float *W_row = W + (size_t)row * in_features; // W is not batched
-  for (int i = 0; i < in_features; i++) {
-    sum += W_row[i] * x_batch[i]; // Read from the correct batch in 'x'
-  }
-  if (bias != nullptr) {
-    sum += bias[row]; // Bias is not batched
-  }
-  out_batch[row] = sum; // Write to the correct batch in 'out'
-}
-
-void qkv_gemm_batched(
-  Tensor *x,            // Shape: [batch_size, hidden_dim]
-  const Tensor *W_qkv,  // Shape: [out_features, hidden_dim]
-  const Tensor *b_qkv,  // Shape: [out_features]
-  Tensor *qkv,          // Shape: [batch_size, out_features]
-  long long layer_offset, bool x_to_device, bool qkv_from_device,
-  int cur_batch_size, hipStream_t stream
-) {
+void qkv_gemm_batched(Tensor *x,            // Shape: [batch_size, hidden_dim]
+                      const Tensor *W_qkv,  // Shape: [out_features, hidden_dim]
+                      const Tensor *b_qkv,  // Shape: [out_features]
+                      Tensor *qkv,          // Shape: [batch_size, out_features]
+                      long long layer_offset, bool x_to_device, bool qkv_from_device,
+                      hipStream_t stream) {
   GpuTimer timer("qkv_gemm");
   if (x_to_device) {
     x->to_device(stream);
@@ -241,6 +244,7 @@ void qkv_gemm_batched(
 
   // --- MODIFIED: Get dimensions based on batched shapes ---
   // Assuming Tensor has a shape member or method, e.g., x->shape[0]
+  const int batch_size = x->shape[0];
   const int in_features = x->shape[1];   // hidden_dim
   const int out_features = qkv->shape[1];  // 3 * hidden_dim for QKV
 
@@ -255,12 +259,12 @@ void qkv_gemm_batched(
   dim3 block_dim(warpSize, WARPS_PER_BLOCK);
   
   // --- MODIFIED: Use a 2D grid to parallelize across both output features and batch size ---
-  dim3 grid_dim((out_features + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, cur_batch_size);
+  dim3 grid_dim((out_features + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, batch_size);
   size_t shmem_bytes = TILE * sizeof(float);
 
   // Launch the modified kernel with the new batch_size parameter
   gemm_kernel_batched<WARPS_PER_BLOCK, TILE><<<grid_dim, block_dim, shmem_bytes, stream>>>(
-    w_qkv_ptr, x_ptr, b_qkv_ptr, qkv_ptr, out_features, in_features, cur_batch_size);
+    w_qkv_ptr, x_ptr, b_qkv_ptr, qkv_ptr, out_features, in_features, batch_size);
 
   if (qkv_from_device) {
     qkv->from_device(stream);
@@ -270,10 +274,9 @@ void qkv_gemm_batched(
 
 // ---------- Split & RoPE ----------
 __global__ void qkv_split_rope_kernel_batched(
-  float *qkv_out, float *q_out, float *k_pos, float *v_pos,
-  const float *rope_cos_pos, const float *rope_sin_pos,
-  int head_dim, int n_q, int n_kv, int batch_size
-) { // Added batch_size
+    float *qkv_out, float *q_out, float *k_pos, float *v_pos,
+    const float *rope_cos_pos, const float *rope_sin_pos,
+    int head_dim, int n_q, int n_kv, int batch_size) { // Added batch_size
 
   // --- MODIFIED: 2D indexing for batch and feature dimensions ---
   int feature_idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -337,16 +340,15 @@ __global__ void qkv_split_rope_kernel_batched(
   }
 }
 
-void qkv_split_rope_batched(
-  Tensor *qkv_out,             // Shape: [batch_size, (n_q + 2*n_kv)*hd]
-  Tensor *q_out,               // Shape: [batch_size, n_q*hd]
-  Tensor *k_pos,               // Shape: [batch_size, n_kv*hd]
-  Tensor *v_pos,               // Shape: [batch_size, n_kv*hd]
-  const Tensor *rope_cos_pos,  // Shape: [seq_len, hd/2]
-  const Tensor *rope_sin_pos,  // Shape: [seq_len, hd/2]
-  int head_dim, int n_q, int n_kv, int pos, bool qkv_out_to_device,
-  bool q_out_from_device, bool k_out_from_device, bool v_out_from_device,
-  int cur_batch_size, hipStream_t stream
+void qkv_split_rope_batched(Tensor *qkv_out,             // Shape: [batch_size, (n_q + 2*n_kv)*hd]
+                            Tensor *q_out,               // Shape: [batch_size, n_q*hd]
+                            Tensor *k_pos,               // Shape: [batch_size, n_kv*hd]
+                            Tensor *v_pos,               // Shape: [batch_size, n_kv*hd]
+                            const Tensor *rope_cos_pos,  // Shape: [seq_len, hd/2]
+                            const Tensor *rope_sin_pos,  // Shape: [seq_len, hd/2]
+                            int head_dim, int n_q, int n_kv, int pos, bool qkv_out_to_device,
+                            bool q_out_from_device, bool k_out_from_device, bool v_out_from_device,
+                            hipStream_t stream
 ) {
     GpuTimer timer("qkv_split_rope");
   if (qkv_out_to_device) {
@@ -354,6 +356,7 @@ void qkv_split_rope_batched(
   }
 
   // --- MODIFIED: Get batch_size from tensor shape ---
+  const int batch_size = qkv_out->shape[0];
   
   // RoPE table offset is unchanged
   int offset = pos * (head_dim / 2);
@@ -371,12 +374,12 @@ void qkv_split_rope_batched(
   // --- MODIFIED: Launch a 2D grid ---
   // grid.x covers the feature dimension
   // grid.y covers the batch dimension
-  dim3 grid_dim((total_dims_per_batch + block_dim.x - 1) / block_dim.x, cur_batch_size);
+  dim3 grid_dim((total_dims_per_batch + block_dim.x - 1) / block_dim.x, batch_size);
   
   qkv_split_rope_kernel_batched<<<grid_dim, block_dim, 0, stream>>>(
       qkv_out_ptr, q_out_ptr, k_pos_ptr, v_pos_ptr,
       rope_cos_pos_ptr, rope_sin_pos_ptr,
-      head_dim, n_q, n_kv, cur_batch_size); // Pass batch_size to kernel
+      head_dim, n_q, n_kv, batch_size); // Pass batch_size to kernel
 
   if (q_out_from_device)
     q_out->from_device(stream);
@@ -396,12 +399,10 @@ __global__ void add_vector_kernel_batched(float *y, const float *b, int len) {
   }
 }
 
-void add_vector_batched(
-  Tensor *y,  // Shape: [batch_size, hidden_dim]
-  Tensor *b,  // Shape: [batch_size, hidden_dim]
-  bool y_to_device, bool b_to_device, bool y_from_device,
-  hipStream_t stream
-) {
+void add_vector_batched(Tensor *y,  // Shape: [batch_size, hidden_dim]
+                        Tensor *b,  // Shape: [batch_size, hidden_dim]
+                        bool y_to_device, bool b_to_device, bool y_from_device,
+                        hipStream_t stream) {
    GpuTimer timer("add_vector");
   if (y_to_device)
     y->to_device(stream);
@@ -552,18 +553,17 @@ __global__ void batched_attention_kernel_opt(
     }
 }
 
-void single_query_attn_batched(
-  Tensor *q,           // Shape: [batch_size, n_q*hd]
-  Tensor *K_cache,     // Shape: [batch_size, layer, seq_len, kv_dim]
-  Tensor *V_cache,     // Shape: [batch_size, layer, seq_len, kv_dim]
-  Tensor *mask,        // Shape: [batch_size, seq_len, seq_len]
-  Tensor *attn_sinks,  // Shape: [n_layers, n_attn_heads]
-  Tensor *tb,          // Shape: [batch_size, n_q*hd]
-  int head_dim, int n_q, int kv_mul, int kv_dim, int seq_len,
-  int sliding_window, int pos, long long layer_offset, bool q_to_device,
-  bool k_cache_to_device, bool v_cache_to_device, bool mask_to_device,
-  bool tb_from_device, int cur_batch_size, hipStream_t stream
-) {
+void single_query_attn_batched(Tensor *q,           // [B, n_q*hd]
+                               Tensor *K_cache,     // [B, L, S, kv_dim]
+                               Tensor *V_cache,     // [B, L, S, kv_dim]
+                               Tensor *mask,        // [B, S, S] or nullptr
+                               Tensor *attn_sinks,  // [L, n_q]
+                               Tensor *tb,          // [B, n_q*hd]
+                               int head_dim, int n_q, int kv_mul, int kv_dim, int seq_len,
+                               int sliding_window, int pos, long long layer_offset,
+                               bool q_to_device, bool k_cache_to_device, bool v_cache_to_device,
+                               bool mask_to_device, bool tb_from_device, hipStream_t stream)
+{
     GpuTimer timer("single_query_attn_batched");
     if (q_to_device)            q->to_device(stream);
     if (k_cache_to_device)      K_cache->to_device(stream);
@@ -605,20 +605,19 @@ void single_query_attn_batched(
     if (tb_from_device) { tb->from_device(stream); CHECK_HIP(hipStreamSynchronize(stream)); }
 }
 
-void attn_out_project_batched(
-  Tensor *tb,         // Shape: [batch_size, n_q*hd]
-  const Tensor *W_o,  // Shape: [hidden_dim, n_q*hd]
-  const Tensor *b_o,  // Shape: [hidden_dim]
-  Tensor *y,          // Shape: [batch_size, hidden_dim]
-  long long layer_offset, bool tb_to_device, bool y_from_device,
-  int cur_batch_size, hipStream_t stream
-) {
+void attn_out_project_batched(Tensor *tb,         // Shape: [batch_size, n_q*hd]
+                              const Tensor *W_o,  // Shape: [hidden_dim, n_q*hd]
+                              const Tensor *b_o,  // Shape: [hidden_dim]
+                              Tensor *y,          // Shape: [batch_size, hidden_dim]
+                              long long layer_offset, bool tb_to_device, bool y_from_device,
+                              hipStream_t stream) {
   if (tb_to_device) {
     tb->to_device(stream);
   }
   GpuTimer timer("attn_out_project");
   // --- MODIFIED: Get dimensions from batched tensor shapes ---
   // Assumes Tensor has a `shape` member, e.g., tb->shape[0]
+  const int batch_size = tb->shape[0];
   const int n_q_hd = tb->shape[1];  // This is the 'in_features'
   const int hidden = y->shape[1];    // This is the 'out_features'
 
@@ -639,15 +638,14 @@ void attn_out_project_batched(
   // --- MODIFIED: Use a 2D grid for batching ---
   // grid.x handles the output features (hidden_dim)
   // grid.y handles the batch items
-  dim3 grid_dim((hidden + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, 
-                  cur_batch_size);
+  dim3 grid_dim((hidden + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, batch_size);
   
   size_t shmem_bytes = TILE * sizeof(float);
   
   // --- MODIFIED: Call the batched gemm_kernel ---
   gemm_kernel_batched<WARPS_PER_BLOCK, TILE><<<grid_dim, block_dim, shmem_bytes, stream>>>(
-    w_o_ptr, tb_ptr, b_o_ptr, y_ptr, hidden, n_q_hd, cur_batch_size
-  ); // Pass batch_size
+      w_o_ptr, tb_ptr, b_o_ptr, y_ptr, 
+      hidden, n_q_hd, batch_size); // Pass batch_size
 
   if (y_from_device) {
     y->from_device(stream);
@@ -656,78 +654,43 @@ void attn_out_project_batched(
 }
 
 // ---------- Router GEMM ----------
-void router_gemm_batched(
-  const Tensor *w_router,  // Shape: [n_experts, hidden_dim]
-  Tensor *t,               // Shape: [batch_size, hidden_dim]
-  const Tensor *b_router,  // Shape: [n_experts]
-  Tensor *router_scores,   // Shape: [batch_size, n_experts]
-  long long layer_offset, bool t_to_device, bool r_from_device,
-  int cur_batch_size, hipStream_t stream
-) {
-  // Transfer input tensor to the GPU if required
+void router_gemm_batched(const Tensor *w_router,  // [n_experts, hidden_dim]
+                         Tensor *t,               // [B, hidden_dim]
+                         const Tensor *b_router,  // [n_experts]
+                         Tensor *router_scores,   // [B, n_experts]
+                         long long layer_offset, bool t_to_device, bool r_from_device,
+                         hipStream_t stream) {
   GpuTimer timer("router_gemm_batched");
-  if (t_to_device) {
-    t->to_device(stream);
-  }
+  if (t_to_device) t->to_device(stream);
 
-  // Extract dimensions from the input tensors
-  // t shape: [batch_size, hidden_dim]
-  // w_router shape: [n_experts, hidden_dim]
-  // router_score shape: [batch_size, n_experts]
-  const long long hidden_dim = t->shape[1];
-  const long long n_experts = router_scores->shape[1];
+  const int B = (int)t->shape[0];
+  const int H = (int)t->shape[1];
+  const int E = (int)router_scores->shape[1];
 
-  // Get raw device pointers for weights, biases, input, and output
-  // Apply the layer offset to select the correct weights and biases for the current layer
-  const float *w_router_ptr = (float *)w_router->d_buf + 1ll * layer_offset * n_experts * hidden_dim;
-  const float *b_router_ptr = (float *)b_router->d_buf + 1ll * layer_offset * n_experts;
-  const float *t_ptr = (float *)t->d_buf;
-  float *r_ptr = (float *)router_scores->d_buf;
+  const float *W = (const float*)w_router->d_buf + 1ll * layer_offset * E * H;
+  const float *b = (const float*)b_router->d_buf + 1ll * layer_offset * E;
+  const float *X = (const float*)t->d_buf;
+  float *R       = (float*)router_scores->d_buf;
 
-  // --- Kernel Launch Configuration ---
+  // tuned like qkv/classifier
+  constexpr int WARPS_PER_BLOCK = 16;
+  constexpr int TILE            = 1024;
 
-  // Define tuning parameters for the kernel. These should match the kernel's template arguments.
-  const int WARPS_PER_BLOCK = 4;  // Number of warps per thread block in the y-dimension
-  const int TILE = 4;           // Size of the tile loaded into shared memory
-  const int warpSize = 64;        // Number of threads in a warp (GPU architecture dependent)
-
-  // Configure the thread block dimensions.
-  // Each block has `warpSize` threads in the x-dimension and `WARPS_PER_BLOCK` in the y-dimension.
   dim3 block_dim(warpSize, WARPS_PER_BLOCK);
+  dim3 grid_dim((E + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, B);
+  size_t shmem = TILE * sizeof(float);
 
-  // Configure the grid dimensions.
-  // The grid's x-dimension is calculated to cover all `n_experts` (output features).
-  // The grid's y-dimension is set to `batch_size`, so each `blockIdx.y` corresponds to a batch item.
-  dim3 grid_dim((n_experts + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, cur_batch_size);
+  gemm_kernel_batched<WARPS_PER_BLOCK, TILE>
+      <<<grid_dim, block_dim, shmem, stream>>>(W, X, b, R, E, H, B);
 
-  // Calculate the required dynamic shared memory for the tile.
-  size_t shared_mem_size = TILE * sizeof(float);
-
-  // Launch the batched GEMM kernel
-  gemm_kernel_batched<WARPS_PER_BLOCK, TILE><<<grid_dim, block_dim, shared_mem_size, stream>>>(
-    w_router_ptr,   // W (weights)
-    t_ptr,          // x (input)
-    b_router_ptr,   // bias
-    r_ptr,          // out (output)
-    n_experts,      // out_features
-    hidden_dim,     // in_features
-    cur_batch_size      // batch_size
-  );
-
-  // --- End Kernel Launch ---
-
-  // Transfer the results back from the GPU if required and synchronize the stream
-  if (r_from_device) {
-    router_scores->from_device(stream);
-    CHECK_HIP(hipStreamSynchronize(stream));
-  }
+  CHECK_HIP(hipGetLastError());
+  if (r_from_device) { router_scores->from_device(stream); CHECK_HIP(hipStreamSynchronize(stream)); }
 }
 
+
 // ---------- TopK + softmax(k) ----------
-__global__ void batched_topk_softmax_kernel(
-  const float *r, int batch_size, int n_experts, int k,
-  float *topk_vals, int *topk_idx
-) {
+__global__ void batched_topk_softmax_kernel(const float *r, int batch_size, int n_experts, int k,
+                                          float *topk_vals, int *topk_idx) {
   // Each block processes one item in the batch
   int batch_idx = blockIdx.x;
 
@@ -796,21 +759,21 @@ __global__ void batched_topk_softmax_kernel(
   }
 }
 
-void topk_softmax_batched(
-  Tensor *r,            // Shape: [batch_size, n_experts]
-  Tensor *topk_vals,    // Shape: [batch_size, k]
-  TensorI32 *topk_idx,  // Shape: [batch_size, k]
-  bool r_to_device, bool topk_vals_from_device, bool topk_idx_from_device,
-  int cur_batch_size, hipStream_t stream
-) {
+void topk_softmax_batched(Tensor *r,            // Shape: [batch_size, n_experts]
+                          Tensor *topk_vals,    // Shape: [batch_size, k]
+                          TensorI32 *topk_idx,  // Shape: [batch_size, k]
+                          bool r_to_device, bool topk_vals_from_device, bool topk_idx_from_device,
+                          hipStream_t stream) 
+{
     GpuTimer timer("topk_softmax_batched");
   if (r_to_device) {
-    r->to_device(stream);
+      r->to_device(stream);
   }
 
   // Extract dimensions from tensor shapes
   // r shape: [batch_size, n_experts]
   // topk_idx shape: [batch_size, k]
+  const int batch_size = r->shape[0];
   const int num_experts = r->shape[1];
   const int experts_per_token = topk_idx->shape[1]; // This is 'k'
 
@@ -825,55 +788,24 @@ void topk_softmax_batched(
   // Configure kernel launch:
   // Grid dimension is the batch_size to process all items in parallel.
   // Block dimension is 1 since one thread does the work within the block.
-  dim3 grid_dim(cur_batch_size, 1, 1);
+  dim3 grid_dim(batch_size, 1, 1);
   dim3 block_dim(1, 1, 1);
 
   batched_topk_softmax_kernel<<<grid_dim, block_dim, shared_mem_size, stream>>>(
-    r_ptr, cur_batch_size, num_experts, experts_per_token,
-    topk_vals_ptr, topk_idx_ptr
-  );
+      r_ptr, batch_size, num_experts, experts_per_token, topk_vals_ptr, topk_idx_ptr);
   
   CHECK_HIP(hipGetLastError());
 
   // Data transfer and synchronization logic remains the same
   if (topk_vals_from_device) {
-    topk_vals->from_device(stream);
+      topk_vals->from_device(stream);
   }
   if (topk_idx_from_device) {
-    topk_idx->from_device(stream);
+      topk_idx->from_device(stream);
   }
   if (topk_vals_from_device || topk_idx_from_device) {
-    CHECK_HIP(hipStreamSynchronize(stream));
+      CHECK_HIP(hipStreamSynchronize(stream));
   }                 
-}
-
-// ---------- MoE apply TopK  ----------
-__global__ void SwiGLU_kernel_batched(
-  const float *interleaved_in, float *swiglu_out, int inter_dim,
-  float clamp_limit
-) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < inter_dim) {
-    float gate_val = interleaved_in[2 * i];
-    float up_val = interleaved_in[2 * i + 1];
-
-    const float alpha = 1.702f;
-
-    // 1. Clamping
-    if (clamp_limit > 0.0f) {
-      if (gate_val > clamp_limit)
-        gate_val = clamp_limit;
-
-      if (up_val > clamp_limit)
-        up_val = clamp_limit;
-      if (up_val < -clamp_limit)
-        up_val = -clamp_limit;
-    }
-
-    float silu_val = gate_val * (1.0f / (1.0f + expf(-alpha * gate_val)));
-
-    swiglu_out[i] = silu_val * (up_val + 1.0f);
-  }
 }
 
 // ---------- MoE----------
@@ -996,7 +928,6 @@ __global__ void weighted_accumulate_noatom_batched(
     out[(size_t)b * H + h] += acc;
 }
 
-// ------- Wrapper (same signature you use) -------
 void moe_apply_topk_batched(
   Tensor *t,            // [B,H]
   const Tensor *W1,     // [L,E,2I,H] (bf16)
@@ -1009,10 +940,10 @@ void moe_apply_topk_batched(
   Tensor *gate_up,      // [B,k,I]
   Tensor *tb3,          // [B,k,H]
   Tensor *e_agg,        // [B,H]
-  float clamp_limit, long long layer_offset, bool t_to_device,
-  bool topk_idx_to_device, bool topk_vals_to_device, bool e_agg_from_device,
-  int cur_batch_size, hipStream_t stream
-) {
+  float clamp_limit, long long layer_offset,
+  bool t_to_device, bool topk_idx_to_device, bool topk_vals_to_device,
+  bool e_agg_from_device, hipStream_t stream)
+{
     GpuTimer timer("moe_apply_topk_batched");
     if (t_to_device)           t->to_device(stream);
     if (topk_idx_to_device)    topk_idx->to_device(stream);
@@ -1089,52 +1020,55 @@ void moe_apply_topk_batched(
 }
 
 // ---------- Classifier & Residuals ----------
-void classifier_gemm_batched(
-  const Tensor *W_out,  // Shape: [vocab_size, hidden_dim]
-  Tensor *x,            // Shape: [batch_size, hidden_dim]
-  Tensor *logits,       // Shape: [batch_size, vocab_size]
-  bool x_to_device, bool logits_from_device, int cur_batch_size,
-  hipStream_t stream
-) {
+void classifier_gemm_batched(const Tensor *W_out,  // Shape: [vocab_size, hidden_dim]
+                             Tensor *x,            // Shape: [batch_size, hidden_dim]
+                             Tensor *logits,       // Shape: [batch_size, vocab_size]
+                             bool x_to_device, bool logits_from_device, hipStream_t stream) {
    GpuTimer timer("classifier_batched");
     if (x_to_device) {
         x->to_device(stream);
     }
 
-  // Extract dimensions from tensor shapes
-  const int hidden_dim = x->shape[1];
-  const int vocab_size = W_out->shape[0];
+    // Extract dimensions from tensor shapes
+    const int batch_size = x->shape[0];
+    const int hidden_dim = x->shape[1];
+    const int vocab_size = W_out->shape[0];
 
-  // Get raw device pointers
-  const float *W_out_ptr = (float *)W_out->d_buf;
-  const float *x_ptr = (float *)x->d_buf;
-  float *logits_ptr = (float *)logits->d_buf;
+    // Get raw device pointers
+    const float *W_out_ptr = (float *)W_out->d_buf;
+    const float *x_ptr = (float *)x->d_buf;
+    float *logits_ptr = (float *)logits->d_buf;
 
-  // Define kernel launch configuration constants
-  constexpr int WARPS_PER_BLOCK = 16;
-  constexpr int TILE = 1024; // Assumed size for shared memory optimization
+    // Define kernel launch configuration constants
+    constexpr int WARPS_PER_BLOCK = 16;
+    constexpr int TILE = 1024; // Assumed size for shared memory optimization
 
-  // Each block has `warpSize` x `WARPS_PER_BLOCK` threads
-  dim3 block_dim(warpSize, WARPS_PER_BLOCK);
-  
-  // The grid is 2D:
-  // - The x-dimension covers the vocabulary size.
-  // - The y-dimension covers the batch size.
-  // This maps each matrix-vector multiplication in the batch to a row of blocks.
-  dim3 grid_dim((vocab_size + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, cur_batch_size);
-  
-  // Shared memory is likely used by the kernel to cache the input vector `x` for faster access.
-  size_t shmem_bytes = TILE * sizeof(float);
+    // Each block has `warpSize` x `WARPS_PER_BLOCK` threads
+    dim3 block_dim(warpSize, WARPS_PER_BLOCK);
+    
+    // The grid is 2D:
+    // - The x-dimension covers the vocabulary size.
+    // - The y-dimension covers the batch size.
+    // This maps each matrix-vector multiplication in the batch to a row of blocks.
+    dim3 grid_dim((vocab_size + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, batch_size);
+    
+    // Shared memory is likely used by the kernel to cache the input vector `x` for faster access.
+    size_t shmem_bytes = TILE * sizeof(float);
 
-  // Launch the batched GEMM kernel
-  gemm_kernel_batched<WARPS_PER_BLOCK, TILE><<<grid_dim, block_dim, shmem_bytes, stream>>>(
-    W_out_ptr, x_ptr, nullptr, // No bias is used in this operation
-    logits_ptr, vocab_size, hidden_dim, cur_batch_size
-  );
+    // Launch the batched GEMM kernel
+    gemm_kernel_batched<WARPS_PER_BLOCK, TILE><<<grid_dim, block_dim, shmem_bytes, stream>>>(
+        W_out_ptr, 
+        x_ptr, 
+        nullptr,       // No bias is used in this operation
+        logits_ptr, 
+        vocab_size, 
+        hidden_dim,
+        batch_size
+    );
 
-  if (logits_from_device) {
-    logits->from_device(stream);
-    // Block until the kernel and data transfer are complete
-    CHECK_HIP(hipStreamSynchronize(stream));
-  }
+    if (logits_from_device) {
+        logits->from_device(stream);
+        // Block until the kernel and data transfer are complete
+        CHECK_HIP(hipStreamSynchronize(stream));
+    }
 }

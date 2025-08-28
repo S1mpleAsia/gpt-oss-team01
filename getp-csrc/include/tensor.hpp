@@ -12,8 +12,8 @@ using std::vector;
 typedef hip_bfloat16 bf16;
 
 #define RUN_BATCH
-#define BATCH_SIZE 2
-#define PRINT_LOGITS
+#define BATCH_SIZE 16
+// #define PRINT_LOGITS
 // #define TIME_GPU
 
 struct DType {
@@ -21,7 +21,6 @@ struct DType {
 };
 
 // #define DEBUG
-#define PRINT_LOGITS
 
 #define CHECK_HIP(call)                                                                            \
   do {                                                                                             \

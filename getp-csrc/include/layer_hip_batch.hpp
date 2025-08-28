@@ -9,7 +9,7 @@ void embedding_lookup_batched(
   Tensor *embedding,  // Shape: [vocab_size, hidden_dim]
   int *tokens,        // Shape: [batch_size]
   Tensor *x,          // Shape: [batch_size, hidden_dim]
-  bool x_from_device, int cur_batch_size, hipStream_t stream = 0
+  bool x_from_device, hipStream_t stream = 0
 );
 
 // ---------- RMSNorm ----------
@@ -18,7 +18,7 @@ void rmsnorm_batched(
   Tensor *w,    // Shape: [hidden_dim]
   Tensor *out,  // Shape: [batch_size, hidden_dim]
   long long layer_offset, bool x_to_device, bool out_from_device,
-  int cur_batch_size, float eps = 1e-5f, hipStream_t stream = 0
+  float eps = 1e-5f, hipStream_t stream = 0
 );
 
 // ---------- QKV GEMM ----------
@@ -28,7 +28,7 @@ void qkv_gemm_batched(
   const Tensor *b_qkv,  // Shape: [out_features]
   Tensor *qkv,          // Shape: [batch_size, out_features]
   long long layer_offset, bool x_to_device, bool qkv_from_device,
-  int cur_batch_size, hipStream_t stream = 0
+  hipStream_t stream = 0
 );
 
 // ---------- Split & RoPE ----------
@@ -41,7 +41,7 @@ void qkv_split_rope_batched(
   const Tensor *rope_sin_pos,  // Shape: [seq_len, hd/2]
   int head_dim, int n_q, int n_kv, int pos, bool qkv_out_to_device,
   bool q_out_from_device, bool k_out_from_device, bool v_out_from_device,
-  int cur_batch_size, hipStream_t stream = 0
+  hipStream_t stream = 0
 );
 
 void add_vector_batched(
@@ -62,7 +62,7 @@ void single_query_attn_batched(
   int head_dim, int n_q, int kv_mul, int kv_dim, int seq_len,
   int sliding_window, int pos, long long layer_offset, bool q_to_device,
   bool k_cache_to_device, bool v_cache_to_device, bool mask_to_device,
-  bool tb_from_device, int cur_batch_size, hipStream_t stream = 0
+  bool tb_from_device, hipStream_t stream = 0
 );
 
 void attn_out_project_batched(
@@ -71,7 +71,7 @@ void attn_out_project_batched(
   const Tensor *b_o,  // Shape: [hidden_dim]
   Tensor *y,          // Shape: [batch_size, hidden_dim]
   long long layer_offset, bool tb_to_device, bool y_from_device,
-  int cur_batch_size, hipStream_t stream = 0
+  hipStream_t stream = 0
 );
 
 // ---------- Router GEMM ----------
@@ -81,7 +81,7 @@ void router_gemm_batched(
   const Tensor *b_router,  // Shape: [n_experts]
   Tensor *router_scores,   // Shape: [batch_size, n_experts]
   long long layer_offset, bool t_to_device, bool r_from_device,
-  int cur_batch_size, hipStream_t stream = 0
+  hipStream_t stream = 0
 );
 
 // ---------- TopK + softmax(k) ----------
@@ -90,7 +90,7 @@ void topk_softmax_batched(
   Tensor *topk_vals,    // Shape: [batch_size, k]
   TensorI32 *topk_idx,  // Shape: [batch_size, k]
   bool r_to_device, bool topk_vals_from_device, bool topk_idx_from_device,
-  int cur_batch_size, hipStream_t stream = 0
+  hipStream_t stream = 0
 );
 
 // ---------- MoE apply TopK  ----------
@@ -108,7 +108,7 @@ void moe_apply_topk_batched(
   Tensor *e_agg,        // Shape [batch_size, hidden_dim]
   float clamp_limit, long long layer_offset, bool t_to_device,
   bool topk_idx_to_device, bool topk_vals_to_device, bool e_agg_from_device,
-  int cur_batch_size, hipStream_t stream = 0
+  hipStream_t stream = 0
 );
 
 // ---------- Classifier & Residuals ----------
@@ -116,6 +116,5 @@ void classifier_gemm_batched(
   const Tensor *W_out,  // Shape: [vocab_size, hidden_dim]
   Tensor *x,            // Shape: [batch_size, hidden_dim]
   Tensor *logits,       // Shape: [batch_size, vocab_size]
-  bool x_to_device, bool logits_from_device, int cur_batch_size,
-  hipStream_t stream = 0
+  bool x_to_device, bool logits_from_device, hipStream_t stream = 0
 );
