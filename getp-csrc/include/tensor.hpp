@@ -31,10 +31,11 @@ struct Tensor {
   void *d_buf = nullptr;  // Unified device pointer
   DType::Type dtype;
   bool owns_host_buf;
+  int gpu_id;  // Add this line
 
-  Tensor(const vector<size_t> &shape_, DType::Type dtype = DType::FP32);
-  Tensor(const vector<size_t> &shape_, float *buf_, DType::Type dtype = DType::FP32);
-  Tensor(const vector<size_t> &shape_, float *buf_, bool batch_alloc, DType::Type dtype = DType::FP32);
+  Tensor(const vector<size_t> &shape_, int gpu_id, DType::Type dtype = DType::FP32);
+  Tensor(const vector<size_t> &shape_, float *buf_, int gpu_id, DType::Type dtype = DType::FP32);
+  Tensor(const vector<size_t> &shape_, float *buf_, bool batch_alloc, int gpu_id, DType::Type dtype = DType::FP32);
   ~Tensor();
 
   size_t num_elem() const;
@@ -42,8 +43,8 @@ struct Tensor {
   void printShape(const std::string &descr) const;
   void reshape(const vector<int> &shape_);
 
-  void to_device(hipStream_t stream = 0);
-  void from_device(hipStream_t stream = 0);
+  void to_device(hipStream_t stream = 0, bool set_device = false);
+  void from_device(hipStream_t stream = 0, bool set_device = false);
 };
 
 struct TensorI32 {
@@ -52,14 +53,15 @@ struct TensorI32 {
   int *buf = nullptr;
   int *d_buf = nullptr;  // Device buffer
   bool owns_host_buf;
+  int gpu_id;
 
-  TensorI32(const vector<size_t> &shape_);
-  TensorI32(const vector<size_t> &shape_, int *buf_);
+  TensorI32(const vector<size_t> &shape_, int gpu_id);
+  TensorI32(const vector<size_t> &shape_, int *buf_, int gpu_id);
   ~TensorI32();
 
   size_t num_elem() const;
   void reshape(const vector<int> &shape_);
 
-  void to_device(hipStream_t stream = 0);
-  void from_device(hipStream_t stream = 0);
+  void to_device(hipStream_t stream = 0, bool set_device = false);
+  void from_device(hipStream_t stream = 0, bool set_device = false);
 };
