@@ -5,7 +5,6 @@
 #include <cstring>
 
 #include "tensor.hpp"
-#include "config_run.hpp"
 
 Tensor *cos_tensor, *sin_tensor;
 
