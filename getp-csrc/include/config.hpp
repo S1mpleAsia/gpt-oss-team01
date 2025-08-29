@@ -87,9 +87,7 @@ typedef struct {
 
 typedef struct {
   int id;
-  Transformer *transformer;
-  Tokenizer *tokenizer;
-  Sampler *sampler;
-  Requests *reqs;
-  long long *local_token_count;
+  long long *local_token_ptr;
+  int start_idx;
+  int end_idx;
 } ThreadArgs;
