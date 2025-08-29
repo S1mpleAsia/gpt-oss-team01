@@ -32,7 +32,6 @@ float *forward_gpu_20b_batched(Config *p, OurTransformerWeights *weights_total, 
                           p->n_kv_heads, pos, false, false, false, false);
 
     // Store k, v in cache
-    #pragma omp parallel for
     for (int b = 0; b < cur_batch_size; b++) {
       memcpy_tensor(rs->key_cache, rs->k, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim, 1ll * b * kv_dim, kv_dim, false, true);
       memcpy_tensor(rs->value_cache, rs->v, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim, 1ll * b * kv_dim, kv_dim, false, true);

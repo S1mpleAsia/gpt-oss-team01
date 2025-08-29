@@ -217,7 +217,6 @@ long long batched_getp_generate(
     float *batch_logits =
       forward_gpu_20b_batched(public_config, weights, rs, current_tokens.data(), pos, batch_size, flow_id);
 
-  #pragma omp parallel for
     for (int i = 0; i < batch_size; i++) {
       if (!active[i])
         continue;
