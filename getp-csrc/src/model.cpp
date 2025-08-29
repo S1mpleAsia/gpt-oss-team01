@@ -2,8 +2,11 @@
 #include <cmath>
 #include <cstring>
 
-float *forward_gpu_20b_batched(Config *p, OurTransformerWeights *weights, OurRunState *rs,
-                               int *tokens, int pos, int cur_batch_size) {
+float *forward_gpu_20b_batched(Config *p, OurTransformerWeights *weights_total, OurRunState *rs_total,
+                               int *tokens, int pos, int cur_batch_size, int flow_id) {
+  OurTransformerWeights *weights = &weights_total[flow_id];
+  OurRunState *rs = &rs_total[flow_id];
+  
   // copy the token embedding into x
   embedding_lookup_batched(weights->token_embedding_table, tokens, rs->x, false);
 
@@ -24,11 +27,11 @@ float *forward_gpu_20b_batched(Config *p, OurTransformerWeights *weights, OurRun
     qkv_gemm_batched(rs->t, weights->w_qkv, weights->b_qkv, rs->qkv, 1ll * l, false, false);  // This kernel diverges the most
 
     // Separate q, k, v + RoPE
-    qkv_split_rope_batched(rs->qkv, rs->q, rs->k, rs->v, cos_tensor, sin_tensor, p->head_dim,
-                   p->n_attn_heads, p->n_kv_heads, pos, false, false, false, false);
+    qkv_split_rope_batched(rs->qkv, rs->q, rs->k, rs->v, rs->cos_tensor,
+                          rs->sin_tensor, p->head_dim, p->n_attn_heads,
+                          p->n_kv_heads, pos, false, false, false, false);
 
     // Store k, v in cache
-    #pragma omp parallel for
     for (int b = 0; b < cur_batch_size; b++) {
       memcpy_tensor(rs->key_cache, rs->k, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim, 1ll * b * kv_dim, kv_dim, false, true);
       memcpy_tensor(rs->value_cache, rs->v, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim, 1ll * b * kv_dim, kv_dim, false, true);
@@ -98,8 +101,9 @@ float *forward_gpu_20b(Config *p, OurTransformerWeights *weights, OurRunState *r
              false);  // This kernel diverges the most
 
     // Separate q, k, v + RoPE
-    qkv_split_rope(rs->qkv, rs->q, rs->k, rs->v, cos_tensor, sin_tensor, p->head_dim,
-                   p->n_attn_heads, p->n_kv_heads, pos, false, false, false, false);
+    qkv_split_rope(rs->qkv, rs->q, rs->k, rs->v, rs->cos_tensor,
+                  rs->sin_tensor, p->head_dim, p->n_attn_heads, p->n_kv_heads,
+                  pos, false, false, false, false);
 
     // Store k, v in cache
     memcpy_tensor(rs->key_cache, rs->k, loff + 1ll * pos * p->n_kv_heads * p->head_dim, 0,
@@ -168,8 +172,8 @@ float *forward_cpu_20b(Config *p, OurTransformerWeights *weights, OurRunState *r
 
     // Separate q, k, v + apply RoPE
     SplitQKV(rs->qkv, p->head_dim, p->n_attn_heads, p->n_kv_heads, rs->q, rs->k, rs->v);
-    ApplyRotary(rs->q, cos_tensor, sin_tensor, p->n_attn_heads, p->head_dim, pos);
-    ApplyRotary(rs->k, cos_tensor, sin_tensor, p->n_kv_heads, p->head_dim, pos);
+    ApplyRotary(rs->q, rs->cos_tensor, rs->sin_tensor, p->n_attn_heads, p->head_dim, pos);
+    ApplyRotary(rs->k, rs->cos_tensor, rs->sin_tensor, p->n_kv_heads, p->head_dim, pos);
 
     // Store k, v in cache
     memcpy(rs->key_cache->buf + loff + 1ll * pos * p->n_kv_heads * p->head_dim, rs->k->buf,
