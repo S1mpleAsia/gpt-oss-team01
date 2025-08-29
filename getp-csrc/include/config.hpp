@@ -5,7 +5,6 @@
 #include <cstring>
 
 #include "tensor.hpp"
-#include "config_run.hpp"
 
 #define RUN_BATCH
 #define BATCH_SIZE 4
