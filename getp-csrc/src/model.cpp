@@ -2,8 +2,11 @@
 #include <cmath>
 #include <cstring>
 
-float *forward_gpu_20b_batched(Config *p, OurTransformerWeights *weights, OurRunState *rs,
-                               int *tokens, int pos, int cur_batch_size) {
+float *forward_gpu_20b_batched(Config *p, OurTransformerWeights *weights_total, OurRunState *rs_total,
+                               int *tokens, int pos, int cur_batch_size, int flow_id) {
+  OurTransformerWeights *weights = &weights_total[flow_id];
+  OurRunState *rs = &rs_total[flow_id];
+  
   // copy the token embedding into x
   embedding_lookup_batched(weights->token_embedding_table, tokens, rs->x, false);
 

@@ -28,6 +28,7 @@ __device__ __forceinline__ void bf16x2_to_f32(uint32_t packed, float &f0, float 
 }
 
 
+/*
 __device__ float block_reduce_sum(float val) {
     // A block can have multiple warps.
     // Each warp reduces its values, then one thread from each warp writes its sum to shared memory.
@@ -51,6 +52,7 @@ __device__ float block_reduce_sum(float val) {
     
     return val; // The final sum is in lane 0 of the first warp
 }
+*/
 
 void embedding_lookup_batched(Tensor *embedding,  // Shape: [vocab_size, hidden_dim]
                               int *tokens,        // Shape: [batch_size]
@@ -866,7 +868,7 @@ __global__ void moe_mm_bf16w_xcached(
         for (int i = lane; i < in_features; i += WARP_SIZE) {
             sum += (float)W_row[i] * x_sh[i];
         }
-        sum = warp_reduce_sum(sum);
+        sum = warp_reduce_sum_batched(sum);
 
         if (lane == 0) {
             float y = sum;

@@ -8,7 +8,7 @@
 #include "config_run.hpp"
 
 #define RUN_BATCH
-#define BATCH_SIZE 16
+#define BATCH_SIZE 4
 // #define PRINT_LOGITS
 // #define TIME_GPU
 // #define DEBUG
@@ -85,4 +85,11 @@ typedef struct {
   Tensor *mask;
 } OurRunState;
 
-
+typedef struct {
+  int id;
+  Transformer *transformer;
+  Tokenizer *tokenizer;
+  Sampler *sampler;
+  Requests *reqs;
+  long long *local_token_count;
+} ThreadArgs;

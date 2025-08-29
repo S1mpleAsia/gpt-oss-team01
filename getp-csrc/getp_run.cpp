@@ -2,20 +2,12 @@
 #include "getp_eval.cpp"
 
 #include "src/tensor.cpp"
-#include "include/tensor.hpp"
 #include "src/layer.cpp"
-#include "include/layer.hpp"
 #include "src/layer_hip.cpp"
-#include "include/layer_hip.hpp"
 #include "src/layer_hip_batch.cpp"
-#include "include/layer_hip_batch.hpp"
 #include "src/model.cpp"
-#include "include/model.hpp"
 #include "src/alloc.cpp"
-#include "include/alloc.hpp"
 #include "src/utils.cpp"
-#include "include/utils.hpp"
-#include "include/config.hpp"
 
 #ifndef GETP_RUN
 #define GETP_RUN
@@ -36,11 +28,11 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 
   if (TOTAL_GPUS_NEEDED != actualGPUs) {
     fprintf(stderr, "Error: Required %d GPUs, but only %d available.\n", TOTAL_GPUS_NEEDED, actualGPUs);
-    return EXIT_FAILURE;
+    exit(1);
   }
 
-  weights = new OurTransformerWeights;
-  rs = new OurRunState;
+  weights = new OurTransformerWeights[TOTAL_GPUS_NEEDED];
+  rs = new OurRunState[TOTAL_GPUS_NEEDED];
   p = &transformer->config;
   our_init(transformer, weights, rs);
 }
@@ -172,7 +164,7 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer, Sampler *sam
 
 long long batched_getp_generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
                                 const std::vector<const char *> &input_batch,
-                                const std::vector<int *> &output_batch, int steps) {
+                                const std::vector<int *> &output_batch, int steps, int flow_id) {
   Config *p = &transformer->config;
 
   const int batch_size = input_batch.size();
@@ -211,9 +203,9 @@ long long batched_getp_generate(Transformer *transformer, Tokenizer *tokenizer, 
 
   for (int pos = 0; pos < steps && active_count > 0; ++pos) {
     float *batch_logits =
-      forward_gpu_20b_batched(p, weights, rs, current_tokens.data(), pos, batch_size);
+      forward_gpu_20b_batched(p, weights, rs, current_tokens.data(), pos, batch_size, flow_id);
 
-  #pragma omp parallel for
+  // #pragma omp parallel for
     for (int i = 0; i < batch_size; i++) {
       if (!active[i])
         continue;
@@ -279,31 +271,102 @@ long long batched_getp_generate(Transformer *transformer, Tokenizer *tokenizer, 
   return total_generate_tokens;
 }
 
-long long inference(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
+long long inference_old(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
                     Requests *requests) {
   long long num_token_out = 0;
 
   for (int start_idx = 0; start_idx < requests->num_reqs; start_idx += BATCH_SIZE) {
     int current_size = BATCH_SIZE;
     if (start_idx + BATCH_SIZE > requests->num_reqs) {
-      current_size = requests->num_reqs - BATCH_SIZE;
+      current_size = requests->num_reqs - start_idx;
     }
 
     vector<const char *> input_batch;
     vector<int *> output_batch;
 
     for (int i = 0; i < current_size; i++) {
-      input_batch.push_back(get_str_req_ptr(requests, start_idx + i));
-      output_batch.push_back(get_tok_gen_ptr(requests, start_idx + i));
+      input_batch.push_back(get_str_req_ptr(requests, i + start_idx));
+      output_batch.push_back(get_tok_gen_ptr(requests, i + start_idx));
     }
 
     // const char *input_seq = get_str_req_ptr(requests, idx);
     // int *output_tokens = get_tok_gen_ptr(requests, idx);
     num_token_out += batched_getp_generate(transformer, tokenizer, sampler, input_batch,
-                                           output_batch, requests->max_seq_len);
+                                           output_batch, requests->max_seq_len, 0);
   }
   return num_token_out;
 }
+
+void *thread_handler(void *arg) {
+  ThreadArgs *args = (ThreadArgs *)arg;
+  int id = args->id;
+
+  int total_reqs = args->reqs->num_reqs;
+  int chunk_size = (total_reqs + TOTAL_GPUS_NEEDED - 1) / TOTAL_GPUS_NEEDED;
+
+  int start_idx = id * chunk_size;
+  int end_idx = min(start_idx + chunk_size, total_reqs);
+
+  long long local_token_count = 0ll;
+
+  CHECK_HIP(hipSetDevice(id));
+
+  for (int i = start_idx; i < end_idx; i += BATCH_SIZE) {
+    int current_size = BATCH_SIZE;
+    if (start_idx + BATCH_SIZE > end_idx) {
+      current_size = end_idx - i;
+    }
+
+    vector<const char *> input_batch;
+    vector<int *> output_batch;
+
+    for (int j = 0; j < current_size; j++) {
+      input_batch.push_back(get_str_req_ptr(args->reqs, i + j));
+      output_batch.push_back(get_tok_gen_ptr(args->reqs, i + j));
+    }
+
+    // const char *input_seq = get_str_req_ptr(requests, idx);
+    // int *output_tokens = get_tok_gen_ptr(requests, idx);
+    local_token_count += batched_getp_generate(
+      args->transformer, args->tokenizer, args->sampler,
+      input_batch, output_batch, args->reqs->max_seq_len, id);
+  }
+
+  *(args->local_token_count) = local_token_count; 
+
+  return nullptr;
+}
+
+long long inference(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
+                    Requests *requests) {
+  long long num_token_out = 0;
+  pthread_t threads[TOTAL_GPUS_NEEDED];
+  long long token_counts[TOTAL_GPUS_NEEDED];
+  ThreadArgs args[TOTAL_GPUS_NEEDED];
+
+  for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
+    args[i].id = i;
+    args[i].transformer = transformer;
+    args[i].tokenizer = tokenizer;
+    args[i].sampler = sampler;
+    args[i].reqs = requests;
+    args[i].local_token_count = &token_counts[i];
+
+    pthread_create(&threads[i], NULL, thread_handler, (void *)&args[i]);
+  }
+
+  for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
+    pthread_join(threads[i], NULL);
+    num_token_out += *(args[i].local_token_count);
+  }
+
+  printf("Total tokens generated: %lld\n", num_token_out);
+  fflush(stdout);
+
+  return num_token_out;
+}
+
+
 #endif
 
 #endif  // GETP_RUN

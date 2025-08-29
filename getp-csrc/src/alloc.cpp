@@ -97,11 +97,13 @@ void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunSt
   TransformerWeights *w = &transformer->weights;
   RunState *s = &transformer->state;
 
-  our_init_weights(w, p, weights, 0);
-  our_init_run_state(s, p, rs, 0);
+  for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
+    our_init_weights(w, p, &weights[i], i);
+    our_init_run_state(s, p, &rs[i], i);
+  }
 }
 
-void our_free(OurTransformerWeights *weights, OurRunState *rs) {
+void our_free_each(OurTransformerWeights *weights, OurRunState *rs) {
   // weights
   delete weights->token_embedding_table;
   delete weights->rms_attn_w;
@@ -146,4 +148,14 @@ void our_free(OurTransformerWeights *weights, OurRunState *rs) {
   // Others
   delete rs->cos_tensor;
   delete rs->sin_tensor;
+}
+
+void our_free(OurTransformerWeights *weights, OurRunState *rs) {
+  for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
+    fprintf(stderr, "Freeing weights and run state of id %d\n", i);
+    CHECK_HIP(hipSetDevice(i));
+    our_free_each(&weights[i], &rs[i]);
+    fprintf(stderr, "Finish freeing weights and run state of id %d, moving on to actual pointer\n", i);
+    fprintf(stderr, "Finish everything id %d\n", i);
+  }
 }
