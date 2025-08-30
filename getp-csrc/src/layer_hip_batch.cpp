@@ -31,6 +31,77 @@ __global__ void f32_to_bf16_row(const float* __restrict__ src, bf16* __restrict_
 }
 
 template<int WARPS_PER_BLOCK, int TILE>
+__global__ void gemm_kernel_batched_accum_bf16W(
+    const bf16* __restrict__ W,      // [out_features, in_features] (bf16)
+    const float* __restrict__ x,     // [B, in_features]
+    const float* __restrict__ bias,  // [out_features] or nullptr
+    float* __restrict__ res,         // [B, out_features]  (ACCUMULATE HERE)
+    int out_features, int in_features, int batch_size)
+{
+    extern __shared__ float s_x[];   // TILE floats
+
+    const int b    = blockIdx.y;
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int row  = blockIdx.x * WARPS_PER_BLOCK + warp;
+
+    if (b >= batch_size || row >= out_features) return;
+
+    const float* __restrict__ x_b    = x   + (size_t)b * in_features;
+    float*       __restrict__ res_b  = res + (size_t)b * out_features;
+    const bf16*  __restrict__ W_row  = W   + (size_t)row * in_features;
+
+    float acc = 0.0f;
+
+    for (int k0 = 0; k0 < in_features; k0 += TILE) {
+        const int tile_len = min(TILE, in_features - k0);
+        for (int t = warp * warpSize + lane; t < tile_len; t += WARPS_PER_BLOCK * warpSize)
+            s_x[t] = x_b[k0 + t];
+        __syncthreads();
+
+        const int pack = 4; // load 4 bf16 at once
+        const int vec_elems = (tile_len / pack) * pack;
+        bool vec_ok = (((uintptr_t)(W_row + k0)) & 0x7) == 0;  // 8B aligned
+
+        if (vec_ok) {
+            int t = lane * pack;
+            for (; t < vec_elems; t += warpSize * pack) {
+                uint64_t p4 = *reinterpret_cast<const uint64_t*>(W_row + k0 + t);
+                uint32_t lo2 = (uint32_t)(p4 & 0xFFFFFFFFu);
+                uint32_t hi2 = (uint32_t)(p4 >> 32);
+                float w0,w1,w2,w3;
+                bf16x2_to_f32(lo2, w0, w1);
+                bf16x2_to_f32(hi2, w2, w3);
+                acc = fmaf(w0, s_x[t + 0], acc);
+                acc = fmaf(w1, s_x[t + 1], acc);
+                acc = fmaf(w2, s_x[t + 2], acc);
+                acc = fmaf(w3, s_x[t + 3], acc);
+            }
+            for (; t < tile_len; ++t) {
+                float w = bf16_to_f32(W_row[k0 + t]);
+                acc = fmaf(w, s_x[t], acc);
+            }
+        } else {
+            for (int t = lane; t < tile_len; t += warpSize) {
+                float w = bf16_to_f32(W_row[k0 + t]);
+                acc = fmaf(w, s_x[t], acc);
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int off = warpSize >> 1; off > 0; off >>= 1)
+        acc += __shfl_down(acc, off);
+
+    if (lane == 0) {
+        float v = acc;
+        if (bias) v += bias[row];
+        res_b[row] += v; // *** ACCUMULATE into x ***
+    }
+}
+
+template<int WARPS_PER_BLOCK, int TILE>
 __global__ void gemm_kernel_batched_bf16W(
     const bf16* __restrict__ W,      // [out_features, in_features]  (BF16)
     const float* __restrict__ x,     // [B, in_features]             (FP32)
@@ -121,30 +192,6 @@ __device__ __forceinline__ float warp_reduce_sum_batched(float v) {
     v += __shfl_down(v, offset);
   }
   return v;
-}
-
-__device__ float block_reduce_sum(float val) {
-    // A block can have multiple warps.
-    // Each warp reduces its values, then one thread from each warp writes its sum to shared memory.
-    // Finally, the first warp reduces the values from shared memory.
-    static __shared__ float shared_mem[32]; // Max 32 warps/block (1024/32)
-    int lane = threadIdx.x % warpSize;
-    int warp_id = threadIdx.x / warpSize;
-
-    val = warp_reduce_sum_batched(val); // Each warp sums its partial results
-
-    if (lane == 0) {
-        shared_mem[warp_id] = val; // The first thread of each warp writes to shared memory
-    }
-    __syncthreads();
-
-    // The first warp is now responsible for summing the results from shared memory
-    val = (threadIdx.x < blockDim.x / warpSize) ? shared_mem[lane] : 0.0f;
-    if (warp_id == 0) {
-        val = warp_reduce_sum_batched(val);
-    }
-    
-    return val; // The final sum is in lane 0 of the first warp
 }
 
 void embedding_lookup_batched(Tensor *embedding,  // Shape: [vocab_size, hidden_dim]
@@ -332,13 +379,10 @@ void qkv_gemm_batched(Tensor *x,            // Shape: [batch_size, hidden_dim]
                       Tensor *qkv,          // Shape: [batch_size, out_features]
                       long long layer_offset, bool x_to_device, bool qkv_from_device,
                       hipStream_t stream) {
-  GpuTimer timer("qkv_gemm");
+  GpuTimer timer("qkv_gemm_batched");
   if (x_to_device) {
     x->to_device(stream);
   }
-
-  // --- MODIFIED: Get dimensions based on batched shapes ---
-  // Assuming Tensor has a shape member or method, e.g., x->shape[0]
   const int batch_size = x->shape[0];
   const int in_features = x->shape[1];   // hidden_dim
   const int out_features = qkv->shape[1];  // 3 * hidden_dim for QKV
@@ -367,14 +411,15 @@ void qkv_gemm_batched(Tensor *x,            // Shape: [batch_size, hidden_dim]
             <<<grid_dim, block_dim, shmem_bytes, stream>>>(
                 w_qkv_ptr, x_ptr, b_qkv_ptr, qkv_ptr,
                 out_features, in_features, batch_size);
-    } else {
-        const float *w_qkv_ptr = (const float *)W_qkv->d_buf
-                            + 1ll * layer_offset * out_features * in_features;
-        gemm_kernel_batched<WARPS_PER_BLOCK, TILE>
-            <<<grid_dim, block_dim, shmem_bytes, stream>>>(
-                w_qkv_ptr, x_ptr, b_qkv_ptr, qkv_ptr,
-                out_features, in_features, batch_size);
     }
+    //  else {
+    //     const float *w_qkv_ptr = (const float *)W_qkv->d_buf
+    //                         + 1ll * layer_offset * out_features * in_features;
+    //     gemm_kernel_batched<WARPS_PER_BLOCK, TILE>
+    //         <<<grid_dim, block_dim, shmem_bytes, stream>>>(
+    //             w_qkv_ptr, x_ptr, b_qkv_ptr, qkv_ptr,
+    //             out_features, in_features, batch_size);
+    // }
 
   if (qkv_from_device) {
     qkv->from_device(stream);
@@ -383,101 +428,146 @@ void qkv_gemm_batched(Tensor *x,            // Shape: [batch_size, hidden_dim]
 }
 
 // ---------- Split & RoPE ----------
-__global__ void qkv_split_rope_kernel_batched(
-    float *qkv_out, float *q_out, float *k_pos, float *v_pos,
-    const float *rope_cos_pos, const float *rope_sin_pos,
-    int head_dim, int n_q, int n_kv, int batch_size) { // Added batch_size
+// ---- fused Q/K/V split + RoPE + KV-cache write ----
+// layout notes:
+//   qkv_in[b] = [ Q(n_q*hd) | K(n_kv*hd) | V(n_kv*hd) ]
+//   q_out[b]  = [ Q(n_q*hd) ]  (written after RoPE)
+//   K_cache/V_cache are already host-offset to the current layer,
+//   but still stride per-batch by (L*S*kv_dim).
 
-  int feature_idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int batch_idx = blockIdx.y;
-  int q_dims = n_q * head_dim;
-  int k_dims = n_kv * head_dim;
-  int v_dims = n_kv * head_dim;
-  int total_dims_per_batch = q_dims + k_dims + v_dims;
-  if (batch_idx >= batch_size || feature_idx >= total_dims_per_batch) {
-    return;
-  }
-  float *qkv_batch = qkv_out + (size_t)batch_idx * total_dims_per_batch;
-  float *q_batch = q_out + (size_t)batch_idx * q_dims;
-  float *k_batch = k_pos + (size_t)batch_idx * k_dims;
-  float *v_batch = v_pos + (size_t)batch_idx * v_dims;
+template<bool KV_BF16=false>
+__global__ void qkv_split_rope_store_kernel(
+    const float* __restrict__ qkv_in,     // [B, (n_q + 2*n_kv)*hd]
+    float*       __restrict__ q_out,      // [B, n_q*hd]
+    void*        __restrict__ K_cache,    // [B, L, S, kv_dim] (layer-offset)
+    void*        __restrict__ V_cache,    // [B, L, S, kv_dim] (layer-offset)
+    const float* __restrict__ rope_cos,   // [hd/2] row for 'pos'
+    const float* __restrict__ rope_sin,   // [hd/2] row for 'pos'
+    int B, int head_dim, int n_q, int n_kv,
+    int seq_len, int n_layers, int pos)
+{
+    const int b = blockIdx.y;
+    if (b >= B) return;
 
-  int half_dim = head_dim / 2;
-  if (feature_idx < q_dims) { // Processing a Q element
-    int dim_idx_in_head = feature_idx % head_dim;
-    int rope_idx = dim_idx_in_head % half_dim;
-    float cos_val = rope_cos_pos[rope_idx];
-    float sin_val = rope_sin_pos[rope_idx];
-    float partner_val;
-    if (dim_idx_in_head < half_dim) {
-      partner_val = qkv_batch[feature_idx + half_dim];
-      q_batch[feature_idx] = qkv_batch[feature_idx] * cos_val - partner_val * sin_val;
-    } else {
-      partner_val = qkv_batch[feature_idx - half_dim];
-      q_batch[feature_idx] = qkv_batch[feature_idx] * cos_val + partner_val * sin_val;
+    const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+
+    const int hd   = head_dim;
+    const int h2   = hd >> 1;
+    const int qdim = n_q  * hd;
+    const int kdim = n_kv * hd;
+    const int vdim = n_kv * hd;
+    const int total = qdim + kdim + vdim;
+
+    const float* qkv_b = qkv_in + (size_t)b * total;
+    float*       q_b   = q_out  + (size_t)b * qdim;
+
+    // per-batch base in the cache (host already offset to layer 0)
+    const size_t kv_batch_stride = (size_t)n_layers * seq_len * (size_t)(n_kv * hd);
+    char*  Kb =  (char*)K_cache + (size_t)b * kv_batch_stride * (KV_BF16 ? sizeof(bf16) : sizeof(float));
+    char*  Vb =  (char*)V_cache + (size_t)b * kv_batch_stride * (KV_BF16 ? sizeof(bf16) : sizeof(float));
+    const size_t t_base = (size_t)pos * (size_t)(n_kv * hd);
+
+    // -------- 1) Q: RoPE in pairs, write to q_out --------
+    // treat as (n_q * h2) pairs
+    for (int p = lane; p < n_q * h2; p += gridDim.x * blockDim.x) {
+        int h  = p / h2;      // q-head
+        int j  = p % h2;      // pair index within head
+        int i0 = h * hd + j;
+        int i1 = i0 + h2;
+
+        const float c = rope_cos[j];
+        const float s = rope_sin[j];
+
+        float x0 = qkv_b[i0];
+        float x1 = qkv_b[i1];
+
+        float y0 = x0 * c - x1 * s;
+        float y1 = x0 * s + x1 * c;
+
+        q_b[i0] = y0;
+        q_b[i1] = y1;
     }
-  } else if (feature_idx < q_dims + k_dims) { // Processing a K element
-    int k_local_idx = feature_idx - q_dims;
-    int dim_idx_in_head = k_local_idx % head_dim;
-    int rope_idx = dim_idx_in_head % half_dim;
-    float cos_val = rope_cos_pos[rope_idx];
-    float sin_val = rope_sin_pos[rope_idx];
-    float partner_val;
-    if (dim_idx_in_head < half_dim) {
-      partner_val = qkv_batch[feature_idx + half_dim];
-      k_batch[k_local_idx] = qkv_batch[feature_idx] * cos_val - partner_val * sin_val;
-    } else {
-      partner_val = qkv_batch[feature_idx - half_dim];
-      k_batch[k_local_idx] = qkv_batch[feature_idx] * cos_val + partner_val * sin_val;
+
+    // -------- 2) K: RoPE in pairs, write directly into K_cache --------
+    // K section starts at offset qdim
+    for (int p = lane; p < n_kv * h2; p += gridDim.x * blockDim.x) {
+        int h  = p / h2;            // kv-head
+        int j  = p % h2;
+        int i0 = qdim + h * hd + j; // source in qkv_b
+        int i1 = i0 + h2;
+
+        const float c = rope_cos[j];
+        const float s = rope_sin[j];
+
+        float k0 = qkv_b[i0];
+        float k1 = qkv_b[i1];
+
+        float r0 = k0 * c - k1 * s;
+        float r1 = k0 * s + k1 * c;
+
+        size_t dst = t_base + (size_t)h * hd + j; // destination index for j
+        // write two elements (j and j+h2)
+        if constexpr (KV_BF16) {
+            ((bf16*)Kb)[dst]        = (bf16)((__float_as_uint(r0) + 0x00007FFFu + (((__float_as_uint(r0)>>16)&1u))) >> 16);
+            ((bf16*)Kb)[dst + h2]   = (bf16)((__float_as_uint(r1) + 0x00007FFFu + (((__float_as_uint(r1)>>16)&1u))) >> 16);
+        } else {
+            ((float*)Kb)[dst]       = r0;
+            ((float*)Kb)[dst + h2]  = r1;
+        }
     }
-  } else { // Processing a V element (simple copy)
-    int v_local_idx = feature_idx - q_dims - k_dims;
-    v_batch[v_local_idx] = qkv_batch[feature_idx];
-  }
+
+    // -------- 3) V: simple copy to V_cache (vector-ish) --------
+    // V section starts at qdim + kdim ; write contiguous kv_dim elements
+    for (int d = lane; d < kdim; d += gridDim.x * blockDim.x) {
+        float v = qkv_b[qdim + kdim + d];
+        size_t dst = t_base + d;
+        if constexpr (KV_BF16) {
+            ((bf16*)Vb)[dst] = (bf16)((__float_as_uint(v) + 0x00007FFFu + (((__float_as_uint(v)>>16)&1u))) >> 16);
+        } else {
+            ((float*)Vb)[dst] = v;
+        }
+    }
 }
+// replaces: qkv_split_rope_batched(...) + store_kv_cache_batched(...)
+void qkv_split_rope_batched(
+    Tensor* qkv_out,      // [B, (n_q + 2*n_kv)*hd]
+    Tensor* q_out,        // [B, n_q*hd]
+    Tensor* K_cache,      // [B, L, S, kv_dim]
+    Tensor* V_cache,      // [B, L, S, kv_dim]
+    const Tensor* rope_c, // [S, hd/2]
+    const Tensor* rope_s, // [S, hd/2]
+    int head_dim, int n_q, int n_kv, int pos,
+    long long layer_offset, hipStream_t stream)
+{
+    const int B  = (int)qkv_out->shape[0];
+    const int kv_dim = n_kv * head_dim;
 
-void qkv_split_rope_batched(Tensor *qkv_out,             // Shape: [batch_size, (n_q + 2*n_kv)*hd]
-                            Tensor *q_out,               // Shape: [batch_size, n_q*hd]
-                            Tensor *k_pos,               // Shape: [batch_size, n_kv*hd]
-                            Tensor *v_pos,               // Shape: [batch_size, n_kv*hd]
-                            const Tensor *rope_cos_pos,  // Shape: [seq_len, hd/2]
-                            const Tensor *rope_sin_pos,  // Shape: [seq_len, hd/2]
-                            int head_dim, int n_q, int n_kv, int pos, bool qkv_out_to_device,
-                            bool q_out_from_device, bool k_out_from_device, bool v_out_from_device,
-                            hipStream_t stream
-) {
-    GpuTimer timer("qkv_split_rope");
-  if (qkv_out_to_device) {
-    qkv_out->to_device(stream);
-  }
-  const int batch_size = qkv_out->shape[0];
-  // RoPE table offset is unchanged
-  int offset = pos * (head_dim / 2);
-  float *qkv_out_ptr = (float *)qkv_out->d_buf;
-  float *q_out_ptr = (float *)q_out->d_buf;
-  float *k_pos_ptr = (float *)k_pos->d_buf;
-  float *v_pos_ptr = (float *)v_pos->d_buf;
-  const float *rope_cos_pos_ptr = (float *)rope_cos_pos->d_buf + 1ll * offset;
-  const float *rope_sin_pos_ptr = (float *)rope_sin_pos->d_buf + 1ll * offset;
-  int total_dims_per_batch = (n_q + 2 * n_kv) * head_dim;
-  dim3 block_dim(DEFAULT_BLOCK_SIZE);
-  // grid.x covers the feature dimension
-  // grid.y covers the batch dimension
-  dim3 grid_dim((total_dims_per_batch + block_dim.x - 1) / block_dim.x, batch_size);
-  qkv_split_rope_kernel_batched<<<grid_dim, block_dim, 0, stream>>>(
-      qkv_out_ptr, q_out_ptr, k_pos_ptr, v_pos_ptr,
-      rope_cos_pos_ptr, rope_sin_pos_ptr,
-      head_dim, n_q, n_kv, batch_size); // Pass batch_size to kernel
+    // pre-offset caches to the current layer (BY ELEMENTS)
+    void* K_ptr = (char*)K_cache->d_buf + (size_t)layer_offset * (size_t)(K_cache->shape[2] * kv_dim) * sizeof(float);
+    void* V_ptr = (char*)V_cache->d_buf + (size_t)layer_offset * (size_t)(V_cache->shape[2] * kv_dim) * sizeof(float);
 
-  if (q_out_from_device)
-    q_out->from_device(stream);
-  if (k_out_from_device)
-    k_pos->from_device(stream);
-  if (v_out_from_device)
-    v_pos->from_device(stream);
-  if (q_out_from_device || k_out_from_device || v_out_from_device) {
-    CHECK_HIP(hipStreamSynchronize(stream));
-  }
+    const int h2 = head_dim >> 1;
+    const int total_pairs = max(n_q * h2, n_kv * h2);
+    const int vec_span    = max(total_pairs, kv_dim);
+
+    dim3 blk(256);
+    dim3 grd((unsigned)((vec_span + blk.x - 1) / blk.x), B);
+
+    const float* cos_row = (const float*)rope_c->d_buf + (size_t)pos * h2;
+    const float* sin_row = (const float*)rope_s->d_buf + (size_t)pos * h2;
+
+    if (K_cache->dtype == DType::BF16) {
+        qkv_split_rope_store_kernel<true><<<grd, blk, 0, stream>>>(
+            (const float*)qkv_out->d_buf, (float*)q_out->d_buf,
+            K_ptr, V_ptr, cos_row, sin_row,
+            B, head_dim, n_q, n_kv, (int)K_cache->shape[2], (int)K_cache->shape[1], pos);
+    } else {
+        qkv_split_rope_store_kernel<false><<<grd, blk, 0, stream>>>(
+            (const float*)qkv_out->d_buf, (float*)q_out->d_buf,
+            K_ptr, V_ptr, cos_row, sin_row,
+            B, head_dim, n_q, n_kv, (int)K_cache->shape[2], (int)K_cache->shape[1], pos);
+    }
+    CHECK_HIP(hipGetLastError());
 }
 
 __global__ void add_vector_kernel_batched(float *y, const float *b, int len) {
@@ -693,68 +783,40 @@ void single_query_attn_batched(Tensor *q,           // [B, n_q*hd]
     if (tb_from_device) { tb->from_device(stream); CHECK_HIP(hipStreamSynchronize(stream)); }
 }
 
-void attn_out_project_batched(Tensor *tb,         // Shape: [batch_size, n_q*hd]
-                              const Tensor *W_o,  // Shape: [hidden_dim, n_q*hd]
-                              const Tensor *b_o,  // Shape: [hidden_dim]
-                              Tensor *y,          // Shape: [batch_size, hidden_dim]
-                              long long layer_offset, bool tb_to_device, bool y_from_device,
-                              hipStream_t stream) {
-  if (tb_to_device) {
-    tb->to_device(stream);
-  }
-  GpuTimer timer("attn_out_project");
-  // --- MODIFIED: Get dimensions from batched tensor shapes ---
-  // Assumes Tensor has a `shape` member, e.g., tb->shape[0]
-  const int batch_size = tb->shape[0];
-  const int n_q_hd = tb->shape[1];  // This is the 'in_features'
-  const int hidden = y->shape[1];    // This is the 'out_features'
+void attn_out_project_batched(
+    Tensor *tb,           // [B, n_q*hd]
+    const Tensor *W_o,    // [hidden_dim, n_q*hd] (bf16 or f32)
+    const Tensor *b_o,    // [hidden_dim]
+    Tensor *x,            // [B, hidden_dim]  <-- accumulate into this
+    long long layer_offset, bool tb_to_device, bool sync_from_device, hipStream_t stream)
+{
+    if (tb_to_device) tb->to_device(stream);
+    GpuTimer timer("attn_out_project+residual(epilogue)");
 
-  // Pointer logic for weights and biases remains the same
-  const float *w_o_ptr = (float *)W_o->d_buf + 1ll * layer_offset * n_q_hd * hidden;
-  const float *b_o_ptr = (float *)b_o->d_buf + 1ll * layer_offset * hidden;
-  
-  // Base pointers for the batched input and output
-  const float *tb_ptr = (float *)tb->d_buf;
-  float *y_ptr = (float *)y->d_buf;
+    const int B      = tb->shape[0];
+    const int inK    = tb->shape[1];   // n_q*hd
+    const int outN   = x->shape[1];    // hidden_dim
 
-  // Kernel launch constants
-  constexpr int WARPS_PER_BLOCK = 16;
-  constexpr int TILE = 1024;
+    const int WARPS  = 16;
+    const int TILE   = 1024;
+    dim3 block_dim(warpSize, WARPS);
+    dim3 grid_dim((outN + WARPS - 1) / WARPS, B);
+    size_t shmem = TILE * sizeof(float);
 
-  dim3 block_dim(warpSize, WARPS_PER_BLOCK);
-  
-  // --- MODIFIED: Use a 2D grid for batching ---
-  // grid.x handles the output features (hidden_dim)
-  // grid.y handles the batch items
-  dim3 grid_dim((hidden + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, batch_size);
-  
-  size_t shmem_bytes = TILE * sizeof(float);
-  
-  // --- MODIFIED: Call the batched gemm_kernel ---
-   //printf("GEMM: N: %d, K: %d, M: %d\n", hidden, n_q_hd, batch_size);
-//   gemm_kernel_batched<WARPS_PER_BLOCK, TILE><<<grid_dim, block_dim, shmem_bytes, stream>>>(
-//       w_o_ptr, tb_ptr, b_o_ptr, y_ptr, 
-//       hidden, n_q_hd, batch_size); // Pass batch_size
+    const float *bias = (const float*)b_o->d_buf + 1ll * layer_offset * outN;
+
     if (W_o->dtype == DType::BF16) {
-        const bf16 *w_o_ptr = (const bf16 *)W_o->d_buf + 1ll * layer_offset * hidden * n_q_hd;
-        const float *b_o_ptr = (const float *)b_o->d_buf + 1ll * layer_offset * hidden;
-        gemm_kernel_batched_bf16W<WARPS_PER_BLOCK, TILE>
-            <<<grid_dim, block_dim, shmem_bytes, stream>>>(
-                w_o_ptr, tb_ptr, b_o_ptr, y_ptr,
-                hidden, n_q_hd, batch_size);
-    } else {
-        const float *w_o_ptr = (const float *)W_o->d_buf + 1ll * layer_offset * hidden * n_q_hd;
-        const float *b_o_ptr = (const float *)b_o->d_buf + 1ll * layer_offset * hidden;
-        gemm_kernel_batched<WARPS_PER_BLOCK, TILE>
-            <<<grid_dim, block_dim, shmem_bytes, stream>>>(
-                w_o_ptr, tb_ptr, b_o_ptr, y_ptr,
-                hidden, n_q_hd, batch_size);
+        const bf16 *W = (const bf16*)W_o->d_buf + 1ll * layer_offset * outN * inK;
+        gemm_kernel_batched_accum_bf16W<WARPS, TILE>
+            <<<grid_dim, block_dim, shmem, stream>>>(W,
+                                                     (const float*)tb->d_buf,
+                                                     bias,
+                                                     (float*)x->d_buf,
+                                                     outN, inK, B);
     }
+    CHECK_HIP(hipGetLastError());
 
-  if (y_from_device) {
-    y->from_device(stream);
-    CHECK_HIP(hipStreamSynchronize(stream));
-  }
+    if (sync_from_device) { x->from_device(stream); CHECK_HIP(hipStreamSynchronize(stream)); }
 }
 
 // ---------- Router GEMM ----------
@@ -981,7 +1043,7 @@ __global__ void moe_mm_bf16w_xcached(
         for (int i = lane; i < in_features; i += WARP_SIZE) {
             sum += (float)W_row[i] * x_sh[i];
         }
-        sum = warp_reduce_sum(sum);
+        sum = warp_reduce_sum_batched(sum);
 
         if (lane == 0) {
             float y = sum;
