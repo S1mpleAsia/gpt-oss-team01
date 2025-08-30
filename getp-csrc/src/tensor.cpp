@@ -2,12 +2,10 @@
 #include "../include/tensor.hpp"
 #include <stdexcept>
 
-Tensor::Tensor(
-  const vector<size_t> &shape_, int gpu_id, DType::Type dtype
-) : shape(shape_), dtype(dtype), owns_host_buf(true), gpu_id(gpu_id) {
-    
+Tensor::Tensor(const vector<size_t> &shape_, int gpu_id, DType::Type dtype)
+    : shape(shape_), dtype(dtype), owns_host_buf(true), gpu_id(gpu_id) {
   CHECK_HIP(hipSetDevice(gpu_id));  // Set device before any operations
-  
+
   ndim = shape_.size();
   size_t N_ = num_elem();
   buf = (float *)calloc(N_, sizeof(float));
@@ -17,11 +15,10 @@ Tensor::Tensor(
   CHECK_HIP(hipMemsetAsync(d_buf, 0, d_size, 0));
 }
 
-Tensor::Tensor(
-  const vector<size_t> &shape_, float *buf_, int gpu_id, DType::Type dtype
-) : shape(shape_), buf(buf_), dtype(dtype), owns_host_buf(false), gpu_id(gpu_id) {
+Tensor::Tensor(const vector<size_t> &shape_, float *buf_, int gpu_id, DType::Type dtype)
+    : shape(shape_), buf(buf_), dtype(dtype), owns_host_buf(false), gpu_id(gpu_id) {
   CHECK_HIP(hipSetDevice(gpu_id));  // Set device before any operations
-  
+
   ndim = shape_.size();
   size_t N_ = num_elem();
 
@@ -47,12 +44,11 @@ Tensor::Tensor(
  * @param batch_alloc A flag to enable the batch replication logic.
  * @param dtype The data type of the tensor (FP32 or BF16).
  */
-Tensor::Tensor(
-  const vector<size_t> &shape_, float *buf_, bool batch_alloc, int gpu_id,
-  DType::Type dtype
-) : shape(shape_), dtype(dtype), gpu_id(gpu_id) {
+Tensor::Tensor(const vector<size_t> &shape_, float *buf_, bool batch_alloc, int gpu_id,
+               DType::Type dtype)
+    : shape(shape_), dtype(dtype), gpu_id(gpu_id) {
   CHECK_HIP(hipSetDevice(gpu_id));  // Set device before any operations
-  
+
   ndim = shape_.size();
   size_t N_ = num_elem();
 
@@ -70,7 +66,7 @@ Tensor::Tensor(
 
     // Copy the single item's data into each batch slot.
     for (size_t i = 0; i < shape[0]; ++i) {
-      float* destination_pointer = this->buf + (i * single_item_elements);
+      float *destination_pointer = this->buf + (i * single_item_elements);
       memcpy(destination_pointer, buf_, single_item_bytes);
     }
   } else {
@@ -109,7 +105,8 @@ size_t Tensor::get_dtype_size() const {
 }
 
 void Tensor::to_device(hipStream_t stream, bool set_device) {
-  if (set_device) CHECK_HIP(hipSetDevice(gpu_id));  // Set device before any operations
+  if (set_device)
+    CHECK_HIP(hipSetDevice(gpu_id));  // Set device before any operations
 
   size_t N_ = num_elem();
   if (dtype == DType::FP32) {
@@ -126,7 +123,8 @@ void Tensor::to_device(hipStream_t stream, bool set_device) {
 }
 
 void Tensor::from_device(hipStream_t stream, bool set_device) {
-  if (set_device) CHECK_HIP(hipSetDevice(gpu_id));  // Set device before any operations
+  if (set_device)
+    CHECK_HIP(hipSetDevice(gpu_id));  // Set device before any operations
 
   size_t N_ = num_elem();
   if (dtype == DType::FP32) {
@@ -163,11 +161,10 @@ void Tensor::printShape(const std::string &descr) const {
 
 /* INT TENSOR */
 // tensor.cpp (modifications for TensorI32)
-TensorI32::TensorI32(
-  const vector<size_t> &shape_, int gpu_id
-) : shape(shape_), owns_host_buf(true), gpu_id(gpu_id) {
+TensorI32::TensorI32(const vector<size_t> &shape_, int gpu_id)
+    : shape(shape_), owns_host_buf(true), gpu_id(gpu_id) {
   CHECK_HIP(hipSetDevice(gpu_id));  // Set device before any operations
-  
+
   ndim = shape_.size();
   size_t N_ = num_elem();
   buf = (int *)calloc(N_, sizeof(int));
@@ -175,11 +172,10 @@ TensorI32::TensorI32(
   CHECK_HIP(hipMemsetAsync(d_buf, 0, N_ * sizeof(int), 0));
 }
 
-TensorI32::TensorI32(
-  const vector<size_t> &shape_, int *buf_, int gpu_id
-) : shape(shape_), buf(buf_), owns_host_buf(false), gpu_id(gpu_id) {
+TensorI32::TensorI32(const vector<size_t> &shape_, int *buf_, int gpu_id)
+    : shape(shape_), buf(buf_), owns_host_buf(false), gpu_id(gpu_id) {
   CHECK_HIP(hipSetDevice(gpu_id));  // Set device before any operations
-  
+
   ndim = shape_.size();
   size_t N_ = num_elem();
   CHECK_HIP(hipMalloc(&d_buf, N_ * sizeof(int)));
@@ -196,14 +192,16 @@ TensorI32::~TensorI32() {
 }
 
 void TensorI32::to_device(hipStream_t stream, bool set_device) {
-  if (set_device) CHECK_HIP(hipSetDevice(gpu_id));  // Set device before any operations
+  if (set_device)
+    CHECK_HIP(hipSetDevice(gpu_id));  // Set device before any operations
 
   size_t N_ = num_elem();
   CHECK_HIP(hipMemcpyAsync(d_buf, buf, N_ * sizeof(int), hipMemcpyHostToDevice, stream));
 }
 
 void TensorI32::from_device(hipStream_t stream, bool set_device) {
-  if (set_device) CHECK_HIP(hipSetDevice(gpu_id));  // Set device before any operations
+  if (set_device)
+    CHECK_HIP(hipSetDevice(gpu_id));  // Set device before any operations
 
   size_t N_ = num_elem();
   CHECK_HIP(hipMemcpyAsync(buf, d_buf, N_ * sizeof(int), hipMemcpyDeviceToHost, stream));

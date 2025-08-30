@@ -554,21 +554,21 @@ void router_gemm(const Tensor *w_router, Tensor *t, const Tensor *b_router, Tens
   // matmul_kernel<<<grid_dim, block_dim, 0, stream>>>(...);
 
   // New gemv_kernel launch
-  const int WARPS_PER_BLOCK = 4; // Tuning parameter
-  const int TILE = 256;          // Tuning parameter
-  const int warpSize = 64;       // Or 32, depending on GPU architecture
+  const int WARPS_PER_BLOCK = 4;  // Tuning parameter
+  const int TILE = 256;           // Tuning parameter
+  const int warpSize = 64;        // Or 32, depending on GPU architecture
 
   // Each block has `warpSize` threads in the x-dim and `WARPS_PER_BLOCK` in the y-dim
   dim3 block_dim(warpSize, WARPS_PER_BLOCK);
-  
+
   // Each block processes `WARPS_PER_BLOCK` output rows
   dim3 grid_dim((n_experts + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
-  
+
   // Specify dynamic shared memory size needed by the kernel
   size_t shared_mem_size = TILE * sizeof(float);
 
   gemv_kernel<WARPS_PER_BLOCK, TILE><<<grid_dim, block_dim, shared_mem_size, stream>>>(
-      w_router_ptr, t_ptr, b_router_ptr, r_ptr, n_experts, hidden);
+    w_router_ptr, t_ptr, b_router_ptr, r_ptr, n_experts, hidden);
 
   // --- END KERNEL SWAP ---
 

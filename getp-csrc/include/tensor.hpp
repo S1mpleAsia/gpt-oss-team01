@@ -35,7 +35,8 @@ struct Tensor {
 
   Tensor(const vector<size_t> &shape_, int gpu_id, DType::Type dtype = DType::FP32);
   Tensor(const vector<size_t> &shape_, float *buf_, int gpu_id, DType::Type dtype = DType::FP32);
-  Tensor(const vector<size_t> &shape_, float *buf_, bool batch_alloc, int gpu_id, DType::Type dtype = DType::FP32);
+  Tensor(const vector<size_t> &shape_, float *buf_, bool batch_alloc, int gpu_id,
+         DType::Type dtype = DType::FP32);
   ~Tensor();
 
   size_t num_elem() const;

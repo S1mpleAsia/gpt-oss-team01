@@ -2,6 +2,7 @@
 
 #include "layer.hpp"
 #include "layer_hip.hpp"
+#include "layer_hip_batch.hpp"
 #include "utils.hpp"
 #include "config.hpp"
 

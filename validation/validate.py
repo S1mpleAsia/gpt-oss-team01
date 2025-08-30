@@ -1,7 +1,7 @@
 def compare_files(output_path, output_test_path):
     with open(output_test_path, 'r') as f_test:
         test_lines = f_test.readlines()
-    
+
     n = len(test_lines)
 
     with open(output_path, 'r') as f_out:
@@ -11,7 +11,8 @@ def compare_files(output_path, output_test_path):
     match = out_lines[:n] == test_lines
 
     if match:
-        print("✅ The first n lines of output.txt match output_test.txt exactly.")
+        print(
+            "✅ The first n lines of output.txt match output_test.txt exactly.")
     else:
         print("❌ The files differ in the first n lines.")
         for i in range(n):
@@ -21,6 +22,6 @@ def compare_files(output_path, output_test_path):
                 print(f"  output_test.txt: {test_lines[i].rstrip()}")
                 break
 
+
 # Example usage
 compare_files('../data/output.txt', '../data/output_test.txt')
-

@@ -32,7 +32,8 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   CHECK_HIP(hipGetDeviceCount(&actualGPUs));
 
   if (TOTAL_GPUS_NEEDED != actualGPUs) {
-    fprintf(stderr, "Error: Required %d GPUs, but only %d available.\n", TOTAL_GPUS_NEEDED, actualGPUs);
+    fprintf(stderr, "Error: Required %d GPUs, but only %d available.\n", TOTAL_GPUS_NEEDED,
+            actualGPUs);
     exit(1);
   }
 
@@ -121,22 +122,22 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer, S
         output_tokens[pos - num_prompt_tokens] = next;
       }
 
-      // --- MODIFICATION START ---
-      // This single block replaces the two original PRINT_LOGITS blocks.
-      #ifdef PRINT_LOGITS
-        // Decode the next token to get its string representation
-        const char *piece = decode_piece(tokenizer, token, next);
+// --- MODIFICATION START ---
+// This single block replaces the two original PRINT_LOGITS blocks.
+#ifdef PRINT_LOGITS
+      // Decode the next token to get its string representation
+      const char *piece = decode_piece(tokenizer, token, next);
 
-        // Print in the requested format
-        printf("batch id 0 --> ");
-        safe_printf(piece);
-        printf("logits: ");
-        for (int j = 0; j < 5; j++) {
-            printf("%.6f ", logits[j]);
-        }
-        printf("\n");
-        fflush(stdout);
-      #endif
+      // Print in the requested format
+      printf("batch id 0 --> ");
+      safe_printf(piece);
+      printf("logits: ");
+      for (int j = 0; j < 5; j++) {
+        printf("%.6f ", logits[j]);
+      }
+      printf("\n");
+      fflush(stdout);
+#endif
       // --- MODIFICATION END ---
 
       // data-dependent terminating condition: the EOS (=199999 or =200002) token
@@ -149,10 +150,10 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer, S
     }
   }
 
-  // should be removed
-  #ifdef PRINT_LOGITS
-    printf("\n");
-  #endif
+// should be removed
+#ifdef PRINT_LOGITS
+  printf("\n");
+#endif
 
   // Marker for end of sequence
   output_tokens[pos - num_prompt_tokens + 1] = -1;
@@ -175,10 +176,8 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer, Sampler *sam
 }
 #else
 
-long long batched_getp_generate(
-  const std::vector<const char *> &input_batch,
-  const std::vector<int *> &output_batch, int steps, int flow_id
-) {
+long long batched_getp_generate(const std::vector<const char *> &input_batch,
+                                const std::vector<int *> &output_batch, int steps, int flow_id) {
   const int batch_size = input_batch.size();
   if (batch_size == 0)
     return 0;
@@ -190,7 +189,8 @@ long long batched_getp_generate(
     const char *input_seq = input_batch[i] ? input_batch[i] : "";
     int *prompt_tokens_buffer = (int *)malloc(strlen((input_seq) + 3) * sizeof(int));
     int count = 0;
-    encode(public_tokenizer, input_seq, -1, -1, prompt_tokens_buffer, &count, public_config->initial_context_length);
+    encode(public_tokenizer, input_seq, -1, -1, prompt_tokens_buffer, &count,
+           public_config->initial_context_length);
 
     if (count < 1) {
       fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
@@ -214,13 +214,13 @@ long long batched_getp_generate(
   }
 
   for (int pos = 0; pos < steps && active_count > 0; ++pos) {
-    float *batch_logits =
-      forward_gpu_20b_batched(public_config, weights, rs, current_tokens.data(), pos, batch_size, flow_id);
+    float *batch_logits = forward_gpu_20b_batched(public_config, weights, rs, current_tokens.data(),
+                                                  pos, batch_size, flow_id);
 
     for (int i = 0; i < batch_size; i++) {
       if (!active[i])
         continue;
-      
+
       float *logits = batch_logits + 1ll * i * public_config->vocab_size;
 
       int next_token;
@@ -230,45 +230,45 @@ long long batched_getp_generate(
         next_token = sample(public_sampler, logits);
         output_batch[i][current_pos[i] - (num_prompt_tokens[i] - 1)] = next_token;
       }
-      
-      // Print the logits in the desired format if the flag is enabled
-      #ifdef PRINT_LOGITS
-        // Decode the next token to get its string representation
-        const char *piece = decode_piece(tokenizer, current_tokens[i], next_token);
-        
-        // Use a critical section for printing to prevent interleaved output
-        #pragma omp critical
-        {
-            printf("batch id %d --> ", i);
-            safe_printf(piece);
-            printf("logits: ");
-            for (int j = 0; j < 5; j++) {
-                printf("%.6f ", logits[j]);
-            }
-            printf("\n");
-            fflush(stdout);
-        }
-      #endif
+
+// Print the logits in the desired format if the flag is enabled
+#ifdef PRINT_LOGITS
+      // Decode the next token to get its string representation
+      const char *piece = decode_piece(public_tokenizer, current_tokens[i], next_token);
+
+      // Use a critical section for printing to prevent interleaved output
+      // #pragma omp critical
+      // {
+      // printf("batch id %d --> ", i);
+      safe_printf(piece);
+      // printf("logits: ");
+      // for (int j = 0; j < 5; j++) {
+      // printf("%.6f ", logits[j]);
+      // }
+      // printf("\n");
+      fflush(stdout);
+//       }
+#endif
 
       if (next_token == 199999 || next_token == 200002) {
-      #pragma omp critical
-        {
-          if (active[i]) {
-            active[i] = false;
-            active_count--;
-          }
+        // #pragma omp critical
+        // {
+        if (active[i]) {
+          active[i] = false;
+          active_count--;
         }
+        // }
       }
 
       current_tokens[i] = next_token;
       current_pos[i]++;
     }
   }
-  
-  // should be removed
-  #ifdef PRINT_LOGITS
-    printf("\n");
-  #endif
+
+// should be removed
+#ifdef PRINT_LOGITS
+  printf("\n");
+#endif
 
   for (int i = 0; i < batch_size; i++) {
     int generated_len = current_pos[i] - num_prompt_tokens[i];
@@ -283,7 +283,7 @@ long long batched_getp_generate(
 }
 
 long long inference_old(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
-                    Requests *requests) {
+                        Requests *requests) {
   setup(sampler, requests);
 
   long long num_token_out = 0;
@@ -304,9 +304,7 @@ long long inference_old(Transformer *transformer, Tokenizer *tokenizer, Sampler 
 
     // const char *input_seq = get_str_req_ptr(requests, idx);
     // int *output_tokens = get_tok_gen_ptr(requests, idx);
-    num_token_out += batched_getp_generate(
-      input_batch, output_batch, requests->max_seq_len, 0
-    );
+    num_token_out += batched_getp_generate(input_batch, output_batch, requests->max_seq_len, 0);
   }
   return num_token_out;
 }
@@ -332,9 +330,7 @@ void *thread_handler(void *arg) {
       output_batch.push_back(get_tok_gen_ptr(public_requests, i + j));
     }
 
-    local_token_count += batched_getp_generate(
-      input_batch, output_batch, max_seq_len, id
-    );
+    local_token_count += batched_getp_generate(input_batch, output_batch, max_seq_len, id);
   }
 
   *(args->local_token_ptr) = local_token_count;
@@ -353,12 +349,12 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer, Sampler *sam
 
   int total_reqs = public_requests->num_reqs;
   int chunk_size = (total_reqs + TOTAL_GPUS_NEEDED - 1) / TOTAL_GPUS_NEEDED;
-    
+
   for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
     args[i].id = i;
     args[i].local_token_ptr = &tokens_out[i];
     args[i].start_idx = i * chunk_size;
-    args[i].end_idx = min((i+1) * chunk_size, total_reqs);
+    args[i].end_idx = min((i + 1) * chunk_size, total_reqs);
 
     pthread_create(&threads[i], NULL, thread_handler, (void *)&args[i]);
   }
@@ -373,7 +369,6 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer, Sampler *sam
 
   return num_token_out;
 }
-
 
 #endif
 

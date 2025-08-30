@@ -8,12 +8,12 @@
 #include "config_run.hpp"
 
 #define RUN_BATCH
-#define BATCH_SIZE 4
+#define BATCH_SIZE 16
 // #define PRINT_LOGITS
-// #define TIME_GPU
+#define TIME_GPU
 // #define DEBUG
 
-#define DP 2
+#define DP 1
 #define PP 1
 #define TP 1
 #define TOTAL_GPUS_NEEDED ((DP) * (PP) * (TP))
