@@ -7,7 +7,7 @@
 #include "tensor.hpp"
 
 #define RUN_BATCH
-#define BATCH_SIZE 4
+#define BATCH_SIZE 2
 // #define PRINT_LOGITS
 // #define TIME_GPU
 // #define DEBUG
@@ -16,6 +16,7 @@
 #define PP 1
 #define TP 1
 #define TOTAL_GPUS_NEEDED ((DP) * (PP) * (TP))
+#define TOTAL_PIPELINES ((PP) * (TP))
 
 typedef struct {
   // token_embedding_table - embedding.weight
@@ -90,3 +91,8 @@ typedef struct {
   int start_idx;
   int end_idx;
 } ThreadArgs;
+
+typedef struct {
+  hipStream_t stream;
+  hipEvent_t kernelEnd;
+} StreamTotal;

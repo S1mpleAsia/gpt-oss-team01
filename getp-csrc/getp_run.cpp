@@ -20,6 +20,7 @@ Transformer *public_transformer;
 Tokenizer *public_tokenizer;
 Sampler *public_sampler;
 Requests *public_requests;
+StreamTotal *total_streams;
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // Do not inference here
@@ -38,6 +39,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 
   weights = new OurTransformerWeights[TOTAL_GPUS_NEEDED];
   rs = new OurRunState[TOTAL_GPUS_NEEDED];
+  total_streams = new StreamTotal[TOTAL_GPUS_NEEDED];
   our_init(transformer, weights, rs);
 
   public_config = &transformer->config;
@@ -215,7 +217,7 @@ long long batched_getp_generate(
 
   for (int pos = 0; pos < steps && active_count > 0; ++pos) {
     float *batch_logits =
-      forward_gpu_20b_batched(public_config, weights, rs, current_tokens.data(), pos, batch_size, flow_id);
+      forward_gpu_120b_batched(public_config, weights, rs, current_tokens.data(), pos, batch_size, flow_id);
 
     for (int i = 0; i < batch_size; i++) {
       if (!active[i])
@@ -347,14 +349,14 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer, Sampler *sam
   setup(sampler, requests);
 
   long long num_token_out = 0;
-  pthread_t threads[TOTAL_GPUS_NEEDED];
-  ThreadArgs args[TOTAL_GPUS_NEEDED];
-  long long tokens_out[TOTAL_GPUS_NEEDED];
+  pthread_t threads[DP];
+  ThreadArgs args[DP];
+  long long tokens_out[DP];
 
   int total_reqs = public_requests->num_reqs;
-  int chunk_size = (total_reqs + TOTAL_GPUS_NEEDED - 1) / TOTAL_GPUS_NEEDED;
+  int chunk_size = (total_reqs + DP - 1) / DP;
     
-  for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
+  for (int i = 0; i < DP; i++) {
     args[i].id = i;
     args[i].local_token_ptr = &tokens_out[i];
     args[i].start_idx = i * chunk_size;
@@ -363,7 +365,7 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer, Sampler *sam
     pthread_create(&threads[i], NULL, thread_handler, (void *)&args[i]);
   }
 
-  for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
+  for (int i = 0; i < DP; i++) {
     pthread_join(threads[i], NULL);
     num_token_out += tokens_out[i];
   }
