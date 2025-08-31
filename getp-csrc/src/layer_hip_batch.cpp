@@ -1330,6 +1330,21 @@ void moe_apply_topk_batched(Tensor *t,            // [B,H]
   }
 }
 
+void moe_block_matmul_style_hip(
+  Tensor *x_in,         // [batch_size, hidden_dim]
+  TensorI32 *topk_idx,  // [batch_size, experts_per_token]
+  Tensor *topk_v,       // [batch_size, experts_per_token]
+  Tensor *w_mlp1,       // [n_layers, n_experts, hidden_dim, 2*intermediate_dim]
+  Tensor *b_mlp1,       // [n_layers, n_experts, 2*intermediate_dim]
+  Tensor *w_mlp2,       // [n_layers, n_experts, intermediate_dim, hidden_dim]
+  Tensor *b_mlp2,       // [n_layers, n_experts, hidden_dim]
+  Tensor *e_agg,        // [batch_size, hidden_dim]
+  float clamp_limit, long long layer_offset, hipStream_t stream) {
+  // GpuTimer timer("moe_v2");
+  moe_block_matmul_style(x_in, topk_idx, topk_v, w_mlp1, b_mlp1, w_mlp2, b_mlp2, e_agg, clamp_limit,
+                         layer_offset, stream);
+}
+
 static inline void moe_mlp1_batched(Tensor *t, Tensor *w_mlp1, Tensor *b_mlp1, TensorI32 *topk_idx,
                                     Tensor *mlp1_out, bool t_to_device, bool topk_idx_to_device,
                                     long long layer_offset, hipStream_t stream) {

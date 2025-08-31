@@ -120,6 +120,17 @@ void moe_apply_topk_batched(
   float clamp_limit, long long layer_offset, bool t_to_device, bool topk_idx_to_device,
   bool topk_vals_to_device, bool e_agg_from_device, hipStream_t stream = 0);
 
+void moe_block_matmul_style_hip(
+  Tensor *x_in,         // [batch_size, hidden_dim]
+  TensorI32 *topk_idx,  // [batch_size, experts_per_token]
+  Tensor *topk_v,       // [batch_size, experts_per_token]
+  Tensor *w_mlp1,       // [n_layers, n_experts, hidden_dim, 2*intermediate_dim]
+  Tensor *b_mlp1,       // [n_layers, n_experts, 2*intermediate_dim]
+  Tensor *w_mlp2,       // [n_layers, n_experts, intermediate_dim, hidden_dim]
+  Tensor *b_mlp2,       // [n_layers, n_experts, hidden_dim]
+  Tensor *e_agg,        // [batch_size, hidden_dim]
+  float clamp_limit, long long layer_offset, hipStream_t stream);
+
 static inline void moe_mlp1_batched(Tensor *t, Tensor *w_mlp1, Tensor *b_mlp1, TensorI32 *topk_idx,
                                     Tensor *mlp1_out, bool t_to_device, bool topk_idx_to_device,
                                     long long layer_offset, hipStream_t stream = 0);
