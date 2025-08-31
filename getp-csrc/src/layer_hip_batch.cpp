@@ -1,6 +1,7 @@
 #include "../include/layer_hip_batch.hpp"
 #include <cmath>
 #include <cfloat>
+#include "kernel.cpp"
 #include <rocblas/rocblas.h>
 
 #define DEFAULT_BLOCK_SIZE 256
@@ -28,147 +29,108 @@ __device__ __forceinline__ void bf16x2_to_f32(uint32_t packed, float &f0, float 
   f1 = __int_as_float((int)(hi << 16));
 }
 
-template <int BM = 16, int BN = 128, int BK = 16, int TM = 2, int TN = 8>
-__global__ void matmul_kernel(const float *__restrict__ A, const float *__restrict__ B,
-                              float *__restrict__ C, const float *bias, int M, int N, int K) {
-  const int VEC_SIZE = 4;
+__device__ __forceinline__ float block_reduce_sum(float v) {
+  // Số warp tối đa cho 1024 threads với WARP_SIZE=32 là 32; với 64 là 16 → 32 là dư an toàn.
+  __shared__ float warp_sums[32];
 
-  const int BLOCK_SIZE_X = BN / TN;
-  const int BLOCK_SIZE_Y = BM / TM;
+  int lane = threadIdx.x & (warpSize - 1);
+  int wid = threadIdx.x / warpSize;
+  int num_warps = (blockDim.x + warpSize - 1) / warpSize;
 
-  const int tid_x = threadIdx.x;
-  const int tid_y = threadIdx.y;
-  const int block_col = blockIdx.x;
-  const int block_row = blockIdx.y;
+  // reduce trong warp
+  v = warp_reduce_sum(v);
+  if (lane == 0)
+    warp_sums[wid] = v;
+  __syncthreads();
 
-  // Padding có thể giúp hiệu năng, giữ lại để linh hoạt
-  __shared__ float As[BM][BK + 8];
-  __shared__ float Bs[BK][BN + 8];
+  // warp 0 cộng các warp_sums
+  float sum = 0.0f;
+  if (wid == 0) {
+    sum = (lane < num_warps) ? warp_sums[lane] : 0.0f;
+    sum = warp_reduce_sum(sum);
+    if (lane == 0)
+      warp_sums[0] = sum;  // broadcast qua shared
+  }
+  __syncthreads();
+  return warp_sums[0];
+}
 
-  float acc[TM][TN] = {0.0f};
+template <int BLOCK_THREADS = 256>
+__global__ void residual_rmsnorm_f32_kernel(const float *input, float *residual, const float *w,
+                                            float *output, int hidden_dim, float epsilon) {
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
 
-  for (int k_base = 0; k_base < K; k_base += BK) {
-    constexpr int ITERS_A = (BK + BLOCK_SIZE_X - 1) / BLOCK_SIZE_X;
-#pragma unroll
-    for (int it = 0; it < ITERS_A; ++it) {
-      int kk = it * BLOCK_SIZE_X + tid_x;  // kk phụ thuộc tid_x, nhưng ITERS_A là hằng
-      if (kk < BK) {
-#pragma unroll
-        for (int i = 0; i < TM; ++i) {
-          int row = block_row * BM + tid_y * TM + i;
-          int col = k_base + kk;
-          As[tid_y * TM + i][kk] = (row < M && col < K) ? A[row * K + col] : 0.0f;
-        }
-      }
-    }
+  const float *in_row = input + (size_t)row * hidden_dim;
+  float *res_row = residual + (size_t)row * hidden_dim;
+  const float *g_row = w;
+  float *out_row = output + (size_t)row * hidden_dim;
 
-    constexpr int ITERS_B = (BK + BLOCK_SIZE_Y - 1) / BLOCK_SIZE_Y;
-#pragma unroll
-    for (int it = 0; it < ITERS_B; ++it) {
-      int tile_row = it * BLOCK_SIZE_Y + tid_y;
-      if (tile_row < BK) {
-        int global_row = k_base + tile_row;
+  float thread_sum = 0.f;
 
-        constexpr int V_ITERS = TN / 4;  // VEC_SIZE=4
-#pragma unroll
-        for (int i = 0; i < V_ITERS; ++i) {
-          int global_col = block_col * BN + tid_x * TN + i * 4;
+  const int vecN = hidden_dim >> 2;
+  const float4 *in4 = reinterpret_cast<const float4 *>(in_row);
+  float4 *rs4 = reinterpret_cast<float4 *>(res_row);
 
-          float4 *dst = reinterpret_cast<float4 *>(&Bs[tile_row][tid_x * TN + i * 4]);
-          if (global_row < K && (global_col + 3) < N) {
-            const float4 *src = reinterpret_cast<const float4 *>(&B[global_row * N + global_col]);
-            *dst = *src;
-          } else {
-            // fallback an toàn khi chạm mép
-            for (int t = 0; t < 4; ++t) {
-              int gc = global_col + t;
-              Bs[tile_row][tid_x * TN + i * 4 + t] =
-                (global_row < K && gc < N) ? B[global_row * N + gc] : 0.0f;
-            }
-          }
-        }
-      }
-    }
-
-    __syncthreads();
-
-// Phần tính toán (accumulate) đã đúng, giữ nguyên
-#pragma unroll
-    for (int k = 0; k < BK; k++) {
-      float a_reg[TM];
-#pragma unroll
-      for (int i = 0; i < TM; i++) {
-        a_reg[i] = As[tid_y * TM + i][k];
-      }
-
-#pragma unroll
-      for (int i = 0; i < TM; i++) {
-#pragma unroll
-        for (int j = 0; j < TN; j++) {
-          acc[i][j] = fmaf(a_reg[i], Bs[k][tid_x * TN + j], acc[i][j]);
-        }
-      }
-    }
-    __syncthreads();
+  for (int i = tid; i < vecN; i += BLOCK_THREADS) {
+    float4 a = in4[i];
+    float4 r = rs4[i];
+    r.x += a.x;
+    r.y += a.y;
+    r.z += a.z;
+    r.w += a.w;
+    rs4[i] = r;
+    thread_sum += r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
   }
 
-// Phần ghi kết quả (Write back) đã đúng, giữ nguyên
-// --- WRITE BACK (+ optional bias) ---
-#pragma unroll
-  for (int i = 0; i < TM; i++) {
-#pragma unroll
-    for (int j = 0; j < TN; j += VEC_SIZE) {
-      int row = block_row * BM + tid_y * TM + i;
-      int col = block_col * BN + tid_x * TN + j;
-      if (row < M && col < N) {
-        if ((col + (VEC_SIZE - 1)) < N) {  // nguyên khối 4 phần tử
-          float4 v = *reinterpret_cast<float4 *>(&acc[i][j]);
-          if (bias) {
-            const float4 b = *reinterpret_cast<const float4 *>(&bias[col]);
-            v.x += b.x;
-            v.y += b.y;
-            v.z += b.z;
-            v.w += b.w;
-          }
-          *reinterpret_cast<float4 *>(&C[row * N + col]) = v;
-        } else {  // đuôi lẻ
-          for (int t = 0; t < VEC_SIZE && (col + t) < N; ++t) {
-            float v = acc[i][j + t];
-            if (bias)
-              v += bias[col + t];
-            C[row * N + col + t] = v;
-          }
-        }
-      }
-    }
+  float sum = block_reduce_sum(thread_sum);
+  float s_norm;
+  if (tid == 0) {
+    float mean = sum / (float)hidden_dim;
+    s_norm = rsqrtf(mean + epsilon);
+  }
+  __shared__ float s_shared;
+  if (tid == 0)
+    s_shared = s_norm;
+  __syncthreads();
+  s_norm = s_shared;
+
+  // const int vecN = hidden_dim >> 2;
+  // const float4 *rs4 = reinterpret_cast<const float4 *>(res_row);
+  const float4 *g4 = reinterpret_cast<const float4 *>(g_row);
+  float4 *o4 = reinterpret_cast<float4 *>(out_row);
+
+  for (int i = tid; i < vecN; i += BLOCK_THREADS) {
+    float4 r = rs4[i];
+    float4 g = g4[i];
+    r.x = r.x * s_norm * g.x;
+    r.y = r.y * s_norm * g.y;
+    r.z = r.z * s_norm * g.z;
+    r.w = r.w * s_norm * g.w;
+    o4[i] = r;
   }
 }
 
-/*
-__device__ float block_reduce_sum(float val) {
-    // A block can have multiple warps.
-    // Each warp reduces its values, then one thread from each warp writes its sum to shared memory.
-    // Finally, the first warp reduces the values from shared memory.
-    static __shared__ float shared_mem[32]; // Max 32 warps/block (1024/32)
-    int lane = threadIdx.x % warpSize;
-    int warp_id = threadIdx.x / warpSize;
+void residual_rmsnorm_batched(Tensor *x,         // Shape: [batch_size, hidden_dim]
+                              Tensor *residual,  // Shape: [batch_size, hidden_dim]
+                              Tensor *w,         // Shape: [n_layers, hidden_dim]
+                              Tensor *out,       // Shape: [batch_size, hidden_dim]
+                              long long layer_offset, float epsilon, hipStream_t stream) {
+  GpuTimer timer("residual_rmsnorm");
+  const int batch_size = (int)residual->shape[0];
+  const int hidden_dim = (int)residual->shape[1];
 
-    val = warp_reduce_sum_batched(val); // Each warp sums its partial results
+  const float *x_ptr = (const float *)x->d_buf;
+  float *residual_ptr = (float *)residual->d_buf;
+  float *out_ptr = (float *)out->d_buf;
+  const float *w_ptr = (const float *)w->d_buf + layer_offset * hidden_dim;
 
-    if (lane == 0) {
-        shared_mem[warp_id] = val; // The first thread of each warp writes to shared memory
-    }
-    __syncthreads();
+  dim3 block_size(256);
+  dim3 grid_size(batch_size);
 
-    // The first warp is now responsible for summing the results from shared memory
-    val = (threadIdx.x < blockDim.x / warpSize) ? shared_mem[lane] : 0.0f;
-    if (warp_id == 0) {
-        val = warp_reduce_sum_batched(val);
-    }
-
-    return val; // The final sum is in lane 0 of the first warp
+  residual_rmsnorm_f32_kernel<256><<<grid_size, block_size, 0, stream>>>(
+    x_ptr, residual_ptr, w_ptr, out_ptr, hidden_dim, epsilon);
 }
-*/
 
 void embedding_lookup_batched(Tensor *embedding,  // Shape: [vocab_size, hidden_dim]
                               int *tokens,        // Shape: [batch_size]
@@ -239,7 +201,7 @@ __global__ void rmsnorm_kernel(const float *x, const float *w, float *out, int h
 }
 
 void rmsnorm_batched(Tensor *x,    // Shape: [batch_size, hidden_dim]
-                     Tensor *w,    // Shape: [hidden_dim]
+                     Tensor *w,    // Shape: [n_layers, hidden_dim]
                      Tensor *out,  // Shape: [batch_size, hidden_dim]
                      long long layer_offset, bool x_to_device, bool out_from_device, float eps,
                      hipStream_t stream) {
@@ -415,8 +377,8 @@ void qkv_gemm_batched_v2(Tensor *x,            // Shape: [batch_size, hidden_dim
   {
     constexpr int BM = 16;
     constexpr int BN = 128;
-    constexpr int BK = 32;
-    constexpr int TM = 2;
+    constexpr int BK = 16;
+    constexpr int TM = 1;
     constexpr int TN = 4;
 
     const int BLOCK_SIZE_X = BN / TN;
@@ -551,6 +513,144 @@ void qkv_split_rope_batched(Tensor *qkv_out,             // Shape: [batch_size, 
   if (q_out_from_device || k_out_from_device || v_out_from_device) {
     CHECK_HIP(hipStreamSynchronize(stream));
   }
+}
+
+template <bool KV_BF16 = false>
+__global__ void qkv_split_rope_store_kernel(
+  const float *__restrict__ qkv_in,    // [B, (n_q + 2*n_kv)*hd]
+  float *__restrict__ q_out,           // [B, n_q*hd]
+  void *__restrict__ K_cache,          // [B, L, S, kv_dim] (layer-offset)
+  void *__restrict__ V_cache,          // [B, L, S, kv_dim] (layer-offset)
+  const float *__restrict__ rope_cos,  // [hd/2] row for 'pos'
+  const float *__restrict__ rope_sin,  // [hd/2] row for 'pos'
+  int B, int head_dim, int n_q, int n_kv, int seq_len, int n_layers, int pos) {
+  const int b = blockIdx.y;
+  if (b >= B)
+    return;
+
+  const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+
+  const int hd = head_dim;
+  const int h2 = hd >> 1;
+  const int qdim = n_q * hd;
+  const int kdim = n_kv * hd;
+  const int vdim = n_kv * hd;
+  const int total = qdim + kdim + vdim;
+
+  const float *qkv_b = qkv_in + (size_t)b * total;
+  float *q_b = q_out + (size_t)b * qdim;
+
+  // per-batch base in the cache (host already offset to layer 0)
+  const size_t kv_batch_stride = (size_t)n_layers * seq_len * (size_t)(n_kv * hd);
+  char *Kb =
+    (char *)K_cache + (size_t)b * kv_batch_stride * (KV_BF16 ? sizeof(bf16) : sizeof(float));
+  char *Vb =
+    (char *)V_cache + (size_t)b * kv_batch_stride * (KV_BF16 ? sizeof(bf16) : sizeof(float));
+  const size_t t_base = (size_t)pos * (size_t)(n_kv * hd);
+
+  // -------- 1) Q: RoPE in pairs, write to q_out --------
+  // treat as (n_q * h2) pairs
+  for (int p = lane; p < n_q * h2; p += gridDim.x * blockDim.x) {
+    int h = p / h2;  // q-head
+    int j = p % h2;  // pair index within head
+    int i0 = h * hd + j;
+    int i1 = i0 + h2;
+
+    const float c = rope_cos[j];
+    const float s = rope_sin[j];
+
+    float x0 = qkv_b[i0];
+    float x1 = qkv_b[i1];
+
+    float y0 = x0 * c - x1 * s;
+    float y1 = x0 * s + x1 * c;
+
+    q_b[i0] = y0;
+    q_b[i1] = y1;
+  }
+
+  // -------- 2) K: RoPE in pairs, write directly into K_cache --------
+  // K section starts at offset qdim
+  for (int p = lane; p < n_kv * h2; p += gridDim.x * blockDim.x) {
+    int h = p / h2;  // kv-head
+    int j = p % h2;
+    int i0 = qdim + h * hd + j;  // source in qkv_b
+    int i1 = i0 + h2;
+
+    const float c = rope_cos[j];
+    const float s = rope_sin[j];
+
+    float k0 = qkv_b[i0];
+    float k1 = qkv_b[i1];
+
+    float r0 = k0 * c - k1 * s;
+    float r1 = k0 * s + k1 * c;
+
+    size_t dst = t_base + (size_t)h * hd + j;  // destination index for j
+    // write two elements (j and j+h2)
+    if constexpr (KV_BF16) {
+      ((bf16 *)Kb)[dst] =
+        (bf16)((__float_as_uint(r0) + 0x00007FFFu + (((__float_as_uint(r0) >> 16) & 1u))) >> 16);
+      ((bf16 *)Kb)[dst + h2] =
+        (bf16)((__float_as_uint(r1) + 0x00007FFFu + (((__float_as_uint(r1) >> 16) & 1u))) >> 16);
+    } else {
+      ((float *)Kb)[dst] = r0;
+      ((float *)Kb)[dst + h2] = r1;
+    }
+  }
+
+  // -------- 3) V: simple copy to V_cache (vector-ish) --------
+  // V section starts at qdim + kdim ; write contiguous kv_dim elements
+  for (int d = lane; d < kdim; d += gridDim.x * blockDim.x) {
+    float v = qkv_b[qdim + kdim + d];
+    size_t dst = t_base + d;
+    if constexpr (KV_BF16) {
+      ((bf16 *)Vb)[dst] =
+        (bf16)((__float_as_uint(v) + 0x00007FFFu + (((__float_as_uint(v) >> 16) & 1u))) >> 16);
+    } else {
+      ((float *)Vb)[dst] = v;
+    }
+  }
+}
+
+void qkv_split_rope_fused(Tensor *qkv_out,  // Shape: [batch_size, (n_q + 2*n_kv)*hd]
+                          Tensor *q_out,    // Shape: [batch_size, n_q*hd]
+                          Tensor *K_cache,  // Shape: [batch_size, n_layers, seq_len, kv_dim]
+                          Tensor *V_cache,  // Shape: [batch_size, n_layers, seq_len, kv_dim]
+                          const Tensor *rope_cos_pos,  // Shape: [seq_len, hd/2]
+                          const Tensor *rope_sin_pos,  // Shape: [seq_len, hd/2]
+                          int head_dim, int n_q, int n_kv, int pos, long long layer_offset,
+                          hipStream_t stream) {
+  GpuTimer timer("qkv_split_fused");
+  const int batch_size = (int)qkv_out->shape[0];
+  const int kv_dim = n_kv * head_dim;
+
+  // pre-offset caches to the current layer (BY ELEMENTS)
+  void *k_ptr = (char *)K_cache->d_buf +
+                (size_t)layer_offset * (size_t)(K_cache->shape[2] * kv_dim) * sizeof(float);
+  void *v_ptr = (char *)V_cache->d_buf +
+                (size_t)layer_offset * (size_t)(V_cache->shape[2] * kv_dim) * sizeof(float);
+
+  const int h2 = head_dim >> 1;
+  const int total_pairs = n_kv > n_q ? n_kv * h2 : n_q * h2;
+  const int vec_span = total_pairs > kv_dim ? total_pairs : kv_dim;
+
+  dim3 block_size(256);
+  dim3 grid_size(((vec_span + block_size.x - 1) / block_size.x), batch_size);
+
+  const float *cos_row = (const float *)rope_cos_pos->d_buf + (size_t)pos * h2;
+  const float *sin_row = (const float *)rope_sin_pos->d_buf + (size_t)pos * h2;
+
+  if (K_cache->dtype == DType::BF16) {
+    qkv_split_rope_store_kernel<true><<<grid_size, block_size, 0, stream>>>(
+      (const float *)qkv_out->d_buf, (float *)q_out->d_buf, k_ptr, v_ptr, cos_row, sin_row,
+      batch_size, head_dim, n_q, n_kv, (int)K_cache->shape[2], (int)K_cache->shape[1], pos);
+  } else {
+    qkv_split_rope_store_kernel<false><<<grid_size, block_size, 0, stream>>>(
+      (const float *)qkv_out->d_buf, (float *)q_out->d_buf, k_ptr, v_ptr, cos_row, sin_row,
+      batch_size, head_dim, n_q, n_kv, (int)K_cache->shape[2], (int)K_cache->shape[1], pos);
+  }
+  CHECK_HIP(hipGetLastError());
 }
 
 __global__ void add_vector_kernel_batched(float *y, const float *b, int len) {
@@ -843,8 +943,8 @@ void attn_out_project_batched_v2(Tensor *tb,         // Shape: [batch_size, n_at
   {
     constexpr int BM = 16;
     constexpr int BN = 128;
-    constexpr int BK = 32;
-    constexpr int TM = 2;
+    constexpr int BK = 16;
+    constexpr int TM = 1;
     constexpr int TN = 4;
 
     const int BLOCK_SIZE_X = BN / TN;
@@ -1403,23 +1503,23 @@ void classifier_gemm_batched_v2(const Tensor *W_out,  // Shape: [hidden_dim, voc
   const int hidden_dim = x->shape[1];
   const int vocab_size = W_out->shape[1];
 
-  const float *w_out_ptr = (const float *)W_out->d_buf;
+  const bf16 *w_out_ptr = (const bf16 *)W_out->d_buf;
   const float *x_ptr = (const float *)x->d_buf;
   float *logits_buf = (float *)logits->d_buf;
 
   {
     constexpr int BM = 16;
-    constexpr int BN = 128;
-    constexpr int BK = 32;
+    constexpr int BN = 256;
+    constexpr int BK = 16;
     constexpr int TM = 2;
-    constexpr int TN = 4;
+    constexpr int TN = 8;
 
     const int BLOCK_SIZE_X = BN / TN;
     const int BLOCK_SIZE_Y = BM / TM;
     dim3 block_size(BLOCK_SIZE_X, BLOCK_SIZE_Y);
     dim3 grid_size((vocab_size + BN - 1) / BN, (batch_size + BM - 1) / BM);
 
-    matmul_kernel<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
+    matmul_kernel_bf16<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
       x_ptr, w_out_ptr, logits_buf, nullptr, batch_size, vocab_size, hidden_dim);
     CHECK_HIP(hipGetLastError());
   }

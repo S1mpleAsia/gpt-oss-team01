@@ -98,7 +98,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     size_t vocab_size = p->vocab_size;
     size_t hidden_dim = p->hidden_dim;
 
-    weights->out = new Tensor({hidden_dim, vocab_size}, device_id);
+    weights->out = new Tensor({hidden_dim, vocab_size}, device_id, DType::BF16);
 
     for (size_t i = 0; i < vocab_size; i++) {
       for (size_t j = 0; j < hidden_dim; j++) {

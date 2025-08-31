@@ -27,18 +27,21 @@ float *forward_gpu_20b_batched(Config *p, OurTransformerWeights *weights_total,
     qkv_gemm_batched_v2(rs->t, weights->w_qkv, weights->b_qkv, rs->qkv, 1ll * l, false,
                         false);  // This kernel diverges the most
 
-    // Separate q, k, v + RoPE
-    qkv_split_rope_batched(rs->qkv, rs->q, rs->k, rs->v, rs->cos_tensor, rs->sin_tensor,
-                           p->head_dim, p->n_attn_heads, p->n_kv_heads, pos, false, false, false,
-                           false);
+    // // Separate q, k, v + RoPE
+    // qkv_split_rope_batched(rs->qkv, rs->q, rs->k, rs->v, rs->cos_tensor, rs->sin_tensor,
+    //                        p->head_dim, p->n_attn_heads, p->n_kv_heads, pos, false, false, false,
+    //                        false);
 
-    // Store k, v in cache
-    for (int b = 0; b < cur_batch_size; b++) {
-      memcpy_tensor(rs->key_cache, rs->k, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim,
-                    1ll * b * kv_dim, kv_dim, false, true);
-      memcpy_tensor(rs->value_cache, rs->v, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim,
-                    1ll * b * kv_dim, kv_dim, false, true);
-    }
+    // // Store k, v in cache
+    // for (int b = 0; b < cur_batch_size; b++) {
+    //   memcpy_tensor(rs->key_cache, rs->k, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim,
+    //                 1ll * b * kv_dim, kv_dim, false, true);
+    //   memcpy_tensor(rs->value_cache, rs->v, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim,
+    //                 1ll * b * kv_dim, kv_dim, false, true);
+    // }
+
+    qkv_split_rope_fused(rs->qkv, rs->q, rs->key_cache, rs->value_cache, rs->cos_tensor,
+                         rs->sin_tensor, p->head_dim, p->n_attn_heads, p->n_kv_heads, pos, l);
 
     // multihead attention
     int kv_mul = p->n_attn_heads / p->n_kv_heads;  // integer multiplier for GQA
@@ -52,10 +55,12 @@ float *forward_gpu_20b_batched(Config *p, OurTransformerWeights *weights_total,
     attn_out_project_batched_v2(rs->tb, weights->w_o, weights->b_o, rs->tb2, 1ll * l, false, false);
 
     // residual connection back into x
-    add_vector_batched(rs->x, rs->tb2, false, false, false);  // equals residual add
+    // add_vector_batched(rs->x, rs->tb2, false, false, false);  // equals residual add
 
     // ffn rmsnorm
-    rmsnorm_batched(rs->x, weights->rms_ffn_w, rs->t, 1ll * l, false, false);
+    // rmsnorm_batched(rs->x, weights->rms_ffn_w, rs->t, 1ll * l, false, false);
+
+    residual_rmsnorm_batched(rs->tb2, rs->x, weights->rms_ffn_w, rs->t, 1ll * l, 1e-6f);
 
     // MoE routing
     router_gemm_batched(weights->w_router, rs->t, weights->b_router, rs->router_score, 1ll * l,

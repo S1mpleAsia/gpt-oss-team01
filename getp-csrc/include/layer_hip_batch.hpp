@@ -17,6 +17,12 @@ void rmsnorm_batched(Tensor *x,    // Shape: [batch_size, hidden_dim]
                      long long layer_offset, bool x_to_device, bool out_from_device,
                      float eps = 1e-5f, hipStream_t stream = 0);
 
+void residual_rmsnorm_batched(Tensor *x,         // Shape: [batch_size, hidden_dim]
+                              Tensor *residual,  // Shape: [batch_size, hidden_dim]
+                              Tensor *w,         // Shape: [n_layers, hidden_dim]
+                              Tensor *out,       // Shape: [batch_size, hidden_dim]
+                              long long layer_offset, float epsilon, hipStream_t stream = 0);
+
 // ---------- QKV GEMM ----------
 void qkv_gemm_batched(Tensor *x,            // Shape: [batch_size, hidden_dim]
                       const Tensor *W_qkv,  // Shape: [out_features, hidden_dim]
@@ -42,6 +48,15 @@ void qkv_split_rope_batched(Tensor *qkv_out,             // Shape: [batch_size, 
                             int head_dim, int n_q, int n_kv, int pos, bool qkv_out_to_device,
                             bool q_out_from_device, bool k_out_from_device, bool v_out_from_device,
                             hipStream_t stream = 0);
+
+void qkv_split_rope_fused(Tensor *qkv_out,  // Shape: [batch_size, (n_q + 2*n_kv)*hd]
+                          Tensor *q_out,    // Shape: [batch_size, n_q*hd]
+                          Tensor *K_cache,  // Shape: [batch_size, n_layers, seq_len, kv_dim]
+                          Tensor *V_cache,  // Shape: [batch_size, n_layers, seq_len, kv_dim]
+                          const Tensor *rope_cos_pos,  // Shape: [seq_len, hd/2]
+                          const Tensor *rope_sin_pos,  // Shape: [seq_len, hd/2]
+                          int head_dim, int n_q, int n_kv, int pos, long long layer_offset,
+                          hipStream_t stream = 0);
 
 void add_vector_batched(Tensor *y,  // Shape: [batch_size, hidden_dim]
                         Tensor *b,  // Shape: [batch_size, hidden_dim]
