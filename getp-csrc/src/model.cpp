@@ -4,9 +4,10 @@
 
 float *forward_gpu_120b_batched(
   Config *p, OurTransformerWeights *weights_total, OurRunState *rs_total,
-  int *tokens, int pos, int cur_batch_size, int flow_id
+  int *tokens, int pos, int cur_batch_size, int flow_id,
+  int tp_rank, int pp_rank
 ) {
-  int cur_device = flow_id * TOTAL_PIPELINES;
+  int cur_device = flow_id * TOTAL_PIPELINES + tp_rank;
 
   OurTransformerWeights *weights = &weights_total[cur_device];
   OurRunState *rs = &rs_total[cur_device];
@@ -23,13 +24,13 @@ float *forward_gpu_120b_batched(
   // forward all the layers
   for (int pipeline_id = 0; pipeline_id < PP; pipeline_id++) {
     if (pipeline_id) {
-      cur_device++;
+      cur_device += TP;
       CHECK_HIP(hipSetDevice(cur_device));
 
       OurRunState *rs_new = &rs_total[cur_device];
       
       // sync from rs->x to rs->x
-      CHECK_HIP(hipMemcpyPeerAsync(rs_new->x->d_buf, cur_device, rs->x->d_buf, cur_device - 1, rs->x->num_elem() * rs->x->get_dtype_size(), 0));
+      CHECK_HIP(hipMemcpyPeerAsync(rs_new->x->d_buf, cur_device, rs->x->d_buf, cur_device - TP, rs->x->num_elem() * rs->x->get_dtype_size(), 0));
 
       weights = &weights_total[cur_device];
       rs = &rs_total[cur_device];
@@ -223,9 +224,21 @@ float *forward_gpu_120b_batched(
       #endif
 
       // Route the tokens to their corresponding top-k experts
+      int tp_rank = cur_device % TP;
       moe_apply_topk_batched(rs->t, weights->w_mlp1, weights->b_mlp1, weights->w_mlp2, weights->b_mlp2,
                     rs->topk_i, rs->topk_v, rs->mlp1_out, rs->gate_up, rs->tb3, rs->e_agg,
-                    p->swiglu_limit, 1ll * l, false, false, false, false);
+                    p->swiglu_limit, 1ll * l, false, false, false, false, tp_rank);
+      
+      if (l == 11 && false) {
+        rs->e_agg->from_device(0);
+        CHECK_HIP(hipDeviceSynchronize());
+        printf("rs->e_agg: ");
+        for (int id_test = 0; id_test < 5; id_test++) {
+          printf("%.6f ", rs->e_agg->buf[id_test]);
+        }
+        printf("\n");
+        fflush(stdout);
+      }
 
       #ifdef DEBUG
         if (flow_id == 0) {
@@ -259,6 +272,8 @@ float *forward_gpu_120b_batched(
     }
     CHECK_HIP(hipDeviceSynchronize());
   }
+
+  // exit(1);
 
   #ifdef DEBUG
     if (flow_id == 0) {
@@ -341,7 +356,7 @@ float *forward_gpu_20b_batched(
     // Route the tokens to their corresponding top-k experts
     moe_apply_topk_batched(rs->t, weights->w_mlp1, weights->b_mlp1, weights->w_mlp2, weights->b_mlp2,
                    rs->topk_i, rs->topk_v, rs->mlp1_out, rs->gate_up, rs->tb3, rs->e_agg,
-                   p->swiglu_limit, 1ll * l, false, false, false, false);
+                   p->swiglu_limit, 1ll * l, false, false, false, false, 0);
 
     // residual connection
     add_vector_batched(rs->x, rs->e_agg, false, false, false);  // equals residual add

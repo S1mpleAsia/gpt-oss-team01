@@ -95,20 +95,20 @@ void topk_softmax_batched(
 
 // ---------- MoE apply TopK  ----------
 void moe_apply_topk_batched(
-  Tensor *t,            // Shape [batch_size, hidden_dim]
-  const Tensor *W1,     // Shape [n_layers, n_experts, 2*inter_dim, hidden_dim]
-  const Tensor *b1,     // Shape [n_layers, n_experts, 2*inter_dim]
-  const Tensor *W2,     // Shape [n_layers, n_experts, hidden_dim, inter_dim]
-  const Tensor *b2,     // Shape [n_layers, n_experts, hidden_dim]
-  TensorI32 *topk_idx,  // Shape [batch_size, k]
-  Tensor *topk_vals,    // Shape [batch_size, k]
-  Tensor *mlp1_out,     // Shape [batch_size, k, 2*inter_dim]
-  Tensor *gate_up,      // Shape [batch_size, k, inter_dim]
-  Tensor *tb3,          // Shape [batch_size, k, hidden_dim]
-  Tensor *e_agg,        // Shape [batch_size, hidden_dim]
-  float clamp_limit, long long layer_offset, bool t_to_device,
-  bool topk_idx_to_device, bool topk_vals_to_device, bool e_agg_from_device,
-  hipStream_t stream = 0
+  Tensor *t,              // [B,H]
+  const Tensor *W1,       // [L,E_local,2I,H] (bf16)
+  const Tensor *b1,       // [L,E_local,2I]   (bf16)
+  const Tensor *W2,       // [L,E_local,H,I]  (bf16)
+  const Tensor *b2,       // [L,E_local,H]    (bf16)
+  TensorI32 *topk_idx,    // [B,k]
+  Tensor *topk_vals,      // [B,k]
+  Tensor *mlp1_out,       // [B,k,2I]
+  Tensor *gate_up,        // [B,k,I]
+  Tensor *tb3,            // [B,k,H]
+  Tensor *e_agg,          // [B,H]
+  float clamp_limit, long long layer_offset,
+  bool t_to_device, bool topk_idx_to_device, bool topk_vals_to_device,
+  bool e_agg_from_device, int tp_rank, hipStream_t stream = 0
 );
 
 // ---------- Classifier & Residuals ----------

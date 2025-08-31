@@ -17,6 +17,7 @@
 #define TP 1
 #define TOTAL_GPUS_NEEDED ((DP) * (PP) * (TP))
 #define TOTAL_PIPELINES ((PP) * (TP))
+#define TOTAL_STAGES ((DP) * (TP))
 
 typedef struct {
   // token_embedding_table - embedding.weight

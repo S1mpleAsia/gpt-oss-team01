@@ -179,7 +179,8 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer, Sampler *sam
 
 long long batched_getp_generate(
   const std::vector<const char *> &input_batch,
-  const std::vector<int *> &output_batch, int steps, int flow_id
+  const std::vector<int *> &output_batch, int steps, int flow_id,
+  int tp_rank, int pp_rank
 ) {
   const int batch_size = input_batch.size();
   if (batch_size == 0)
@@ -217,53 +218,55 @@ long long batched_getp_generate(
 
   for (int pos = 0; pos < steps && active_count > 0; ++pos) {
     float *batch_logits =
-      forward_gpu_120b_batched(public_config, weights, rs, current_tokens.data(), pos, batch_size, flow_id);
+      forward_gpu_120b_batched(public_config, weights, rs, current_tokens.data(), pos, batch_size, flow_id, tp_rank, pp_rank);
 
-    for (int i = 0; i < batch_size; i++) {
-      if (!active[i])
-        continue;
-      
-      float *logits = batch_logits + 1ll * i * public_config->vocab_size;
-
-      int next_token;
-      if (current_pos[i] < num_prompt_tokens[i] - 1) {
-        next_token = batch_prompt_tokens[i][current_pos[i] + 1];
-      } else {
-        next_token = sample(public_sampler, logits);
-        output_batch[i][current_pos[i] - (num_prompt_tokens[i] - 1)] = next_token;
-      }
-      
-      // Print the logits in the desired format if the flag is enabled
-      #ifdef PRINT_LOGITS
-        // Decode the next token to get its string representation
-        const char *piece = decode_piece(tokenizer, current_tokens[i], next_token);
+    if (tp_rank == 0) {
+      for (int i = 0; i < batch_size; i++) {
+        if (!active[i])
+          continue;
         
-        // Use a critical section for printing to prevent interleaved output
-        #pragma omp critical
-        {
-            printf("batch id %d --> ", i);
-            safe_printf(piece);
-            printf("logits: ");
-            for (int j = 0; j < 5; j++) {
-                printf("%.6f ", logits[j]);
-            }
-            printf("\n");
-            fflush(stdout);
-        }
-      #endif
+        float *logits = batch_logits + 1ll * i * public_config->vocab_size;
 
-      if (next_token == 199999 || next_token == 200002) {
-      #pragma omp critical
-        {
-          if (active[i]) {
-            active[i] = false;
-            active_count--;
+        int next_token;
+        if (current_pos[i] < num_prompt_tokens[i] - 1) {
+          next_token = batch_prompt_tokens[i][current_pos[i] + 1];
+        } else {
+          next_token = sample(public_sampler, logits);
+          output_batch[i][current_pos[i] - (num_prompt_tokens[i] - 1)] = next_token;
+        }
+        
+        // Print the logits in the desired format if the flag is enabled
+        #ifdef PRINT_LOGITS
+          // Decode the next token to get its string representation
+          const char *piece = decode_piece(tokenizer, current_tokens[i], next_token);
+          
+          // Use a critical section for printing to prevent interleaved output
+          #pragma omp critical
+          {
+              printf("batch id %d --> ", i);
+              safe_printf(piece);
+              printf("logits: ");
+              for (int j = 0; j < 5; j++) {
+                  printf("%.6f ", logits[j]);
+              }
+              printf("\n");
+              fflush(stdout);
+          }
+        #endif
+
+        if (next_token == 199999 || next_token == 200002) {
+        #pragma omp critical
+          {
+            if (active[i]) {
+              active[i] = false;
+              active_count--;
+            }
           }
         }
-      }
 
-      current_tokens[i] = next_token;
-      current_pos[i]++;
+        current_tokens[i] = next_token;
+        current_pos[i]++;
+      }
     }
   }
   
@@ -272,16 +275,20 @@ long long batched_getp_generate(
     printf("\n");
   #endif
 
-  for (int i = 0; i < batch_size; i++) {
-    int generated_len = current_pos[i] - num_prompt_tokens[i];
-    if (generated_len < 0)
-      generated_len = 0;
+  if (tp_rank == 0) {
+    for (int i = 0; i < batch_size; i++) {
+      int generated_len = current_pos[i] - num_prompt_tokens[i];
+      if (generated_len < 0)
+        generated_len = 0;
 
-    output_batch[i][generated_len + 1] = -1;
-    total_generate_tokens += generated_len;
+      output_batch[i][generated_len + 1] = -1;
+      total_generate_tokens += generated_len;
+    }
+
+    return total_generate_tokens;
+  } else {
+    return 0ll;
   }
-
-  return total_generate_tokens;
 }
 
 long long inference_old(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
@@ -307,7 +314,7 @@ long long inference_old(Transformer *transformer, Tokenizer *tokenizer, Sampler 
     // const char *input_seq = get_str_req_ptr(requests, idx);
     // int *output_tokens = get_tok_gen_ptr(requests, idx);
     num_token_out += batched_getp_generate(
-      input_batch, output_batch, requests->max_seq_len, 0
+      input_batch, output_batch, requests->max_seq_len, 0, 0, 0
     );
   }
   return num_token_out;
@@ -320,6 +327,9 @@ void *thread_handler(void *arg) {
   int id = args->id;
   int max_seq_len = public_requests->max_seq_len;
   int end_idx = args->end_idx;
+
+  int tp_rank = (id % TP);
+  int pp_rank = 0;
 
   CHECK_HIP(hipSetDevice(id));
 
@@ -335,7 +345,7 @@ void *thread_handler(void *arg) {
     }
 
     local_token_count += batched_getp_generate(
-      input_batch, output_batch, max_seq_len, id
+      input_batch, output_batch, max_seq_len, id, tp_rank, pp_rank
     );
   }
 
@@ -349,14 +359,14 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer, Sampler *sam
   setup(sampler, requests);
 
   long long num_token_out = 0;
-  pthread_t threads[DP];
-  ThreadArgs args[DP];
-  long long tokens_out[DP];
+  pthread_t threads[TOTAL_STAGES];
+  ThreadArgs args[TOTAL_STAGES];
+  long long tokens_out[TOTAL_STAGES];
 
   int total_reqs = public_requests->num_reqs;
   int chunk_size = (total_reqs + DP - 1) / DP;
     
-  for (int i = 0; i < DP; i++) {
+  for (int i = 0; i < TOTAL_STAGES; i++) {
     args[i].id = i;
     args[i].local_token_ptr = &tokens_out[i];
     args[i].start_idx = i * chunk_size;

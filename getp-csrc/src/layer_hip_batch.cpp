@@ -819,32 +819,53 @@ void topk_softmax_batched(Tensor *r,            // Shape: [batch_size, n_experts
 // We cache the entire input vector x in shared once, then reuse it for all rows.
 template<int WARPS_PER_BLOCK>
 __global__ void moe_mm_bf16w_xcached(
-    const bf16* __restrict__ W,       // [E, out_features, in_features]
-    const float* __restrict__ X,      // if offset_input==0: [B, in_features]
-                                      // if offset_input==1: [B,k,in_features]
-    const bf16* __restrict__ Bias,    // [E, out_features] or nullptr
-    float* __restrict__ Out,          // [B,k,out_features]
-    const int* __restrict__ topk_idx, // [B,k]
+    const bf16* __restrict__ W,      // [E_local, out_features, in_features]
+    const float* __restrict__ X,     // if offset_input==0: [B, in_features]
+                                    // if offset_input==1: [B,k,in_features]
+    const bf16* __restrict__ Bias,    // [E_local, out_features] or nullptr
+    float* __restrict__ Out,         // [B,k,out_features]
+    const int* __restrict__ topk_idx, // [B,k] (global expert indices)
     int B, int k, int out_features, int in_features,
-    int E, bool offset_input)
+    int E, bool offset_input,
+    int tp_rank, int tp_size) // <-- TP parameters
 {
     const int lane   = threadIdx.x & (WARP_SIZE - 1);
     const int warpId = threadIdx.x / WARP_SIZE;
 
-    const int pair = blockIdx.y;       // 0..B*k-1
+    const int pair = blockIdx.y;      // 0..B*k-1
     if (warpId >= WARPS_PER_BLOCK) return;
     const int b  = pair / k;
     const int ek = pair % k;
 
-    // Resolve expert for this (b,ek)
+    // Resolve GLOBAL expert for this (b,ek)
     const int expert = topk_idx[(size_t)b * k + ek];
 
-    // Base pointers
-    const size_t W_base   = (size_t)expert * (size_t)out_features * (size_t)in_features;
-    const size_t BiasBase = (size_t)expert * (size_t)out_features;
+    // --- TP CHANGE: Check if the expert is on this GPU rank ---
+    if (tp_size > 1) {
+        // E is the total number of experts across all ranks
+        const int experts_per_rank = E / tp_size;
+        const int start_expert = tp_rank * experts_per_rank;
+        const int end_expert = (tp_rank + 1) * experts_per_rank;
+
+        // If the required expert is not in this rank's range, exit.
+        if (expert < start_expert || expert >= end_expert) {
+            return;
+        }
+    }
+    // --- END TP CHANGE ---
+
+    // --- TP CHANGE: Calculate LOCAL expert index for memory access ---
+    // The W, Bias pointers are for the local shard of experts.
+    const int experts_per_rank = E / tp_size;
+    const int local_expert = (tp_size > 1) ? (expert % experts_per_rank) : expert;
+    // --- END TP CHANGE ---
+
+    // Base pointers using the LOCAL expert index
+    const size_t W_base   = (size_t)local_expert * (size_t)out_features * (size_t)in_features;
+    const size_t BiasBase = (size_t)local_expert * (size_t)out_features;
     const float* x_vec    = offset_input
-                            ? (X + (size_t)pair * (size_t)in_features)
-                            : (X + (size_t)b * (size_t)in_features);
+                              ? (X + (size_t)pair * (size_t)in_features)
+                              : (X + (size_t)b * (size_t)in_features);
     float* out_vec        = Out + (size_t)pair * (size_t)out_features;
 
     extern __shared__ float x_sh[]; // size = in_features
@@ -930,94 +951,101 @@ __global__ void weighted_accumulate_noatom_batched(
 }
 
 void moe_apply_topk_batched(
-  Tensor *t,            // [B,H]
-  const Tensor *W1,     // [L,E,2I,H] (bf16)
-  const Tensor *b1,     // [L,E,2I]   (bf16)
-  const Tensor *W2,     // [L,E,H,I]  (bf16)
-  const Tensor *b2,     // [L,E,H]    (bf16)
-  TensorI32 *topk_idx,  // [B,k]
-  Tensor *topk_vals,    // [B,k]
-  Tensor *mlp1_out,     // [B,k,2I]
-  Tensor *gate_up,      // [B,k,I]
-  Tensor *tb3,          // [B,k,H]
-  Tensor *e_agg,        // [B,H]
+  Tensor *t,              // [B,H]
+  const Tensor *W1,       // [L,E_local,2I,H] (bf16)
+  const Tensor *b1,       // [L,E_local,2I]   (bf16)
+  const Tensor *W2,       // [L,E_local,H,I]  (bf16)
+  const Tensor *b2,       // [L,E_local,H]    (bf16)
+  TensorI32 *topk_idx,    // [B,k]
+  Tensor *topk_vals,      // [B,k]
+  Tensor *mlp1_out,       // [B,k,2I]
+  Tensor *gate_up,        // [B,k,I]
+  Tensor *tb3,            // [B,k,H]
+  Tensor *e_agg,          // [B,H]
   float clamp_limit, long long layer_offset,
   bool t_to_device, bool topk_idx_to_device, bool topk_vals_to_device,
-  bool e_agg_from_device, hipStream_t stream)
-{
-    GpuTimer timer("moe_apply_topk_batched");
-    if (t_to_device)           t->to_device(stream);
-    if (topk_idx_to_device)    topk_idx->to_device(stream);
-    if (topk_vals_to_device)   topk_vals->to_device(stream);
+  bool e_agg_from_device, int tp_rank, hipStream_t stream
+) {
+  GpuTimer timer("moe_apply_topk_batched");
+  if (t_to_device)          t->to_device(stream);
+  if (topk_idx_to_device)   topk_idx->to_device(stream);
+  if (topk_vals_to_device)  topk_vals->to_device(stream);
 
-    const int B = (int)t->shape[0];
-    const int H = (int)t->shape[1];
-    const int k = (int)topk_idx->shape[1];
-    const int I = (int)W2->shape[3];
-    const int E = (int)W2->shape[1];
+  const int B = (int)t->shape[0];
+  const int H = (int)t->shape[1];
+  const int k = (int)topk_idx->shape[1];
+  const int I = (int)W2->shape[3];
+  // NOTE: W2->shape[1] is E_local (experts on this rank). E must be total experts.
+  const int E_local = (int)W2->shape[1];
+  const int E = E_local * TP; // Total experts across all ranks
 
-    // layer offsets
-    const long long L2IH = (long long)(2 * I) * H;
-    const long long LH   = (long long)H * I;
+  // layer offsets
+  const long long L2IH = (long long)(2 * I) * H;
+  const long long LH   = (long long)H * I;
 
-    const bf16* W1p = (const bf16*)W1->d_buf + (size_t)layer_offset * E * L2IH;
-    const bf16* b1p = (const bf16*)b1->d_buf + (size_t)layer_offset * E * (2 * I);
-    const bf16* W2p = (const bf16*)W2->d_buf + (size_t)layer_offset * E * LH;
-    const bf16* b2p = (const bf16*)b2->d_buf + (size_t)layer_offset * E * H;
+  const bf16* W1p = (const bf16*)W1->d_buf + (size_t)layer_offset * E_local * L2IH;
+  const bf16* b1p = (const bf16*)b1->d_buf + (size_t)layer_offset * E_local * (2 * I);
+  const bf16* W2p = (const bf16*)W2->d_buf + (size_t)layer_offset * E_local * LH;
+  const bf16* b2p = (const bf16*)b2->d_buf + (size_t)layer_offset * E_local * H;
 
-    const float* X1 = (const float*)t->d_buf;             // [B,H]
-    const float* Wt = (const float*)topk_vals->d_buf;     // [B,k]
-    const int*   Ti = topk_idx->d_buf;                    // [B,k]
+  const float* X1 = (const float*)t->d_buf;           // [B,H]
+  const float* Wt = (const float*)topk_vals->d_buf;   // [B,k]
+  const int* Ti = topk_idx->d_buf;                   // [B,k]
 
-    float* M1 = (float*)mlp1_out->d_buf;                  // [B,k,2I]
-    float* GU = (float*)gate_up->d_buf;                   // [B,k,I]
-    float* T3 = (float*)tb3->d_buf;                       // [B,k,H]
-    float* EA = (float*)e_agg->d_buf;                     // [B,H]
+  float* M1 = (float*)mlp1_out->d_buf;                 // [B,k,2I]
+  float* GU = (float*)gate_up->d_buf;                  // [B,k,I]
+  float* T3 = (float*)tb3->d_buf;                      // [B,k,H]
+  float* EA = (float*)e_agg->d_buf;                    // [B,H]
 
-    memset_tensor(e_agg, 0, false, true, stream);
+  // Note: It's important that mlp1_out and tb3 buffers are zero-initialized
+  // before this function, as some entries may not be written if their
+  // expert is on another rank.
+  memset_tensor(e_agg, 0, false, true, stream);
 
-    // Tunables
-    constexpr int WARPS = 8;                         // 8 warps/block → 512 threads
-    const dim3 blk(WARP_SIZE * WARPS);
-    size_t shmem_x_B = (size_t)H * sizeof(float);    // cache x[b] once
-    size_t shmem_x_I = (size_t)I * sizeof(float);    // cache gate[b,ek] once
+  // Tunables
+  constexpr int WARPS = 8;                         // 8 warps/block -> 512 threads
+  const dim3 blk(WARP_SIZE * WARPS);
+  size_t shmem_x_B = (size_t)H * sizeof(float);    // cache x[b] once
+  size_t shmem_x_I = (size_t)I * sizeof(float);    // cache gate[b,ek] once
 
-    // 1) FFN1: [B,k,2I] = W1[ek]*x[b] + b1[ek]
-    {
-        const int pairs = B * k;
-        const dim3 grd((unsigned)((2 * I + WARPS - 1) / WARPS), pairs);
-        moe_mm_bf16w_xcached<WARPS><<<grd, blk, shmem_x_B, stream>>>(
-            W1p, X1, b1p, M1, Ti, B, k, 2 * I, H, E, /*offset_input=*/false);
-        CHECK_HIP(hipGetLastError());
-    }
+  // 1) FFN1: [B,k,2I] = W1[ek]*x[b] + b1[ek]
+  {
+      const int pairs = B * k;
+      const dim3 grd((unsigned)((2 * I + WARPS - 1) / WARPS), pairs);
+      moe_mm_bf16w_xcached<WARPS><<<grd, blk, shmem_x_B, stream>>>(
+          W1p, X1, b1p, M1, Ti, B, k, 2 * I, H, E, /*offset_input=*/false,
+          tp_rank, TP); // Pass TP info
+      CHECK_HIP(hipGetLastError());
+  }
 
-    // 2) SwiGLU
-    {
-        const int NK = B * k;
-        size_t N = (size_t)NK * I;
-        dim3 blk2(256), grd2((unsigned)((N + blk2.x - 1) / blk2.x));
-        swiglu_interleaved_batched_fast<<<grd2, blk2, 0, stream>>>(M1, GU, I, NK, clamp_limit);
-        CHECK_HIP(hipGetLastError());
-    }
+  // 2) SwiGLU (no changes needed)
+  {
+      const int NK = B * k;
+      size_t N = (size_t)NK * I;
+      dim3 blk2(256), grd2((unsigned)((N + blk2.x - 1) / blk2.x));
+      swiglu_interleaved_batched_fast<<<grd2, blk2, 0, stream>>>(M1, GU, I, NK, clamp_limit);
+      CHECK_HIP(hipGetLastError());
+  }
 
-    // 3) FFN2: [B,k,H] = W2[ek]*gate[b,ek] + b2[ek]
-    {
-        const int pairs = B * k;
-        const dim3 grd((unsigned)((H + WARPS - 1) / WARPS), pairs);
-        moe_mm_bf16w_xcached<WARPS><<<grd, blk, shmem_x_I, stream>>>(
-            W2p, GU, b2p, T3, Ti, B, k, H, I, E, /*offset_input=*/true);
-        CHECK_HIP(hipGetLastError());
-    }
+  // 3) FFN2: [B,k,H] = W2[ek]*gate[b,ek] + b2[ek]
+  {
+      const int pairs = B * k;
+      const dim3 grd((unsigned)((H + WARPS - 1) / WARPS), pairs);
+      moe_mm_bf16w_xcached<WARPS><<<grd, blk, shmem_x_I, stream>>>(
+          W2p, GU, b2p, T3, Ti, B, k, H, I, E, /*offset_input=*/true,
+          tp_rank, TP); // Pass TP info
+      CHECK_HIP(hipGetLastError());
+  }
 
-    // 4) Weighted sum (deterministic)
-    {
-        size_t elems = (size_t)B * H;
-        dim3 blk3(256), grd3((unsigned)((elems + blk3.x - 1) / blk3.x));
-        weighted_accumulate_noatom_batched<<<grd3, blk3, 0, stream>>>(T3, Wt, EA, B, k, H);
-        CHECK_HIP(hipGetLastError());
-    }
+  // 4) Weighted sum (no changes needed)
+  {
+      size_t elems = (size_t)B * H;
+      dim3 blk3(256), grd3((unsigned)((elems + blk3.x - 1) / blk3.x));
+      weighted_accumulate_noatom_batched<<<grd3, blk3, 0, stream>>>(T3, Wt, EA, B, k, H);
+      CHECK_HIP(hipGetLastError());
+  }
 
-    if (e_agg_from_device) { e_agg->from_device(stream); CHECK_HIP(hipStreamSynchronize(stream)); }
+  if (e_agg_from_device) { e_agg->from_device(stream); CHECK_HIP(hipStreamSynchronize(stream)); }
 }
 
 // ---------- Classifier & Residuals ----------
