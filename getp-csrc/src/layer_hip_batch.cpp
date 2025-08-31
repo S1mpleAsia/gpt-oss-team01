@@ -142,8 +142,7 @@ void rmsnorm_batched(Tensor *x,    // Shape: [batch_size, hidden_dim]
   const float *w_ptr = (float *)w->d_buf + 1ll * layer_offset * hidden_dim;
   float *out_ptr = (float *)out->d_buf;
 
-  rmsnorm_kernel<<<grid_dim, block_dim, shared_mem_size, stream>>>(x_ptr, w_ptr, out_ptr,
-                                                                   hidden_dim, eps);
+  rmsnorm_kernel<<<grid_dim, block_dim, shared_mem_size, stream>>>(x_ptr, w_ptr, out_ptr, hidden_dim, eps);
   CHECK_HIP(hipGetLastError());
 
   if (out_from_device) {

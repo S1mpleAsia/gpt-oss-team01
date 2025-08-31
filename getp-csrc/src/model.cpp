@@ -25,34 +25,99 @@ float *forward_gpu_120b_batched(
     if (pipeline_id) {
       cur_device++;
       CHECK_HIP(hipSetDevice(cur_device));
+
+      OurRunState *rs_new = &rs_total[cur_device];
       
       // sync from rs->x to rs->x
-      CHECK_HIP(hipMemcpyPeerAsync((rs + 1)->x->d_buf, cur_device, rs->x->d_buf, cur_device - 1, rs->x->num_elem() * rs->x->get_dtype_size(), 0));
+      CHECK_HIP(hipMemcpyPeerAsync(rs_new->x->d_buf, cur_device, rs->x->d_buf, cur_device - 1, rs->x->num_elem() * rs->x->get_dtype_size(), 0));
 
-      weights++;
-      rs++;
+      weights = &weights_total[cur_device];
+      rs = &rs_total[cur_device];
     }
     for (int l = 0; l < p->n_layers / PP; l++) {
       // attention rmsnorm
       rmsnorm_batched(rs->x, weights->rms_attn_w, rs->t, 1ll * l,
                       false, false);
+      
+      #ifdef DEBUG
+        if (flow_id == 0) {
+          rs->t->from_device(0);
+          CHECK_HIP(hipDeviceSynchronize());
+          printf("rs->t: ");
+          for (int id_test = 0; id_test < 5; id_test++) {
+            printf("%.6f ", rs->t->buf[id_test]);
+          }
+          printf("\n");
+          fflush(stdout);
+        }
+      #endif
 
       // key and value point to the kv cache
       long long loff = 1ll * l * loff_one;  // kv cache layer offset
 
       // QKV projection
       qkv_gemm_batched(rs->t, weights->w_qkv, weights->b_qkv, rs->qkv, 1ll * l, false, false);  // This kernel diverges the most
+      
+      #ifdef DEBUG
+        if (flow_id == 0) {
+          rs->qkv->from_device(0);
+          CHECK_HIP(hipDeviceSynchronize());
+          printf("rs->qkv: ");
+          for (int id_test = 0; id_test < 5; id_test++) {
+            printf("%.6f ", rs->qkv->buf[id_test]);
+          }
+          printf("\n");
+          long long layer_offset_wqkv = 1ll * l * (weights->w_qkv->num_elem() / weights->w_qkv->shape[0]); 
+          printf("weights->w_qkv: ");
+          for (int id_test = 0; id_test < 5; id_test++) {
+            printf("%.6f ", weights->w_qkv->buf[layer_offset_wqkv + 1ll * id_test]);
+          }
+          printf("\n");
+          long long layer_offset_bqkv = 1ll * l * (weights->b_qkv->num_elem() / weights->b_qkv->shape[0]); 
+          printf("weights->b_qkv: ");
+          for (int id_test = 0; id_test < 5; id_test++) {
+            printf("%.6f ", weights->b_qkv->buf[layer_offset_bqkv + 1ll * id_test]);
+          }
+          printf("\n");
+          fflush(stdout);
+        }
+      #endif
 
       // Separate q, k, v + RoPE
       qkv_split_rope_batched(rs->qkv, rs->q, rs->k, rs->v, rs->cos_tensor,
                             rs->sin_tensor, p->head_dim, p->n_attn_heads,
                             p->n_kv_heads, pos, false, false, false, false);
+      #ifdef DEBUG
+        if (flow_id == 0) {
+          rs->q->from_device(0);
+          CHECK_HIP(hipDeviceSynchronize());
+          printf("rs->q: ");
+          for (int id_test = 0; id_test < 5; id_test++) {
+            printf("%.6f ", rs->q->buf[id_test]);
+          }
+          printf("\n");
+          fflush(stdout);
+        }
+      #endif
 
       // Store k, v in cache
       for (int b = 0; b < cur_batch_size; b++) {
         memcpy_tensor(rs->key_cache, rs->k, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim, 1ll * b * kv_dim, kv_dim, false, true);
         memcpy_tensor(rs->value_cache, rs->v, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim, 1ll * b * kv_dim, kv_dim, false, true);
       }
+      
+      #ifdef DEBUG
+        if (flow_id == 0) {
+          rs->key_cache->from_device(0);
+          CHECK_HIP(hipDeviceSynchronize());
+          printf("rs->key_cache: ");
+          for (int id_test = 0; id_test < 5; id_test++) {
+            printf("%.6f ", rs->key_cache->buf[id_test]);
+          }
+          printf("\n");
+          fflush(stdout);
+        }
+      #endif
 
       // multihead attention
       int kv_mul = p->n_attn_heads / p->n_kv_heads;  // integer multiplier for GQA
@@ -63,32 +128,143 @@ float *forward_gpu_120b_batched(
                                 p->n_attn_heads, kv_mul, kv_dim, p->seq_len,
                                 p->sliding_window, pos, 1ll * l, false, false,
                                 false, false, false);
-
+      #ifdef DEBUG
+        if (flow_id == 0) {
+          rs->tb->from_device(0);
+          CHECK_HIP(hipDeviceSynchronize());
+          printf("rs->tb: ");
+          for (int id_test = 0; id_test < 5; id_test++) {
+            printf("%.6f ", rs->tb->buf[id_test]);
+          }
+          printf("\n");
+          fflush(stdout);
+        }
+      #endif
+                                
       // final matmul to get the output of the attention
       attn_out_project_batched(rs->tb, weights->w_o, weights->b_o, rs->tb2, 1ll * l, false, false);
+
+      #ifdef DEBUG
+        if (flow_id == 0) {
+          rs->tb2->from_device(0);
+          CHECK_HIP(hipDeviceSynchronize());
+          printf("rs->tb2: ");
+          for (int id_test = 0; id_test < 5; id_test++) {
+            printf("%.6f ", rs->tb2->buf[id_test]);
+          }
+          printf("\n");
+          fflush(stdout);
+        }
+      #endif
 
       // residual connection back into x
       add_vector_batched(rs->x, rs->tb2, false, false, false);  // equals residual add
 
+      #ifdef DEBUG
+        if (flow_id == 0) {
+          rs->x->from_device(0);
+          CHECK_HIP(hipDeviceSynchronize());
+          printf("rs->x: ");
+          for (int id_test = 0; id_test < 5; id_test++) {
+            printf("%.6f ", rs->x->buf[id_test]);
+          }
+          printf("\n");
+          fflush(stdout);
+        }
+      #endif
+
       // ffn rmsnorm
       rmsnorm_batched(rs->x, weights->rms_ffn_w, rs->t, 1ll * l, false, false);
+      
+      #ifdef DEBUG
+        if (flow_id == 0) {
+          rs->t->from_device(0);
+          CHECK_HIP(hipDeviceSynchronize());
+          printf("rs->t: ");
+          for (int id_test = 0; id_test < 5; id_test++) {
+            printf("%.6f ", rs->t->buf[id_test]);
+          }
+          printf("\n");
+          fflush(stdout);
+        }
+      #endif
 
       // MoE routing
       router_gemm_batched(weights->w_router, rs->t, weights->b_router,
                   rs->router_score, 1ll * l, false, false);
 
+      #ifdef DEBUG
+        if (flow_id == 0) {
+          rs->router_score->from_device(0);
+          CHECK_HIP(hipDeviceSynchronize());
+          printf("rs->router_score: ");
+          for (int id_test = 0; id_test < 5; id_test++) {
+            printf("%.6f ", rs->router_score->buf[id_test]);
+          }
+          printf("\n");
+          fflush(stdout);
+        }
+      #endif
+
       // Select top-k experts
       topk_softmax_batched(rs->router_score, rs->topk_v, rs->topk_i, false, false, false);
+      
+      #ifdef DEBUG
+        if (flow_id == 0) {
+          rs->topk_v->from_device(0);
+          CHECK_HIP(hipDeviceSynchronize());
+          printf("rs->topk_v: ");
+          for (int id_test = 0; id_test < 5; id_test++) {
+            printf("%.6f ", rs->topk_v->buf[id_test]);
+          }
+          printf("\n");
+          fflush(stdout);
+        }
+      #endif
 
       // Route the tokens to their corresponding top-k experts
       moe_apply_topk_batched(rs->t, weights->w_mlp1, weights->b_mlp1, weights->w_mlp2, weights->b_mlp2,
                     rs->topk_i, rs->topk_v, rs->mlp1_out, rs->gate_up, rs->tb3, rs->e_agg,
                     p->swiglu_limit, 1ll * l, false, false, false, false);
 
+      #ifdef DEBUG
+        if (flow_id == 0) {
+          rs->e_agg->from_device(0);
+          CHECK_HIP(hipDeviceSynchronize());
+          printf("rs->e_agg: ");
+          for (int id_test = 0; id_test < 5; id_test++) {
+            printf("%.6f ", rs->e_agg->buf[id_test]);
+          }
+          printf("\n");
+          fflush(stdout);
+        }
+      #endif
+
       // residual connection
       add_vector_batched(rs->x, rs->e_agg, false, false, false);  // equals residual add
+      
+      #ifdef DEBUG
+        if (flow_id == 0) {
+          rs->x->from_device(0);
+          CHECK_HIP(hipDeviceSynchronize());
+          printf("rs->x: ");
+          for (int id_test = 0; id_test < 5; id_test++) {
+            printf("%.6f ", rs->x->buf[id_test]);
+          }
+          printf("\n");
+          printf("Finish layer %d\n", l);
+          fflush(stdout);
+        }
+      #endif
     }
+    CHECK_HIP(hipDeviceSynchronize());
   }
+
+  #ifdef DEBUG
+    if (flow_id == 0) {
+      exit(1);
+    }
+  #endif
 
   // final rmsnorm
   rmsnorm_batched(rs->x, weights->rms_out_w, rs->x, 0ll, false, false);

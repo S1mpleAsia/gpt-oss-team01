@@ -7,6 +7,8 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   if (device_id % TOTAL_PIPELINES == 0) {
     weights->token_embedding_table =
       new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->token_embedding_table, device_id);
+  } else {
+    weights->token_embedding_table = nullptr;
   }
 
   long long offset = 1ll * (device_id % TOTAL_PIPELINES) * (p->n_layers / PP);
@@ -18,7 +20,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     new Tensor({(size_t)(p->n_layers / PP),
                 ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * (size_t)p->head_dim,
                 (size_t)p->hidden_dim},
-               w->w_qkv + 1ll * offset * ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * (size_t)p->head_dim, device_id);
+               w->w_qkv + 1ll * offset * ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * (size_t)p->head_dim * (size_t)p->hidden_dim, device_id);
   weights->b_qkv = new Tensor(
     {(size_t)(p->n_layers / PP), ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim},
     w->b_qkv + 1ll * offset * ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim, device_id);
@@ -50,6 +52,9 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   if ((device_id + 1) % TOTAL_PIPELINES == 0) {
     weights->rms_out_w = new Tensor({(size_t)p->hidden_dim}, w->rms_out_w, device_id);
     weights->out = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->out, device_id);
+  } else {
+    weights->rms_out_w = nullptr;
+    weights->out = nullptr;
   }
 }
 
@@ -111,49 +116,49 @@ void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunSt
 
 void our_free_each(OurTransformerWeights *weights, OurRunState *rs) {
   // weights
-  delete weights->token_embedding_table;
-  delete weights->rms_attn_w;
-  delete weights->rms_ffn_w;
-  delete weights->w_qkv;
-  delete weights->w_o;
-  delete weights->b_qkv;
-  delete weights->b_o;
-  delete weights->attn_sinks;
-  delete weights->w_router;
-  delete weights->b_router;
-  delete weights->w_mlp1;
-  delete weights->w_mlp2;
-  delete weights->b_mlp1;
-  delete weights->b_mlp2;
-  delete weights->rms_out_w;
-  delete weights->out;
+  if (weights->token_embedding_table) delete weights->token_embedding_table;
+  if (weights->rms_attn_w) delete weights->rms_attn_w;
+  if (weights->rms_ffn_w) delete weights->rms_ffn_w;
+  if (weights->w_qkv) delete weights->w_qkv;
+  if (weights->w_o) delete weights->w_o;
+  if (weights->b_qkv) delete weights->b_qkv;
+  if (weights->b_o) delete weights->b_o;
+  if (weights->attn_sinks) delete weights->attn_sinks;
+  if (weights->w_router) delete weights->w_router;
+  if (weights->b_router) delete weights->b_router;
+  if (weights->w_mlp1) delete weights->w_mlp1;
+  if (weights->w_mlp2) delete weights->w_mlp2;
+  if (weights->b_mlp1) delete weights->b_mlp1;
+  if (weights->b_mlp2) delete weights->b_mlp2;
+  if (weights->rms_out_w) delete weights->rms_out_w;
+  if (weights->out) delete weights->out;
 
   // delete rs
-  delete rs->x;
-  delete rs->t;
-  delete rs->tb;
-  delete rs->tb2;
-  delete rs->router_score;
-  delete rs->topk_v;
-  delete rs->topk_i;
-  delete rs->mlp1_out;
-  delete rs->gate;
-  delete rs->up;
-  delete rs->gate_up;
-  delete rs->e_agg;
-  delete rs->qkv;
-  delete rs->q;
-  delete rs->k;
-  delete rs->v;
-  delete rs->att;
-  delete rs->logits;
-  delete rs->key_cache;
-  delete rs->value_cache;
-  delete rs->mask;
+  if (rs->x) delete rs->x;
+  if (rs->t) delete rs->t;
+  if (rs->tb) delete rs->tb;
+  if (rs->tb2) delete rs->tb2;
+  if (rs->router_score) delete rs->router_score;
+  if (rs->topk_v) delete rs->topk_v;
+  if (rs->topk_i) delete rs->topk_i;
+  if (rs->mlp1_out) delete rs->mlp1_out;
+  if (rs->gate) delete rs->gate;
+  if (rs->up) delete rs->up;
+  if (rs->gate_up) delete rs->gate_up;
+  if (rs->e_agg) delete rs->e_agg;
+  if (rs->qkv) delete rs->qkv;
+  if (rs->q) delete rs->q;
+  if (rs->k) delete rs->k;
+  if (rs->v) delete rs->v;
+  if (rs->att) delete rs->att;
+  if (rs->logits) delete rs->logits;
+  if (rs->key_cache) delete rs->key_cache;
+  if (rs->value_cache) delete rs->value_cache;
+  if (rs->mask) delete rs->mask;
 
   // Others
-  delete rs->cos_tensor;
-  delete rs->sin_tensor;
+  if (rs->cos_tensor) delete rs->cos_tensor;
+  if (rs->sin_tensor) delete rs->sin_tensor;
 }
 
 void our_free(OurTransformerWeights *weights, OurRunState *rs) {
