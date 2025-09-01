@@ -88,8 +88,6 @@ typedef struct {
   TensorI32 *sorted_pair_ids;  // [batch_size * experts_per_token]
   TensorI32 *expert_offsets;   // [n_experts + 1]
   Tensor *x_packed;            // [batch_size * experts_per_token, hidden_dim]
-  TensorI32 *pair2pos;         // [batch_size * experts_per_token]
-  int *d_max_rows;
 } OurRunState;
 
 typedef struct {

@@ -683,6 +683,18 @@ void moe_block_matmul_style(
   float *e_agg_ptr = (float *)e_agg->d_buf;
 
   CHECK_HIP(hipMemsetAsync(e_agg_ptr, 0, (size_t)batch_size * hidden_dim * sizeof(float), stream));
+  CHECK_HIP(
+    hipMemsetAsync(mlp1_out->d_buf, 0, mlp1_out->num_elem() * mlp1_out->get_dtype_size(), stream));
+  CHECK_HIP(
+    hipMemsetAsync(gate_up->d_buf, 0, gate_up->num_elem() * gate_up->get_dtype_size(), stream));
+  CHECK_HIP(hipMemsetAsync(tb3->d_buf, 0, tb3->num_elem() * tb3->get_dtype_size(), stream));
+
+  CHECK_HIP(
+    hipMemsetAsync(sorted_pair_ids->d_buf, 0, sorted_pair_ids->num_elem() * sizeof(int), stream));
+  CHECK_HIP(
+    hipMemsetAsync(expert_offsets->d_buf, 0, expert_offsets->num_elem() * sizeof(int), stream));
+  CHECK_HIP(
+    hipMemsetAsync(x_packed->d_buf, 0, x_packed->num_elem() * x_packed->get_dtype_size(), stream));
 
   // ====== 1) sort & offsets ======
   {
@@ -722,22 +734,16 @@ void moe_block_matmul_style(
 
   {
     GpuTimer timer("moe_mlp1");
-    CHECK_HIP(hipMemsetAsync(mlp1_out->d_buf, 0, mlp1_out->num_elem() * mlp1_out->get_dtype_size(),
-                             stream));
     constexpr int BM = 16, BN = 128, BK = 16, TM = 2, TN = 8;
     dim3 block_size(BN / TN, BM / TM);
     dim3 grid_size((2 * inter_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
     matmul_kernel_bf16_moe<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
-      (const float *)x_packed->d_buf,
-      (const bf16 *)w1_ptr,  // base của layer (như bạn đã tính)
-      (float *)mlp1_out->d_buf, (const bf16 *)b1_ptr, expert_offsets->d_buf, total_pairs,
-      2 * inter_dim, hidden_dim);
+      (const float *)x_packed->d_buf, w1_ptr, (float *)mlp1_out->d_buf, b1_ptr,
+      expert_offsets->d_buf, total_pairs, 2 * inter_dim, hidden_dim);
   }
 
   {
     GpuTimer timer("moe_swiglu");
-    CHECK_HIP(
-      hipMemsetAsync(gate_up->d_buf, 0, gate_up->num_elem() * gate_up->get_dtype_size(), stream));
     size_t total = (size_t)batch_size * experts_per_token * inter_dim;
     dim3 block_size(256);
     dim3 grid_size((total + 255) / 256);
@@ -748,13 +754,12 @@ void moe_block_matmul_style(
 
   {
     GpuTimer timer("moe_mlp2");
-    CHECK_HIP(hipMemsetAsync(tb3->d_buf, 0, tb3->num_elem() * tb3->get_dtype_size(), stream));
     constexpr int BM = 16, BN = 128, BK = 16, TM = 2, TN = 8;
     dim3 block_size(BN / TN, BM / TM);
     dim3 grid_size((hidden_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
     matmul_kernel_bf16_moe<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
-      (const float *)gate_up->d_buf, (const bf16 *)w2_ptr, (float *)tb3->d_buf,
-      (const bf16 *)b2_ptr, expert_offsets->d_buf, total_pairs, hidden_dim, inter_dim);
+      (const float *)gate_up->d_buf, w2_ptr, (float *)tb3->d_buf, b2_ptr, expert_offsets->d_buf,
+      total_pairs, hidden_dim, inter_dim);
   }
 
   {
@@ -763,8 +768,8 @@ void moe_block_matmul_style(
     dim3 grid_size((hidden_dim + block_size.x - 1) / block_size.x,
                    (max_rows_per_expert + block_size.y - 1) / block_size.y, n_experts);
     scale_scatter_add_kernel_sorted_all<<<grid_size, block_size, 0, stream>>>(
-      (const float *)tb3->d_buf, (const int *)sorted_pair_ids->d_buf, (const float *)topk_v_ptr,
-      (float *)e_agg_ptr, expert_offsets->d_buf, hidden_dim, experts_per_token);
+      (const float *)tb3->d_buf, (const int *)sorted_pair_ids->d_buf, topk_v_ptr, e_agg_ptr,
+      expert_offsets->d_buf, hidden_dim, experts_per_token);
   }
 
   CHECK_HIP(hipGetLastError());

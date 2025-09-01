@@ -1345,8 +1345,7 @@ void moe_block_matmul_style_hip(
   TensorI32 *sorted_pair_ids,  // [batch_size * experts_per_token]
   TensorI32 *expert_offsets,   // [n_experts + 1]
   Tensor *x_packed,            // [batch_size * experts_per_token, hidden_dim]
-  TensorI32 *pair2pos,         // [batch_size * experts_per_token]
-  int *d_max_rows, float clamp_limit, long long layer_offset, hipStream_t stream) {
+  float clamp_limit, long long layer_offset, hipStream_t stream) {
   GpuTimer timer("moe_v2");
   moe_block_matmul_style(x_in, topk_idx, topk_v, w_mlp1, b_mlp1, w_mlp2, b_mlp2, e_agg, mlp1_out,
                          gate_up, tb3, sorted_pair_ids, expert_offsets, x_packed, clamp_limit,

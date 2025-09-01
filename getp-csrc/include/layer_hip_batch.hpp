@@ -135,8 +135,7 @@ void moe_block_matmul_style_hip(
   TensorI32 *sorted_pair_ids,  // [batch_size * experts_per_token]
   TensorI32 *expert_offsets,   // [n_experts + 1]
   Tensor *x_packed,            // [batch_size * experts_per_token, hidden_dim]
-  TensorI32 *pair2pos,         // [batch_size * experts_per_token]
-  int *d_max_rows, float clamp_limit, long long layer_offset, hipStream_t stream = 0);
+  float clamp_limit, long long layer_offset, hipStream_t stream = 0);
 
 static inline void moe_mlp1_batched(Tensor *t, Tensor *w_mlp1, Tensor *b_mlp1, TensorI32 *topk_idx,
                                     Tensor *mlp1_out, bool t_to_device, bool topk_idx_to_device,

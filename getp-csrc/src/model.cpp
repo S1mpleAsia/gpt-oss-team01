@@ -85,10 +85,10 @@ float *forward_gpu_20b_batched(Config *p, OurTransformerWeights *weights_total,
 
     // moe_agg_batched(rs->tb3, rs->topk_v, rs->e_agg, p->experts_per_token, false);
 
-    moe_block_matmul_style_hip(
-      rs->t, rs->topk_i, rs->topk_v, weights->w_mlp1, weights->b_mlp1, weights->w_mlp2,
-      weights->b_mlp2, rs->e_agg, rs->mlp1_out, rs->gate_up, rs->tb3, rs->sorted_pair_ids,
-      rs->expert_offsets, rs->x_packed, rs->pair2pos, rs->d_max_rows, p->swiglu_limit, 1ll * l);
+    moe_block_matmul_style_hip(rs->t, rs->topk_i, rs->topk_v, weights->w_mlp1, weights->b_mlp1,
+                               weights->w_mlp2, weights->b_mlp2, rs->e_agg, rs->mlp1_out,
+                               rs->gate_up, rs->tb3, rs->sorted_pair_ids, rs->expert_offsets,
+                               rs->x_packed, p->swiglu_limit, 1ll * l);
 
     // residual connection
     add_vector_batched(rs->x, rs->e_agg, false, false, false);  // equals residual add

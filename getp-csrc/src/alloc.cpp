@@ -251,8 +251,6 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id) 
   rs->expert_offsets = new TensorI32({(size_t)(p->n_experts + 1)}, device_id);
   rs->x_packed =
     new Tensor({(size_t)BATCH_SIZE * p->experts_per_token, (size_t)p->hidden_dim}, device_id);
-  rs->pair2pos = new TensorI32({(size_t)BATCH_SIZE * p->experts_per_token}, device_id);
-  CHECK_HIP(hipMalloc(&rs->d_max_rows, sizeof(int)));
 
   rs->cos_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2}, device_id);
   rs->sin_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2}, device_id);
@@ -316,8 +314,6 @@ void our_free_each(OurTransformerWeights *weights, OurRunState *rs) {
   delete rs->sorted_pair_ids;
   delete rs->expert_offsets;
   delete rs->x_packed;
-  delete rs->pair2pos;
-  CHECK_HIP(hipFree(rs->d_max_rows));
 
   // Others
   delete rs->cos_tensor;
