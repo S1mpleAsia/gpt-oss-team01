@@ -7,8 +7,21 @@
 #include "tensor.hpp"
 #include "config_run.hpp"
 
+#define RUN_BATCH
 #define BATCH_SIZE 1
-Tensor *cos_tensor, *sin_tensor;
+
+#define REPLICA_SIZE 4
+#define PP 2
+#define TP 2
+#define PRINT_LOGITS
+// #define TIME_GPU
+// #define DEBUG
+
+// #define DP 1
+// #define PP 1
+// #define TP 1
+#define DP_20B 1
+#define DP_120B 1
 
 typedef struct {
   // token_embedding_table - embedding.weight
@@ -47,29 +60,44 @@ typedef struct {
 } OurTransformerWeights;
 
 typedef struct {
+  Tensor *cos_tensor;
+  Tensor *sin_tensor;
+
   // current wave of activations
   Tensor *x;             // activation at current time stamp (hidden_dim, )
   Tensor *t;             // same, but inside a residual branch (hidden_dim, )
   Tensor *tb;            // (head_dim * n_attn_heads, )
   Tensor *tb2;           // (hidden_dim, )
-  Tensor *tb3;           // (experts_per_token, hidden_dim)
+  Tensor *tb3;           // (n_experts, hidden_dim)
   Tensor *router_score;  // router score (n_experts, )
   Tensor *topk_v;        // topk expert weights (experts_per_token, )
   TensorI32 *topk_i;     // topk expert indices (experts_per_token, )
-  Tensor *mlp1_out;
+  Tensor *mlp1_out;      // [batch_size * experts_per_token, 2 * inter_dim]
   Tensor *gate;
   Tensor *up;
-  Tensor *gate_up;
-  Tensor *e_agg;
-  Tensor *qkv;     // an additional buffer just for convenience (head_dim *
-                   // (n_attn_heads + 2 * n_kv_heads), )
-  Tensor *q;       // query (n_attn_heads * head_dim,)
-  Tensor *k;       // key (n_kv_heads * head_dim,)
-  Tensor *v;       // value (n_kv_heads * head_dim,)
-  Tensor *att;     // buffer for scores/attention values (n_heads, seq_len)
-  Tensor *logits;  // output logits
+  Tensor *gate_up;  // [batch_size * experts_per_toeken, inter_dim]
+  Tensor *e_agg;    // [batch_size, hidden_dim]
+  Tensor *qkv;      // an additional buffer just for convenience (head_dim *
+                    // (n_attn_heads + 2 * n_kv_heads), )
+  Tensor *q;        // query (n_attn_heads * head_dim,)
+  Tensor *k;        // key (n_kv_heads * head_dim,)
+  Tensor *v;        // value (n_kv_heads * head_dim,)
+  Tensor *att;      // buffer for scores/attention values (n_heads, seq_len)
+  Tensor *logits;   // output logits
   // kv cache
   Tensor *key_cache;    // (layer, seq_len, kv_dim)
   Tensor *value_cache;  // (layer, seq_len, kv_dim)
   Tensor *mask;
+
+  // MoE buffer
+  TensorI32 *sorted_pair_ids;  // [batch_size * experts_per_token]
+  TensorI32 *expert_offsets;   // [n_experts + 1]
+  Tensor *x_packed;            // [batch_size * experts_per_token, hidden_dim]
 } OurRunState;
+
+typedef struct {
+  int id;
+  long long *local_token_ptr;
+  int start_idx;
+  int end_idx;
+} ThreadArgs;

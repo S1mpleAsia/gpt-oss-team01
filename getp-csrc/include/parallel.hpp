@@ -1,24 +1,21 @@
 #pragma once
 
-#include <vector>
 #include "tensor.hpp"
 #include "config.hpp"
+#include <cstring>
 #include <hip/hip_runtime.h>
-
-#define REPLICA_SIZE 4
-#define PP 2
-#define TP 2
+#include <vector>
 
 struct CommGroups {
   int local_rank;
   int pp_rank;
   int tp_rank;
-  std::vector<int> pp_group;
-  std::vector<int> tp_group;
+  vector<int> pp_group;
+  vector<int> tp_group;
 };
 
 struct Context {
-  std::vector<int> gpu_ids;
+  vector<int> gpu_ids;
   OurTransformerWeights *weights[REPLICA_SIZE];
   OurRunState *run_state[REPLICA_SIZE];
   CommGroups comm_groups[REPLICA_SIZE];
@@ -35,11 +32,11 @@ struct Context {
 
   Transformer *transformer;
 
-  void init(Transformer *transformer, const std::vector<int> &assigned_gpu_ids);
+  void init(Transformer *transformer, const vector<int> &assigned_gpu_ids);
   void destroy();
 };
 
 void our_init_weights_120b(Context *ctx, int gpu_id);
 void our_init_run_state_120b(Context *ctx, int gpu_id);
 
-float *forward_gpu_120b(Context *ctx, int token, int pos);
+float *forward_gpu_120b(Context *ctx, int *tokens, int pos);

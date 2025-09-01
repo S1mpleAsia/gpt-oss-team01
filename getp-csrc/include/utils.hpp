@@ -24,7 +24,9 @@ struct GpuTimer {
     CHECK_HIP(hipEventSynchronize(stop_event));
     float milliseconds = 0;
     CHECK_HIP(hipEventElapsedTime(&milliseconds, start_event, stop_event));
+#ifdef TIME_GPU
     printf("%s: %f ms\n", function_name, milliseconds);
+#endif
     CHECK_HIP(hipEventDestroy(start_event));
     CHECK_HIP(hipEventDestroy(stop_event));
   }

@@ -2,9 +2,105 @@
 #include <cmath>
 #include <cstring>
 
-float *forward_gpu_20b_batched(Config *p, OurTransformerWeights *weights, OurRunState *rs,
-                               int *tokens, int pos, int batch_size) {
-  return forward_gpu_20b(p, weights, rs, tokens[0], pos);
+float *forward_gpu_20b_batched(Config *p, OurTransformerWeights *weights_total,
+                               OurRunState *rs_total, int *tokens, int pos, int cur_batch_size,
+                               int flow_id) {
+  OurTransformerWeights *weights = &weights_total[flow_id];
+  OurRunState *rs = &rs_total[flow_id];
+
+  // copy the token embedding into x
+  embedding_lookup_batched(weights->token_embedding_table, tokens, rs->x, false);
+
+  long long kv_dim = 1ll * p->n_kv_heads * p->head_dim;
+  long long loff_one = 1ll * p->seq_len * kv_dim;
+  long long loff_one_batch = 1ll * p->n_layers * loff_one;
+
+  // forward all the layers
+  for (int l = 0; l < p->n_layers; l++) {
+    // attention rmsnorm
+    rmsnorm_batched(rs->x, weights->rms_attn_w, rs->t, 1ll * l, false, false);
+
+    // key and value point to the kv cache
+    long long loff = 1ll * l * loff_one;  // kv cache layer offset
+
+    // QKV projection
+    qkv_gemm_batched_v2(rs->t, weights->w_qkv, weights->b_qkv, rs->qkv, 1ll * l, false,
+                        false);  // This kernel diverges the most
+
+    // // Separate q, k, v + RoPE
+    // qkv_split_rope_batched(rs->qkv, rs->q, rs->k, rs->v, rs->cos_tensor, rs->sin_tensor,
+    //                        p->head_dim, p->n_attn_heads, p->n_kv_heads, pos, false, false, false,
+    //                        false);
+
+    // // Store k, v in cache
+    // for (int b = 0; b < cur_batch_size; b++) {
+    //   memcpy_tensor(rs->key_cache, rs->k, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim,
+    //                 1ll * b * kv_dim, kv_dim, false, true);
+    //   memcpy_tensor(rs->value_cache, rs->v, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim,
+    //                 1ll * b * kv_dim, kv_dim, false, true);
+    // }
+
+    qkv_split_rope_fused(rs->qkv, rs->q, rs->key_cache, rs->value_cache, rs->cos_tensor,
+                         rs->sin_tensor, p->head_dim, p->n_attn_heads, p->n_kv_heads, pos, l);
+
+    // multihead attention
+    int kv_mul = p->n_attn_heads / p->n_kv_heads;  // integer multiplier for GQA
+
+    // FIX single_query_attn_batched later
+    single_query_attn_batched(rs->q, rs->key_cache, rs->value_cache, rs->mask, weights->attn_sinks,
+                              rs->tb, p->head_dim, p->n_attn_heads, kv_mul, kv_dim, p->seq_len,
+                              p->sliding_window, pos, 1ll * l, false, false, false, false, false);
+
+    // final matmul to get the output of the attention
+    attn_out_project_batched_v2(rs->tb, weights->w_o, weights->b_o, rs->tb2, 1ll * l, false, false);
+
+    // residual connection back into x
+    // add_vector_batched(rs->x, rs->tb2, false, false, false);  // equals residual add
+
+    // ffn rmsnorm
+    // rmsnorm_batched(rs->x, weights->rms_ffn_w, rs->t, 1ll * l, false, false);
+
+    residual_rmsnorm_batched(rs->tb2, rs->x, weights->rms_ffn_w, rs->t, 1ll * l, 1e-5f);
+
+    // MoE routing
+    router_gemm_batched(weights->w_router, rs->t, weights->b_router, rs->router_score, 1ll * l,
+                        false, false);
+
+    // Select top-k experts
+    topk_softmax_batched(rs->router_score, rs->topk_v, rs->topk_i, false, false, false);
+
+    // Route the tokens to their corresponding top-k experts
+    // moe_apply_topk_batched(rs->t, weights->w_mlp1, weights->b_mlp1, weights->w_mlp2,
+    //                        weights->b_mlp2, rs->topk_i, rs->topk_v, rs->mlp1_out, rs->gate_up,
+    //                        rs->tb3, rs->e_agg, p->swiglu_limit, 1ll * l, false, false, false,
+    //                        false);
+
+    moe_mlp1_batched(rs->t, weights->w_mlp1, weights->b_mlp1, rs->topk_i, rs->mlp1_out, false,
+                     false, 1ll * l);
+
+    moe_swiglu_batched(rs->mlp1_out, rs->gate_up, p->experts_per_token, p->swiglu_limit);
+
+    moe_mlp2_batched(rs->gate_up, weights->w_mlp2, weights->b_mlp2, rs->tb3, rs->topk_i,
+                     p->experts_per_token, true, 1ll * l);
+
+    moe_agg_batched(rs->tb3, rs->topk_v, rs->e_agg, p->experts_per_token, false);
+
+    // moe_block_matmul_style_hip(rs->t, rs->topk_i, rs->topk_v, weights->w_mlp1, weights->b_mlp1,
+    //                            weights->w_mlp2, weights->b_mlp2, rs->e_agg, rs->mlp1_out,
+    //                            rs->gate_up, rs->tb3, rs->sorted_pair_ids, rs->expert_offsets,
+    //                            rs->x_packed, p->swiglu_limit, 1ll * l);
+
+    // residual connection
+    add_vector_batched(rs->x, rs->e_agg, false, false, false);  // equals residual add
+  }
+
+  // final rmsnorm
+  rmsnorm_batched(rs->x, weights->rms_out_w, rs->x, 0ll, false, false);
+
+  // classifier into logits
+  classifier_gemm_batched_v2(weights->out, rs->x, rs->logits, false, true);
+
+  return rs->logits->buf;
 }
 
 float *forward_gpu_20b(Config *p, OurTransformerWeights *weights, OurRunState *rs, int token,
@@ -29,7 +125,7 @@ float *forward_gpu_20b(Config *p, OurTransformerWeights *weights, OurRunState *r
              false);  // This kernel diverges the most
 
     // Separate q, k, v + RoPE
-    qkv_split_rope(rs->qkv, rs->q, rs->k, rs->v, cos_tensor, sin_tensor, p->head_dim,
+    qkv_split_rope(rs->qkv, rs->q, rs->k, rs->v, rs->cos_tensor, rs->sin_tensor, p->head_dim,
                    p->n_attn_heads, p->n_kv_heads, pos, false, false, false, false);
 
     // Store k, v in cache
@@ -143,8 +239,8 @@ float *forward_cpu_20b(Config *p, OurTransformerWeights *weights, OurRunState *r
 
     // Separate q, k, v + apply RoPE
     SplitQKV(rs->qkv, p->head_dim, p->n_attn_heads, p->n_kv_heads, rs->q, rs->k, rs->v);
-    ApplyRotary(rs->q, cos_tensor, sin_tensor, p->n_attn_heads, p->head_dim, pos);
-    ApplyRotary(rs->k, cos_tensor, sin_tensor, p->n_kv_heads, p->head_dim, pos);
+    ApplyRotary(rs->q, rs->cos_tensor, rs->sin_tensor, p->n_attn_heads, p->head_dim, pos);
+    ApplyRotary(rs->k, rs->cos_tensor, rs->sin_tensor, p->n_kv_heads, p->head_dim, pos);
 
     // Store k, v in cache
     memcpy(rs->key_cache->buf + loff + 1ll * pos * p->n_kv_heads * p->head_dim, rs->k->buf,

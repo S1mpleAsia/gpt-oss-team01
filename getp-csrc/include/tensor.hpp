@@ -35,6 +35,8 @@ struct Tensor {
   Tensor(const vector<size_t> &shape_, hipStream_t stream = 0, DType::Type dtype = DType::FP32);
   Tensor(const vector<size_t> &shape_, float *buf_, hipStream_t stream = 0,
          DType::Type dtype = DType::FP32);
+  Tensor(const vector<size_t> &shape_, float *buf_, bool batch_alloc, hipStream_t stream,
+         DType::Type dtype);
   ~Tensor();
 
   size_t num_elem() const;
@@ -52,6 +54,7 @@ struct TensorI32 {
   int *buf = nullptr;
   int *d_buf = nullptr;  // Device buffer
   bool owns_host_buf;
+  int gpu_id;
 
   TensorI32(const vector<size_t> &shape_, hipStream_t stream = 0);
   TensorI32(const vector<size_t> &shape_, int *buf_, hipStream_t stream = 0);

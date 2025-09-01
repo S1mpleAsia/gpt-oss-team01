@@ -1,8 +1,10 @@
 #include "../include/parallel.hpp"
 #include "../include/layer.hpp"
 #include "../include/layer_hip.hpp"
+#include "../include/layer_hip_batch.hpp"
 #include <iostream>
 #include <algorithm>
+#include <cstring>
 
 __global__ void add_vectors_kernel(float *dst, const float *src, int n) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -275,7 +277,24 @@ void our_init_run_state_120b(Context *ctx, int local_gpu_id) {
     {BATCH_SIZE, (size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
     s->value_cache, stream);
 
-  rs->mask = new Tensor({BATCH_SIZE, (size_t)p->seq_len, (size_t)p->seq_len}, s->mask, stream);
+  rs->mask = new Tensor({BATCH_SIZE, (size_t)p->seq_len, (size_t)p->seq_len}, stream);
+  size_t single_mask_elems = (size_t)p->seq_len * p->seq_len;
+
+  for (int b = 0; b < BATCH_SIZE; b++) {
+    float *dest_ptr = rs->mask->buf + b * single_mask_elems;
+    memcpy(dest_ptr, s->mask, single_mask_elems * sizeof(float));
+  }
+  rs->mask->to_device(stream);
+
+  // MoE buffer
+  rs->sorted_pair_ids = new TensorI32({(size_t)BATCH_SIZE * p->experts_per_token});
+  rs->expert_offsets = new TensorI32({(size_t)(p->n_experts + 1)});
+  rs->x_packed = new Tensor({(size_t)BATCH_SIZE * p->experts_per_token, (size_t)p->hidden_dim});
+
+  // rs->cos_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2});
+  // rs->sin_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2});
+
+  // RoPE is computed on Context::init
 }
 
 void our_init_weights_120b(Context *ctx, int local_gpu_id) {
@@ -305,16 +324,52 @@ void our_init_weights_120b(Context *ctx, int local_gpu_id) {
                w->rms_ffn_w + 1ll * pp_rank * layers_per_stage * p->hidden_dim, stream);
 
   // QKV / bias
-  weights->w_qkv = new Tensor(
-    {(size_t)layers_per_stage, qkv_layer_size, (size_t)p->hidden_dim},
-    w->w_qkv + 1ll * pp_rank * layers_per_stage * qkv_layer_size * p->hidden_dim, stream);
+  // weights->w_qkv = new Tensor(
+  //   {(size_t)layers_per_stage, qkv_layer_size, (size_t)p->hidden_dim},
+  //   w->w_qkv + 1ll * pp_rank * layers_per_stage * qkv_layer_size * p->hidden_dim, stream);
+
+  {
+    size_t hidden_dim = p->hidden_dim;
+
+    weights->w_qkv = new Tensor({(size_t)layers_per_stage, hidden_dim, qkv_layer_size}, stream);
+
+    for (size_t l = 0; l < layers_per_stage; l++) {
+      for (size_t i = 0; i < qkv_layer_size; i++) {
+        for (size_t j = 0; j < hidden_dim; j++) {
+          weights->w_qkv->buf[l * (hidden_dim * qkv_layer_size) + j * qkv_layer_size + i] =
+            w->w_qkv[1ll * pp_rank * layers_per_stage * qkv_layer_size * hidden_dim +
+                     l * qkv_layer_size * hidden_dim + i * hidden_dim + j];
+        }
+      }
+    }
+
+    weights->w_qkv->to_device(stream);
+  }
+
   weights->b_qkv = new Tensor({(size_t)layers_per_stage, qkv_layer_size},
                               w->b_qkv + 1ll * pp_rank * layers_per_stage * qkv_layer_size, stream);
 
   // O proj + bias
-  weights->w_o = new Tensor(
-    {(size_t)layers_per_stage, (size_t)p->hidden_dim, attn_out_layer_size},
-    w->w_o + 1ll * pp_rank * layers_per_stage * p->hidden_dim * attn_out_layer_size, stream);
+  // weights->w_o = new Tensor(
+  //   {(size_t)layers_per_stage, (size_t)p->hidden_dim, attn_out_layer_size},
+  //   w->w_o + 1ll * pp_rank * layers_per_stage * p->hidden_dim * attn_out_layer_size, stream);
+
+  {
+    size_t hidden_dim = p->hidden_dim;
+    weights->w_o = new Tensor({(size_t)layers_per_stage, attn_out_layer_size, hidden_dim}, stream);
+
+    for (size_t l = 0; l < layers_per_stage; l++) {
+      for (size_t i = 0; i < hidden_dim; i++) {
+        for (size_t j = 0; j < attn_out_layer_size; j++) {
+          weights->w_o->buf[l * attn_out_layer_size * hidden_dim + j * hidden_dim + i] =
+            w->w_o[1ll * pp_rank * layers_per_stage * hidden_dim * attn_out_layer_size +
+                   l * hidden_dim * attn_out_layer_size + i * attn_out_layer_size + j];
+        }
+      }
+    }
+
+    weights->w_o->to_device(stream);
+  }
 
   weights->b_o = new Tensor({(size_t)layers_per_stage, (size_t)p->hidden_dim},
                             w->b_o + 1ll * pp_rank * layers_per_stage * p->hidden_dim, stream);
@@ -417,27 +472,44 @@ void our_init_weights_120b(Context *ctx, int local_gpu_id) {
     new Tensor({(size_t)layers_per_stage, (size_t)experts_per_gpu, (size_t)p->hidden_dim},
                b_mlp2_stage_base, stream, DType::BF16);
 
-  weights->out = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->out, stream);
   weights->rms_out_w = new Tensor({(size_t)p->hidden_dim}, w->rms_out_w, stream);
+  // weights->out = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->out, stream);
+
+  {
+    size_t vocab_size = p->vocab_size;
+    size_t hidden_dim = p->hidden_dim;
+
+    weights->out = new Tensor({hidden_dim, vocab_size}, stream, DType::BF16);
+
+    for (size_t i = 0; i < vocab_size; i++) {
+      for (size_t j = 0; j < hidden_dim; j++) {
+        weights->out->buf[j * vocab_size + i] = w->out[i * hidden_dim + j];
+      }
+    }
+
+    weights->out->to_device(stream);
+  }
 }
 
-float *forward_gpu_120b(Context *ctx, int token, int pos) {
+float *forward_gpu_120b(Context *ctx, int *tokens, int pos) {
   Config *p = &ctx->transformer->config;
   int layer_per_stages = p->n_layers / PP;
 
-  int stage0_size = TP;
-  for (int i = 0; i < stage0_size; i++) {
+  // embedding lookup only for all TPs of stage 0
+  for (int i = 0; i < TP; i++) {
     int gpu_id = ctx->gpu_ids[i];
     CHECK_HIP(hipSetDevice(gpu_id));
-    embedding_lookup(ctx->weights[i]->token_embedding_table, token, ctx->run_state[i]->x, false,
-                     ctx->streams[i]);
+    embedding_lookup_batched(ctx->weights[i]->token_embedding_table, tokens, ctx->run_state[i]->x,
+                             false, ctx->streams[i]);
+    // embedding_lookup(ctx->weights[i]->token_embedding_table, token, ctx->run_state[i]->x, false,
+    //                  ctx->streams[i]);
   }
 
   for (int l = 0; l < p->n_layers; l++) {
     int current_stage_idx = l / layer_per_stages;
     int local_layer_idx = l % layer_per_stages;
-    int start_local_idx = current_stage_idx * stage0_size;
-    int end_local_idx = start_local_idx + stage0_size;
+    int start_local_idx = current_stage_idx * TP;  // First TP in stage
+    int end_local_idx = start_local_idx + TP;      // End TP in stage (exclusive)
 
     // printf("==== stage: %d - layer: %d ====\n", current_stage_idx, l);
 
@@ -478,98 +550,104 @@ float *forward_gpu_120b(Context *ctx, int token, int pos) {
       CHECK_HIP(hipSetDevice(ctx->gpu_ids[i]));
       OurRunState *s = ctx->run_state[i];
       OurTransformerWeights *w = ctx->weights[i];
+      hipStream_t stream = ctx->streams[i];
 
-      rmsnorm(s->x, w->rms_attn_w, s->t, local_layer_idx, false, false, 1e-5f, ctx->streams[i]);
+      rmsnorm_batched(s->x, w->rms_attn_w, s->t, local_layer_idx, false, false, 1e-5f, stream);
+      // rmsnorm(s->x, w->rms_attn_w, s->t, local_layer_idx, false, false, 1e-5f, ctx->streams[i]);
       // printf("stage %d - Done rmsnorm 1\n", current_stage_idx);
 
-      qkv_gemm(s->t, w->w_qkv, w->b_qkv, s->qkv, local_layer_idx, false, false, ctx->streams[i]);
+      qkv_gemm_batched_v2(s->t, w->w_qkv, w->b_qkv, s->qkv, local_layer_idx, false, false, stream);
+      // qkv_gemm(s->t, w->w_qkv, w->b_qkv, s->qkv, local_layer_idx, false, false, ctx->streams[i]);
       // printf("stage %d - Done qkv_gemm\n", current_stage_idx);
 
-      qkv_split_rope(s->qkv, s->q, s->k, s->v, ctx->cos_tensor[i], ctx->sin_tensor[i], p->head_dim,
-                     p->n_attn_heads, p->n_kv_heads, pos, false, false, false, false,
-                     ctx->streams[i]);
-      // printf("stage %d - Done qkv_split_rope\n", current_stage_idx);
+      qkv_split_rope_fused(s->qkv, s->q, s->key_cache, s->value_cache, ctx->cos_tensor[i],
+                           ctx->sin_tensor[i], p->head_dim, p->n_attn_heads, p->n_kv_heads, pos,
+                           local_layer_idx, stream);
+      // qkv_split_rope(s->qkv, s->q, s->k, s->v, ctx->cos_tensor[i], ctx->sin_tensor[i], p->head_dim,
+      //                p->n_attn_heads, p->n_kv_heads, pos, false, false, false, false,
+      //                ctx->streams[i]);
+      // // printf("stage %d - Done qkv_split_rope\n", current_stage_idx);
 
-      long long kv_cache_offset =
-        (long long)local_layer_idx * p->seq_len * p->n_kv_heads * p->head_dim +
-        (long long)pos * p->n_kv_heads * p->head_dim;
-      memcpy_tensor(s->key_cache, s->k, kv_cache_offset, 0, s->k->num_elem(), false, true,
-                    ctx->streams[i]);
-      memcpy_tensor(s->value_cache, s->v, kv_cache_offset, 0, s->v->num_elem(), false, true,
-                    ctx->streams[i]);
-      // printf("stage %d - Done memcpy_tensor\n", current_stage_idx);
+      // long long kv_cache_offset =
+      //   (long long)local_layer_idx * p->seq_len * p->n_kv_heads * p->head_dim +
+      //   (long long)pos * p->n_kv_heads * p->head_dim;
+      // memcpy_tensor(s->key_cache, s->k, kv_cache_offset, 0, s->k->num_elem(), false, true,
+      //               ctx->streams[i]);
+      // memcpy_tensor(s->value_cache, s->v, kv_cache_offset, 0, s->v->num_elem(), false, true,
+      //               ctx->streams[i]);
+      // // printf("stage %d - Done memcpy_tensor\n", current_stage_idx);
 
-      single_query_attn(s->q, s->key_cache, s->value_cache, s->mask, w->attn_sinks, s->tb,
-                        p->head_dim, p->n_attn_heads, p->n_attn_heads / p->n_kv_heads,
-                        p->n_kv_heads * p->head_dim, p->seq_len, p->sliding_window, pos,
-                        local_layer_idx, false, false, false, false, false, ctx->streams[i]);
+      single_query_attn_batched(s->q, s->key_cache, s->value_cache, s->mask, w->attn_sinks, s->tb,
+                                p->head_dim, p->n_attn_heads, p->n_attn_heads / p->n_kv_heads,
+                                p->n_kv_heads * p->head_dim, p->seq_len, p->sliding_window, pos,
+                                local_layer_idx, false, false, false, false, false, stream);
+      // single_query_attn(s->q, s->key_cache, s->value_cache, s->mask, w->attn_sinks, s->tb,
+      //                   p->head_dim, p->n_attn_heads, p->n_attn_heads / p->n_kv_heads,
+      //                   p->n_kv_heads * p->head_dim, p->seq_len, p->sliding_window, pos,
+      //                   local_layer_idx, false, false, false, false, false, ctx->streams[i]);
       // printf("stage %d - Done single_query_attn\n", current_stage_idx);
 
-      attn_out_project(s->tb, w->w_o, w->b_o, s->tb2, local_layer_idx, false, false,
-                       ctx->streams[i]);
+      attn_out_project_batched_v2(s->tb, w->w_o, w->b_o, s->tb2, local_layer_idx, false, false,
+                                  stream);
+      // attn_out_project(s->tb, w->w_o, w->b_o, s->tb2, local_layer_idx, false, false,
+      //                  ctx->streams[i]);
       // printf("stage %d - Done attn_out_project\n", current_stage_idx);
 
-      add_vector(s->x, s->tb2, false, false, false, ctx->streams[i]);
+      residual_rmsnorm_batched(s->tb2, s->x, w->rms_ffn_w, s->t, local_layer_idx, 1e-5f, stream);
+      // add_vector(s->x, s->tb2, false, false, false, ctx->streams[i]);
       // printf("stage %d - Done add_vector 1\n", current_stage_idx);
-    }
 
-    // MoE FFN layers
-    for (int i = start_local_idx; i < end_local_idx; i++) {
-      hipStream_t stream = ctx->streams[i];
-      CHECK_HIP(hipSetDevice(ctx->gpu_ids[i]));
-      OurRunState *s = ctx->run_state[i];
-      OurTransformerWeights *w = ctx->weights[i];
-
-      rmsnorm(s->x, w->rms_ffn_w, s->t, local_layer_idx, false, false, 1e-5f, ctx->streams[i]);
+      // rmsnorm(s->x, w->rms_ffn_w, s->t, local_layer_idx, false, false, 1e-5f, ctx->streams[i]);
       // printf("stage %d - Done rmsnorm 2\n", current_stage_idx);
 
-      router_gemm(w->w_router, s->t, w->b_router, s->router_score, local_layer_idx, false, false,
-                  ctx->streams[i]);
+      router_gemm_batched(w->w_router, s->t, w->b_router, s->router_score, local_layer_idx, false,
+                          false, stream);
+      // router_gemm(w->w_router, s->t, w->b_router, s->router_score, local_layer_idx, false, false,
+      //             ctx->streams[i]);
       // printf("stage %d - Done router_gemm\n", current_stage_idx);
 
-      topk_softmax(s->router_score, s->topk_v, s->topk_i, false, false, false, ctx->streams[i]);
+      topk_softmax_batched(s->router_score, s->topk_v, s->topk_i, false, false, false, stream);
+      // topk_softmax(s->router_score, s->topk_v, s->topk_i, false, false, false, ctx->streams[i]);
       // printf("stage %d - Done topk_softmax\n", current_stage_idx);
 
-      const int hidden_dim = s->t->shape[1];
-      const int sharded_inter_dim = p->intermediate_dim / TP;
-      const int k = s->topk_i->num_elem();
-      const int num_experts = w->b_mlp2->shape[1];
-      const long long offset = local_layer_idx * num_experts;
+      moe_mlp1_batched(s->t, w->w_mlp1, w->b_mlp1, s->topk_i, s->mlp1_out, false, false,
+                       local_layer_idx, stream);
 
-      // Lấy con trỏ thô trên device từ các tensor
-      const float *t_ptr = (const float *)s->t->d_buf;
-      const bf16 *W1_ptr =
-        (const bf16 *)w->w_mlp1->d_buf + offset * 2 * sharded_inter_dim * hidden_dim;
-      const bf16 *b1_ptr = (const bf16 *)w->b_mlp1->d_buf + offset * 2 * sharded_inter_dim;
-      const bf16 *W2_ptr = (const bf16 *)w->w_mlp2->d_buf + offset * sharded_inter_dim * hidden_dim;
-      const bf16 *b2_ptr =
-        (i == start_local_idx) ? (const bf16 *)w->b_mlp2->d_buf + offset * hidden_dim : nullptr;
-      const int *topk_idx_ptr = s->topk_i->d_buf;
-      const float *topk_v_ptr = (const float *)s->topk_v->d_buf;
-      float *mlp1_out_ptr = (float *)s->mlp1_out->d_buf;
-      float *tb3_ptr = (float *)s->tb3->d_buf;
-      float *gate_up_ptr = (float *)s->gate_up->d_buf;
-      float *e_agg_ptr = (float *)s->e_agg->d_buf;
+      moe_swiglu_batched(s->mlp1_out, s->gate_up, p->experts_per_token, p->swiglu_limit, stream);
+      moe_mlp2_batched(s->gate_up, w->w_mlp2, w->b_mlp2, s->tb3, s->topk_i, p->experts_per_token,
+                       (i == start_local_idx), local_layer_idx, stream);
 
-      memset_tensor(s->e_agg, 0, false, true, stream);
+      // const int hidden_dim = s->t->shape[1];
+      // const int sharded_inter_dim = p->intermediate_dim / TP;
+      // const int k = s->topk_i->num_elem();
+      // const int num_experts = w->b_mlp2->shape[1];
+      // const long long offset = local_layer_idx * num_experts;
 
-      moe_mlp1(W1_ptr, t_ptr, b1_ptr, mlp1_out_ptr, topk_idx_ptr, k, sharded_inter_dim, hidden_dim,
-               stream);
-      moe_swiglu(mlp1_out_ptr, gate_up_ptr, k, sharded_inter_dim, p->swiglu_limit, stream);
-      moe_mlp2(W2_ptr, gate_up_ptr, b2_ptr, tb3_ptr, topk_idx_ptr, k, hidden_dim, sharded_inter_dim,
-               stream);
+      // // Lấy con trỏ thô trên device từ các tensor
+      // const float *t_ptr = (const float *)s->t->d_buf;
+      // const bf16 *W1_ptr =
+      //   (const bf16 *)w->w_mlp1->d_buf + offset * 2 * sharded_inter_dim * hidden_dim;
+      // const bf16 *b1_ptr = (const bf16 *)w->b_mlp1->d_buf + offset * 2 * sharded_inter_dim;
+      // const bf16 *W2_ptr = (const bf16 *)w->w_mlp2->d_buf + offset * sharded_inter_dim * hidden_dim;
+      // const bf16 *b2_ptr =
+      //   (i == start_local_idx) ? (const bf16 *)w->b_mlp2->d_buf + offset * hidden_dim : nullptr;
+      // const int *topk_idx_ptr = s->topk_i->d_buf;
+      // const float *topk_v_ptr = (const float *)s->topk_v->d_buf;
+      // float *mlp1_out_ptr = (float *)s->mlp1_out->d_buf;
+      // float *tb3_ptr = (float *)s->tb3->d_buf;
+      // float *gate_up_ptr = (float *)s->gate_up->d_buf;
+      // float *e_agg_ptr = (float *)s->e_agg->d_buf;
+
+      // memset_tensor(s->e_agg, 0, false, true, stream);
+
+      // moe_mlp1(W1_ptr, t_ptr, b1_ptr, mlp1_out_ptr, topk_idx_ptr, k, sharded_inter_dim, hidden_dim,
+      //          stream);
+      // moe_swiglu(mlp1_out_ptr, gate_up_ptr, k, sharded_inter_dim, p->swiglu_limit, stream);
+      // moe_mlp2(W2_ptr, gate_up_ptr, b2_ptr, tb3_ptr, topk_idx_ptr, k, hidden_dim, sharded_inter_dim,
+      //          stream);
 
       CHECK_HIP(hipEventRecord(ctx->tp_ready_event[i], ctx->streams[i]));
-      // moe_agg(tb3_ptr, topk_v_ptr, e_agg_ptr, k, hidden_dim, stream);
-
-      // add_vector(ctx->run_state[i]->x, ctx->run_state[i]->e_agg, false, false, false,
-      //            ctx->streams[i]);
     }
-
-    // for (int i = start_local_idx; i < end_local_idx; i++) {
-    //   CHECK_HIP(hipSetDevice(ctx->gpu_ids[i]));
-    //   CHECK_HIP(hipStreamSynchronize(ctx->streams[i]));
-    // }
 
     if (TP > 1) {
       reduce_broadcast_tb3(ctx, start_local_idx, end_local_idx,
@@ -590,16 +668,20 @@ float *forward_gpu_120b(Context *ctx, int token, int pos) {
     for (int i = start_local_idx; i < end_local_idx; i++) {
       CHECK_HIP(hipSetDevice(ctx->gpu_ids[i]));
       OurRunState *s = ctx->run_state[i];
+      hipStream_t stream = ctx->streams[i];
 
-      const int k = s->topk_i->num_elem();
-      const int hidden_dim = s->t->shape[1];
-      float *tb3_ptr = (float *)s->tb3->d_buf;
-      const float *topk_v_ptr = (const float *)s->topk_v->d_buf;
-      float *e_agg_ptr = (float *)s->e_agg->d_buf;
+      // const int k = s->topk_i->num_elem();
+      // const int hidden_dim = s->t->shape[1];
+      // float *tb3_ptr = (float *)s->tb3->d_buf;
+      // const float *topk_v_ptr = (const float *)s->topk_v->d_buf;
+      // float *e_agg_ptr = (float *)s->e_agg->d_buf;
 
-      moe_agg(tb3_ptr, topk_v_ptr, e_agg_ptr, k, hidden_dim, ctx->streams[i]);
-      add_vector(ctx->run_state[i]->x, ctx->run_state[i]->e_agg, false, false, false,
-                 ctx->streams[i]);
+      moe_agg_batched(s->tb3, s->topk_v, s->e_agg, p->experts_per_token, false, stream);
+      // moe_agg(tb3_ptr, topk_v_ptr, e_agg_ptr, k, hidden_dim, ctx->streams[i]);
+
+      add_vector_batched(s->x, s->e_agg, false, false, false, stream);
+      // add_vector(ctx->run_state[i]->x, ctx->run_state[i]->e_agg, false, false, false,
+      //            ctx->streams[i]);
     }
 
     // --- Pipeline Send ---
@@ -607,7 +689,7 @@ float *forward_gpu_120b(Context *ctx, int token, int pos) {
       int leader_idx = start_local_idx;  // leader stage này
       int leader_global_id = ctx->gpu_ids[leader_idx];
 
-      int next_leader_idx = (current_stage_idx + 1) * stage0_size;
+      int next_leader_idx = (current_stage_idx + 1) * TP;
       int next_leader_global_id = ctx->gpu_ids[next_leader_idx];
 
       size_t nbytes =
@@ -634,12 +716,16 @@ float *forward_gpu_120b(Context *ctx, int token, int pos) {
 
   OurRunState *s_final = ctx->run_state[last_local_idx];
   OurTransformerWeights *w_final = ctx->weights[last_local_idx];
+  hipStream_t stream_final = ctx->streams[last_local_idx];
 
   CHECK_HIP(hipSetDevice(ctx->gpu_ids[last_local_idx]));
-  rmsnorm(s_final->x, w_final->rms_out_w, s_final->x, 0, false, false, 1e-5f,
-          ctx->streams[last_local_idx]);
-  classifier_gemm(w_final->out, s_final->x, s_final->logits, false, true,
-                  ctx->streams[last_local_idx]);
+
+  rmsnorm_batched(s_final->x, w_final->rms_out_w, s_final->x, 0, false, false, 1e-5f, stream_final);
+  classifier_gemm_batched_v2(w_final->out, s_final->x, s_final->logits, false, true, stream_final);
+  // rmsnorm(s_final->x, w_final->rms_out_w, s_final->x, 0, false, false, 1e-5f,
+  //         ctx->streams[last_local_idx]);
+  // classifier_gemm(w_final->out, s_final->x, s_final->logits, false, true,
+  //                 ctx->streams[last_local_idx]);
 
   CHECK_HIP(hipStreamSynchronize(ctx->streams[last_local_idx]));
   s_final->logits->from_device(ctx->streams[last_local_idx]);
