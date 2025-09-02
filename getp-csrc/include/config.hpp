@@ -14,11 +14,10 @@
 // #define RUN_20B
 
 #define DP 1
-#define PP 1
-#define TP 2
+#define PP 4
+#define TP 1
 #define TOTAL_GPUS_NEEDED ((DP) * (PP) * (TP))
 #define TOTAL_PIPELINES ((PP) * (TP))
-#define TOTAL_STAGES ((DP) * (TP))
 
 typedef struct {
   // token_embedding_table - embedding.weight

@@ -31,15 +31,18 @@ float *forward_gpu_120b_batched(
       CHECK_HIP(hipSetDevice(cur_device));
 
       OurRunState *rs_new = &rs[cur_device];
-      stream = total_streams[cur_device];
       
+      CHECK_HIP(hipStreamSynchronize(stream));
+
       // sync from rs_now->x to rs_now->x
+      stream = total_streams[cur_device];
       CHECK_HIP(hipMemcpyPeerAsync(rs_new->x->d_buf, cur_device, rs_now->x->d_buf, cur_device - TP, rs_now->x->num_elem() * rs_now->x->get_dtype_size(), stream));
 
       weights_now = &weights[cur_device];
       rs_now = &rs[cur_device];
       event = total_events[cur_device];
     }
+
     for (int l = 0; l < p->n_layers / PP; l++) {
       #ifdef DEBUG
         #pragma omp critical
@@ -308,22 +311,18 @@ float *forward_gpu_120b_batched(
         }
 
         CHECK_HIP(hipStreamSynchronize(stream));
+      }
 
-        device_from = cur_device + 1;
-        rs_to_agg = &rs[cur_device + 1];
-        hipStream_t *stream_to = &total_streams[cur_device + 1];
+      pthread_barrier_wait(tp_barrier);
 
-        for (int i = 1; i < TP; i++) {
-          CHECK_HIP(hipSetDevice(device_from));
-          CHECK_HIP(hipMemcpyPeerAsync(rs_to_agg->e_agg->d_buf, device_from, rs_now->e_agg->d_buf, cur_device, bytes_agg, *stream_to));
-          CHECK_HIP(hipStreamSynchronize(*stream_to));
+      if (tp_rank > 0) {
+        int device_from = cur_device - tp_rank;
+        OurRunState *rs_orig = &rs[device_from];
+        size_t bytes_agg = rs_orig->e_agg->num_elem() * rs_orig->e_agg->get_dtype_size();
 
-          rs_to_agg++;
-          device_from++;
-          stream_to++;
-        }
+        CHECK_HIP(hipMemcpyPeerAsync(rs_now->e_agg->d_buf, device_from, rs_orig->e_agg->d_buf, cur_device, bytes_agg, stream));
 
-        CHECK_HIP(hipSetDevice(cur_device));
+        CHECK_HIP(hipStreamSynchronize(stream));
       }
 
       pthread_barrier_wait(tp_barrier);
@@ -364,7 +363,6 @@ float *forward_gpu_120b_batched(
         }
       #endif
     }
-    CHECK_HIP(hipDeviceSynchronize());
   }
 
   // exit(1);
