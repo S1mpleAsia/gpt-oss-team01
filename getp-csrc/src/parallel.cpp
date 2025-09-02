@@ -396,75 +396,149 @@ void our_init_weights_120b(Context *ctx, int local_gpu_id) {
   // Sharding weights MLP1
   float *w_mlp1_stage_base = w->w_mlp1 + 1ll * pp_rank * layers_per_stage * experts_per_gpu * 2 *
                                            p->intermediate_dim * p->hidden_dim;
-  float *tmp_buffer = (float *)malloc(layers_per_stage * experts_per_gpu * 2 *
-                                      sharded_intermediate_dim * p->hidden_dim * sizeof(float));
+  // float *tmp_buffer = (float *)malloc(layers_per_stage * experts_per_gpu * 2 *
+  //                                     sharded_intermediate_dim * p->hidden_dim * sizeof(float));
 
-  for (int l = 0; l < layers_per_stage; l++) {
-    for (int e = 0; e < experts_per_gpu; e++) {
-      float *src = w_mlp1_stage_base +
-                   1ll * (l * experts_per_gpu + e) * 2 * p->intermediate_dim * p->hidden_dim +
-                   1ll * tp_rank * 2 * sharded_intermediate_dim * p->hidden_dim;
+  // for (int l = 0; l < layers_per_stage; l++) {
+  //   for (int e = 0; e < experts_per_gpu; e++) {
+  //     float *src = w_mlp1_stage_base +
+  //                  1ll * (l * experts_per_gpu + e) * 2 * p->intermediate_dim * p->hidden_dim +
+  //                  1ll * tp_rank * 2 * sharded_intermediate_dim * p->hidden_dim;
 
-      float *dst =
-        tmp_buffer + 1ll * (l * experts_per_gpu + e) * 2 * sharded_intermediate_dim * p->hidden_dim;
+  //     float *dst =
+  //       tmp_buffer + 1ll * (l * experts_per_gpu + e) * 2 * sharded_intermediate_dim * p->hidden_dim;
 
-      memcpy(dst, src, 2 * sharded_intermediate_dim * p->hidden_dim * sizeof(float));
+  //     memcpy(dst, src, 2 * sharded_intermediate_dim * p->hidden_dim * sizeof(float));
+  //   }
+  // }
+
+  // weights->w_mlp1 = new Tensor({(size_t)layers_per_stage, (size_t)experts_per_gpu,
+  //                               2 * sharded_intermediate_dim, (size_t)p->hidden_dim},
+  //                              tmp_buffer, stream, DType::BF16);
+  // free(tmp_buffer);
+
+  {
+    weights->w_mlp1 = new Tensor({(size_t)layers_per_stage, (size_t)experts_per_gpu,
+                                  2 * sharded_intermediate_dim, (size_t)p->hidden_dim},
+                                 stream, DType::BF16);
+    bf16 *tmp = (bf16 *)malloc(2 * sharded_intermediate_dim * p->hidden_dim * sizeof(bf16));
+    bf16 *dst = (bf16 *)weights->w_mlp1->d_buf;
+    for (int l = 0; l < layers_per_stage; l++) {
+      for (int e = 0; e < experts_per_gpu; e++) {
+        float *src = w_mlp1_stage_base +
+                     1ll * (l * experts_per_gpu + e) * 2 * p->intermediate_dim * p->hidden_dim +
+                     1ll * tp_rank * 2 * sharded_intermediate_dim * p->hidden_dim;
+        for (size_t t = 0; t < 2 * sharded_intermediate_dim * p->hidden_dim; t++) {
+          tmp[t] = bf16(src[t]);
+        }
+        size_t dst_off =
+          1ll * (l * experts_per_gpu + e) * 2 * sharded_intermediate_dim * p->hidden_dim;
+        CHECK_HIP(hipMemcpyAsync(dst + dst_off, tmp,
+                                 2 * sharded_intermediate_dim * p->hidden_dim * sizeof(bf16),
+                                 hipMemcpyHostToDevice, stream));
+      }
     }
+    CHECK_HIP(hipStreamSynchronize(stream));
+    free(tmp);
   }
-
-  weights->w_mlp1 = new Tensor({(size_t)layers_per_stage, (size_t)experts_per_gpu,
-                                2 * sharded_intermediate_dim, (size_t)p->hidden_dim},
-                               tmp_buffer, stream, DType::BF16);
-  free(tmp_buffer);
 
   // Sharding bias MLP1
   float *b_mlp1_stage_base =
     w->b_mlp1 + 1ll * pp_rank * layers_per_stage * experts_per_gpu * 2 * p->intermediate_dim;
-  tmp_buffer = (float *)malloc(layers_per_stage * experts_per_gpu * 2 * sharded_intermediate_dim *
-                               sizeof(float));
-  for (int l = 0; l < layers_per_stage; l++) {
-    for (int e = 0; e < experts_per_gpu; e++) {
-      float *src = b_mlp1_stage_base + 1ll * (l * experts_per_gpu + e) * 2 * p->intermediate_dim +
-                   1ll * tp_rank * 2 * sharded_intermediate_dim;
+  // tmp_buffer = (float *)malloc(layers_per_stage * experts_per_gpu * 2 * sharded_intermediate_dim *
+  //                              sizeof(float));
+  // for (int l = 0; l < layers_per_stage; l++) {
+  //   for (int e = 0; e < experts_per_gpu; e++) {
+  //     float *src = b_mlp1_stage_base + 1ll * (l * experts_per_gpu + e) * 2 * p->intermediate_dim +
+  //                  1ll * tp_rank * 2 * sharded_intermediate_dim;
 
-      float *dst = tmp_buffer + 1ll * (l * experts_per_gpu + e) * 2 * sharded_intermediate_dim;
-      memcpy(dst, src, 2 * sharded_intermediate_dim * sizeof(float));
+  //     float *dst = tmp_buffer + 1ll * (l * experts_per_gpu + e) * 2 * sharded_intermediate_dim;
+  //     memcpy(dst, src, 2 * sharded_intermediate_dim * sizeof(float));
+  //   }
+  // }
+
+  // weights->b_mlp1 =
+  //   new Tensor({(size_t)layers_per_stage, (size_t)experts_per_gpu, 2 * sharded_intermediate_dim},
+  //              tmp_buffer, stream, DType::BF16);
+  // free(tmp_buffer);
+
+  {
+    weights->b_mlp1 =
+      new Tensor({(size_t)layers_per_stage, (size_t)experts_per_gpu, 2 * sharded_intermediate_dim},
+                 stream, DType::BF16);
+    bf16 *dst = (bf16 *)weights->b_mlp1->d_buf;
+    bf16 *tmp = (bf16 *)malloc(2 * sharded_intermediate_dim * sizeof(bf16));
+    for (int l = 0; l < layers_per_stage; l++) {
+      for (int e = 0; e < experts_per_gpu; e++) {
+        float *src = b_mlp1_stage_base + 1ll * (l * experts_per_gpu + e) * 2 * p->intermediate_dim +
+                     1ll * tp_rank * 2 * sharded_intermediate_dim;
+        for (size_t t = 0; t < 2 * sharded_intermediate_dim; t++) {
+          tmp[t] = hip_bfloat16(src[t]);
+        }
+        size_t dst_off = 1ll * (l * experts_per_gpu + e) * 2 * sharded_intermediate_dim;
+        CHECK_HIP(hipMemcpyAsync(dst + dst_off, tmp, 2 * sharded_intermediate_dim * sizeof(bf16),
+                                 hipMemcpyHostToDevice, stream));
+      }
     }
+    CHECK_HIP(hipStreamSynchronize(stream));
+    free(tmp);
   }
-
-  weights->b_mlp1 =
-    new Tensor({(size_t)layers_per_stage, (size_t)experts_per_gpu, 2 * sharded_intermediate_dim},
-               tmp_buffer, stream, DType::BF16);
-  free(tmp_buffer);
 
   // Sharding weights MLP2
   float *w_mlp2_stage_base = w->w_mlp2 + 1ll * pp_rank * layers_per_stage * experts_per_gpu *
                                            p->hidden_dim * p->intermediate_dim;
 
-  tmp_buffer = (float *)malloc(layers_per_stage * experts_per_gpu * sharded_intermediate_dim *
-                               p->hidden_dim * sizeof(float));
+  // tmp_buffer = (float *)malloc(layers_per_stage * experts_per_gpu * sharded_intermediate_dim *
+  //                              p->hidden_dim * sizeof(float));
 
-  for (int l = 0; l < layers_per_stage; l++) {
-    for (int e = 0; e < experts_per_gpu; e++) {
-      for (int h = 0; h < p->hidden_dim; h++) {
-        float *src = w_mlp2_stage_base +
-                     1ll * (l * experts_per_gpu + e) * p->hidden_dim * p->intermediate_dim +
-                     1ll * h * p->intermediate_dim + 1ll * tp_rank * sharded_intermediate_dim;
+  // for (int l = 0; l < layers_per_stage; l++) {
+  //   for (int e = 0; e < experts_per_gpu; e++) {
+  //     for (int h = 0; h < p->hidden_dim; h++) {
+  //       float *src = w_mlp2_stage_base +
+  //                    1ll * (l * experts_per_gpu + e) * p->hidden_dim * p->intermediate_dim +
+  //                    1ll * h * p->intermediate_dim + 1ll * tp_rank * sharded_intermediate_dim;
 
-        float *dst = tmp_buffer +
-                     1ll * (l * experts_per_gpu + e) * p->hidden_dim * sharded_intermediate_dim +
-                     1ll * h * sharded_intermediate_dim;
+  //       float *dst = tmp_buffer +
+  //                    1ll * (l * experts_per_gpu + e) * p->hidden_dim * sharded_intermediate_dim +
+  //                    1ll * h * sharded_intermediate_dim;
 
-        memcpy(dst, src, sharded_intermediate_dim * sizeof(float));
+  //       memcpy(dst, src, sharded_intermediate_dim * sizeof(float));
+  //     }
+  //   }
+  // }
+
+  // weights->w_mlp2 = new Tensor({(size_t)layers_per_stage, (size_t)experts_per_gpu,
+  //                               (size_t)p->hidden_dim, sharded_intermediate_dim},
+  //                              tmp_buffer, stream, DType::BF16);
+
+  // free(tmp_buffer);
+
+  {
+    weights->w_mlp2 = new Tensor({(size_t)layers_per_stage, (size_t)experts_per_gpu,
+                                  (size_t)p->hidden_dim, sharded_intermediate_dim},
+                                 stream, DType::BF16);
+    bf16 *tmp = (bf16 *)malloc(sharded_intermediate_dim * sizeof(bf16));
+    bf16 *dst = (bf16 *)weights->w_mlp2->d_buf;
+    for (int l = 0; l < layers_per_stage; l++) {
+      for (int e = 0; e < experts_per_gpu; e++) {
+        for (int h = 0; h < p->hidden_dim; h++) {
+          float *src = w_mlp2_stage_base +
+                       1ll * (l * experts_per_gpu + e) * p->hidden_dim * p->intermediate_dim +
+                       1ll * h * p->intermediate_dim + 1ll * tp_rank * sharded_intermediate_dim;
+          for (size_t t = 0; t < sharded_intermediate_dim; t++) {
+            tmp[t] = bf16(src[t]);
+          }
+          size_t dst_off =
+            1ll * (l * experts_per_gpu + e) * p->hidden_dim * sharded_intermediate_dim +
+            1ll * h * sharded_intermediate_dim;
+          CHECK_HIP(hipMemcpyAsync(dst + dst_off, tmp, sharded_intermediate_dim * sizeof(bf16),
+                                   hipMemcpyHostToDevice, stream));
+        }
       }
     }
+    CHECK_HIP(hipStreamSynchronize(stream));
+    free(tmp);
   }
-
-  weights->w_mlp2 = new Tensor({(size_t)layers_per_stage, (size_t)experts_per_gpu,
-                                (size_t)p->hidden_dim, sharded_intermediate_dim},
-                               tmp_buffer, stream, DType::BF16);
-
-  free(tmp_buffer);
 
   // Sharding bias MLP2
   float *b_mlp2_stage_base =
