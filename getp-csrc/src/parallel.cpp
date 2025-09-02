@@ -233,6 +233,7 @@ void our_init_run_state_120b(Context *ctx, int local_gpu_id) {
   hipStream_t stream = ctx->streams[local_gpu_id];
 
   size_t sharded_intermediate_dim = p->intermediate_dim / TP;
+  size_t layers_per_stage = p->n_layers / PP;
 
   rs->x = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, s->x, stream);
 
@@ -271,10 +272,10 @@ void our_init_run_state_120b(Context *ctx, int local_gpu_id) {
   rs->logits = new Tensor({BATCH_SIZE, (size_t)p->vocab_size}, s->logits, stream);
 
   rs->key_cache = new Tensor(
-    {BATCH_SIZE, (size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
+    {BATCH_SIZE, (size_t)layers_per_stage, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
     s->key_cache, stream);
   rs->value_cache = new Tensor(
-    {BATCH_SIZE, (size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
+    {BATCH_SIZE, (size_t)layers_per_stage, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
     s->value_cache, stream);
 
   rs->mask = new Tensor({BATCH_SIZE, (size_t)p->seq_len, (size_t)p->seq_len}, stream);
@@ -287,9 +288,10 @@ void our_init_run_state_120b(Context *ctx, int local_gpu_id) {
   rs->mask->to_device(stream);
 
   // MoE buffer
-  rs->sorted_pair_ids = new TensorI32({(size_t)BATCH_SIZE * p->experts_per_token});
-  rs->expert_offsets = new TensorI32({(size_t)(p->n_experts + 1)});
-  rs->x_packed = new Tensor({(size_t)BATCH_SIZE * p->experts_per_token, (size_t)p->hidden_dim});
+  rs->sorted_pair_ids = new TensorI32({(size_t)BATCH_SIZE * p->experts_per_token}, stream);
+  rs->expert_offsets = new TensorI32({(size_t)(p->n_experts + 1)}, stream);
+  rs->x_packed =
+    new Tensor({(size_t)BATCH_SIZE * p->experts_per_token, (size_t)p->hidden_dim}, stream);
 
   // rs->cos_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2});
   // rs->sin_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2});
@@ -616,35 +618,6 @@ float *forward_gpu_120b(Context *ctx, int *tokens, int pos) {
       moe_swiglu_batched(s->mlp1_out, s->gate_up, p->experts_per_token, p->swiglu_limit, stream);
       moe_mlp2_batched(s->gate_up, w->w_mlp2, w->b_mlp2, s->tb3, s->topk_i, p->experts_per_token,
                        (i == start_local_idx), local_layer_idx, stream);
-
-      // const int hidden_dim = s->t->shape[1];
-      // const int sharded_inter_dim = p->intermediate_dim / TP;
-      // const int k = s->topk_i->num_elem();
-      // const int num_experts = w->b_mlp2->shape[1];
-      // const long long offset = local_layer_idx * num_experts;
-
-      // // Lấy con trỏ thô trên device từ các tensor
-      // const float *t_ptr = (const float *)s->t->d_buf;
-      // const bf16 *W1_ptr =
-      //   (const bf16 *)w->w_mlp1->d_buf + offset * 2 * sharded_inter_dim * hidden_dim;
-      // const bf16 *b1_ptr = (const bf16 *)w->b_mlp1->d_buf + offset * 2 * sharded_inter_dim;
-      // const bf16 *W2_ptr = (const bf16 *)w->w_mlp2->d_buf + offset * sharded_inter_dim * hidden_dim;
-      // const bf16 *b2_ptr =
-      //   (i == start_local_idx) ? (const bf16 *)w->b_mlp2->d_buf + offset * hidden_dim : nullptr;
-      // const int *topk_idx_ptr = s->topk_i->d_buf;
-      // const float *topk_v_ptr = (const float *)s->topk_v->d_buf;
-      // float *mlp1_out_ptr = (float *)s->mlp1_out->d_buf;
-      // float *tb3_ptr = (float *)s->tb3->d_buf;
-      // float *gate_up_ptr = (float *)s->gate_up->d_buf;
-      // float *e_agg_ptr = (float *)s->e_agg->d_buf;
-
-      // memset_tensor(s->e_agg, 0, false, true, stream);
-
-      // moe_mlp1(W1_ptr, t_ptr, b1_ptr, mlp1_out_ptr, topk_idx_ptr, k, sharded_inter_dim, hidden_dim,
-      //          stream);
-      // moe_swiglu(mlp1_out_ptr, gate_up_ptr, k, sharded_inter_dim, p->swiglu_limit, stream);
-      // moe_mlp2(W2_ptr, gate_up_ptr, b2_ptr, tb3_ptr, topk_idx_ptr, k, hidden_dim, sharded_inter_dim,
-      //          stream);
 
       CHECK_HIP(hipEventRecord(ctx->tp_ready_event[i], ctx->streams[i]));
     }

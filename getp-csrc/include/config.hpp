@@ -8,12 +8,12 @@
 #include "config_run.hpp"
 
 #define RUN_BATCH
-#define BATCH_SIZE 1
+#define BATCH_SIZE 16
 
-#define REPLICA_SIZE 4
 #define PP 2
 #define TP 2
-#define PRINT_LOGITS
+#define REPLICA_SIZE ((PP * TP))
+// #define PRINT_LOGITS
 // #define TIME_GPU
 // #define DEBUG
 
