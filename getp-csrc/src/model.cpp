@@ -18,7 +18,7 @@ float *forward_gpu_120b_batched(
   CHECK_HIP(hipSetDevice(cur_device));
   
   // copy the token embedding into x
-  embedding_lookup_batched(weights_now->token_embedding_table, tokens, rs_now->x, false, stream);
+  embedding_lookup_batched(weights_now->token_embedding_table, tokens, rs_now->x, false);
 
   long long kv_dim = 1ll * p->n_kv_heads * p->head_dim;
   long long loff_one = 1ll * p->seq_len * kv_dim;
@@ -27,16 +27,16 @@ float *forward_gpu_120b_batched(
   // forward all the layers
   for (int pipeline_id = 0; pipeline_id < PP; pipeline_id++) {
     if (pipeline_id) {
+      CHECK_HIP(hipStreamSynchronize(0));
+      
       cur_device += TP;
       CHECK_HIP(hipSetDevice(cur_device));
 
       OurRunState *rs_new = &rs[cur_device];
-      
-      CHECK_HIP(hipStreamSynchronize(stream));
 
       // sync from rs_now->x to rs_now->x
       stream = total_streams[cur_device];
-      CHECK_HIP(hipMemcpyPeerAsync(rs_new->x->d_buf, cur_device, rs_now->x->d_buf, cur_device - TP, rs_now->x->num_elem() * rs_now->x->get_dtype_size(), stream));
+      CHECK_HIP(hipMemcpyPeerAsync(rs_new->x->d_buf, cur_device, rs_now->x->d_buf, cur_device - TP, rs_now->x->num_elem() * rs_now->x->get_dtype_size()));
 
       weights_now = &weights[cur_device];
       rs_now = &rs[cur_device];
@@ -55,7 +55,7 @@ float *forward_gpu_120b_batched(
 
       // attention rmsnorm
       rmsnorm_batched(rs_now->x, weights_now->rms_attn_w, rs_now->t, 1ll * l,
-                      false, false, stream);
+                      false, false);
       
       #ifdef DEBUG
         #pragma omp critical
@@ -77,7 +77,7 @@ float *forward_gpu_120b_batched(
       long long loff = 1ll * l * loff_one;  // kv cache layer offset
 
       // QKV projection
-      qkv_gemm_batched(rs_now->t, weights_now->w_qkv, weights_now->b_qkv, rs_now->qkv, 1ll * l, false, false, stream);  // This kernel diverges the most
+      qkv_gemm_batched(rs_now->t, weights_now->w_qkv, weights_now->b_qkv, rs_now->qkv, 1ll * l, false, false);  // This kernel diverges the most
       
       #ifdef DEBUG
         #pragma omp critical
@@ -110,8 +110,7 @@ float *forward_gpu_120b_batched(
       // Separate q, k, v + RoPE
       qkv_split_rope_batched(rs_now->qkv, rs_now->q, rs_now->k, rs_now->v, rs_now->cos_tensor,
                             rs_now->sin_tensor, p->head_dim, p->n_attn_heads,
-                            p->n_kv_heads, pos, false, false, false, false,
-                            stream);
+                            p->n_kv_heads, pos, false, false, false, false);
       #ifdef DEBUG
         #pragma omp critical
         {
@@ -130,8 +129,8 @@ float *forward_gpu_120b_batched(
 
       // Store k, v in cache
       for (int b = 0; b < cur_batch_size; b++) {
-        memcpy_tensor(rs_now->key_cache, rs_now->k, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim, 1ll * b * kv_dim, kv_dim, false, true, stream);
-        memcpy_tensor(rs_now->value_cache, rs_now->v, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim, 1ll * b * kv_dim, kv_dim, false, true, stream);
+        memcpy_tensor(rs_now->key_cache, rs_now->k, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim, 1ll * b * kv_dim, kv_dim, false, true);
+        memcpy_tensor(rs_now->value_cache, rs_now->v, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim, 1ll * b * kv_dim, kv_dim, false, true);
       }
       
       #ifdef DEBUG
@@ -158,7 +157,7 @@ float *forward_gpu_120b_batched(
                                 weights_now->attn_sinks, rs_now->tb, p->head_dim,
                                 p->n_attn_heads, kv_mul, kv_dim, p->seq_len,
                                 p->sliding_window, pos, 1ll * l, false, false,
-                                false, false, false, stream);
+                                false, false, false);
       #ifdef DEBUG
         #pragma omp critical
         {
@@ -176,7 +175,7 @@ float *forward_gpu_120b_batched(
       #endif
                                 
       // final matmul to get the output of the attention
-      attn_out_project_batched(rs_now->tb, weights_now->w_o, weights_now->b_o, rs_now->tb2, 1ll * l, false, false, stream);
+      attn_out_project_batched(rs_now->tb, weights_now->w_o, weights_now->b_o, rs_now->tb2, 1ll * l, false, false);
 
       #ifdef DEBUG
         #pragma omp critical
@@ -195,7 +194,7 @@ float *forward_gpu_120b_batched(
       #endif
 
       // residual connection back into x
-      add_vector_batched(rs_now->x, rs_now->tb2, false, false, false, stream);  // equals residual add
+      add_vector_batched(rs_now->x, rs_now->tb2, false, false, false);  // equals residual add
 
       #ifdef DEBUG
         #pragma omp critical
@@ -214,7 +213,7 @@ float *forward_gpu_120b_batched(
       #endif
 
       // ffn rmsnorm
-      rmsnorm_batched(rs_now->x, weights_now->rms_ffn_w, rs_now->t, 1ll * l, false, false, stream);
+      rmsnorm_batched(rs_now->x, weights_now->rms_ffn_w, rs_now->t, 1ll * l, false, false);
       
       #ifdef DEBUG
         #pragma omp critical
@@ -234,7 +233,7 @@ float *forward_gpu_120b_batched(
 
       // MoE routing
       router_gemm_batched(weights_now->w_router, rs_now->t, weights_now->b_router,
-                  rs_now->router_score, 1ll * l, false, false, stream);
+                  rs_now->router_score, 1ll * l, false, false);
 
       #ifdef DEBUG
         #pragma omp critical
@@ -253,7 +252,7 @@ float *forward_gpu_120b_batched(
       #endif
 
       // Select top-k experts
-      topk_softmax_batched(rs_now->router_score, rs_now->topk_v, rs_now->topk_i, false, false, false, stream);
+      topk_softmax_batched(rs_now->router_score, rs_now->topk_v, rs_now->topk_i, false, false, false);
       
       #ifdef DEBUG
         #pragma omp critical
@@ -274,10 +273,10 @@ float *forward_gpu_120b_batched(
       // Route the tokens to their corresponding top-k experts
       moe_apply_topk_batched(rs_now->t, weights_now->w_mlp1, weights_now->b_mlp1, weights_now->w_mlp2, weights_now->b_mlp2,
                     rs_now->topk_i, rs_now->topk_v, rs_now->mlp1_out, rs_now->gate_up, rs_now->tb3, rs_now->e_agg,
-                    p->swiglu_limit, 1ll * l, false, false, false, false, tp_rank, stream);
+                    p->swiglu_limit, 1ll * l, false, false, false, false, tp_rank);
 
       // blocking for tensor aggregation here
-      CHECK_HIP(hipStreamSynchronize(stream));
+      CHECK_HIP(hipStreamSynchronize(0));
 
       pthread_barrier_wait(tp_barrier);
       
@@ -302,15 +301,15 @@ float *forward_gpu_120b_batched(
         OurRunState *rs_to_agg = &rs[cur_device + 1];
         size_t bytes_agg = rs_to_agg->e_agg->num_elem() * rs_to_agg->e_agg->get_dtype_size();
         for (int i = 1; i < TP; i++) {
-          CHECK_HIP(hipMemcpyPeerAsync(rs_now->e_agg_buf->d_buf, cur_device, rs_to_agg->e_agg->d_buf, device_from, bytes_agg, stream));
+          CHECK_HIP(hipMemcpyPeerAsync(rs_now->e_agg_buf->d_buf, cur_device, rs_to_agg->e_agg->d_buf, device_from, bytes_agg));
 
-          add_vector_batched(rs_now->e_agg, rs_now->e_agg_buf, false, false, false, stream);  // equals residual add
+          add_vector_batched(rs_now->e_agg, rs_now->e_agg_buf, false, false, false);  // equals residual add
 
           rs_to_agg++;
           device_from++;
         }
 
-        CHECK_HIP(hipStreamSynchronize(stream));
+        CHECK_HIP(hipStreamSynchronize(0));
       }
 
       pthread_barrier_wait(tp_barrier);
@@ -320,9 +319,9 @@ float *forward_gpu_120b_batched(
         OurRunState *rs_orig = &rs[device_from];
         size_t bytes_agg = rs_orig->e_agg->num_elem() * rs_orig->e_agg->get_dtype_size();
 
-        CHECK_HIP(hipMemcpyPeerAsync(rs_now->e_agg->d_buf, device_from, rs_orig->e_agg->d_buf, cur_device, bytes_agg, stream));
+        CHECK_HIP(hipMemcpyPeerAsync(rs_now->e_agg->d_buf, device_from, rs_orig->e_agg->d_buf, cur_device, bytes_agg));
 
-        CHECK_HIP(hipStreamSynchronize(stream));
+        CHECK_HIP(hipStreamSynchronize(0));
       }
 
       pthread_barrier_wait(tp_barrier);
@@ -344,7 +343,7 @@ float *forward_gpu_120b_batched(
       #endif
 
       // residual connection
-      add_vector_batched(rs_now->x, rs_now->e_agg, false, false, false, stream);  // equals residual add
+      add_vector_batched(rs_now->x, rs_now->e_agg, false, false, false);  // equals residual add
       
       #ifdef DEBUG
         #pragma omp critical
@@ -379,10 +378,10 @@ float *forward_gpu_120b_batched(
   #endif
 
   // final rmsnorm
-  rmsnorm_batched(rs_now->x, weights_now->rms_out_w, rs_now->x, 0ll, false, false, stream);
+  rmsnorm_batched(rs_now->x, weights_now->rms_out_w, rs_now->x, 0ll, false, false);
 
   // classifier into logits
-  classifier_gemm_batched(weights_now->out, rs_now->x, rs_now->logits, false, true, stream);
+  classifier_gemm_batched(weights_now->out, rs_now->x, rs_now->logits, false, true);
 
   return rs_now->logits->buf;
 }
