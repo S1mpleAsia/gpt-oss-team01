@@ -11,10 +11,11 @@
 // #define PRINT_LOGITS
 // #define TIME_GPU
 // #define DEBUG
+// #define RUN_20B
 
-#define DP 2
+#define DP 1
 #define PP 1
-#define TP 1
+#define TP 2
 #define TOTAL_GPUS_NEEDED ((DP) * (PP) * (TP))
 #define TOTAL_PIPELINES ((PP) * (TP))
 #define TOTAL_STAGES ((DP) * (TP))
@@ -73,6 +74,7 @@ typedef struct {
   Tensor *up;
   Tensor *gate_up;
   Tensor *e_agg;
+  Tensor *e_agg_buf;
   Tensor *qkv;     // an additional buffer just for convenience (head_dim *
                    // (n_attn_heads + 2 * n_kv_heads), )
   Tensor *q;       // query (n_attn_heads * head_dim,)
@@ -91,9 +93,28 @@ typedef struct {
   long long *local_token_ptr;
   int start_idx;
   int end_idx;
-} ThreadArgs;
+  pthread_barrier_t tp_barrier;
+} OnePathArgs;
 
 typedef struct {
-  hipStream_t stream;
-  hipEvent_t kernelEnd;
-} StreamTotal;
+  int tp_rank;
+  int pp_rank;
+  vector<int> *current_tokens;
+  int pos;
+  int current_size;
+  int id;
+  float *logits;
+  pthread_barrier_t *tp_barrier;
+} OnePathInsideArgs;
+
+OurTransformerWeights *weights;
+OurRunState *rs;
+
+Config *public_config;
+Transformer *public_transformer;
+Tokenizer *public_tokenizer;
+Sampler *public_sampler;
+Requests *public_requests;
+
+hipStream_t *total_streams;
+hipEvent_t *total_events;

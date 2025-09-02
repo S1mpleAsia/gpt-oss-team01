@@ -124,8 +124,9 @@ __global__ void rmsnorm_kernel(const float *x, const float *w, float *out, int h
 void rmsnorm_batched(Tensor *x,    // Shape: [batch_size, hidden_dim]
                      Tensor *w,    // Shape: [hidden_dim]
                      Tensor *out,  // Shape: [batch_size, hidden_dim]
-                     long long layer_offset, bool x_to_device, bool out_from_device,
-                     float eps, hipStream_t stream) {
+                     long long layer_offset, bool x_to_device,
+                     bool out_from_device, hipStream_t stream,
+                     float eps) {
   GpuTimer timer("rmsnorm");
   if (x_to_device) {
     x->to_device(stream);
@@ -1001,6 +1002,8 @@ void moe_apply_topk_batched(
   // before this function, as some entries may not be written if their
   // expert is on another rank.
   memset_tensor(e_agg, 0, false, true, stream);
+  memset_tensor(mlp1_out, 0, false, true, stream);
+  memset_tensor(tb3, 0, false, true, stream);
 
   // Tunables
   constexpr int WARPS = 8;                         // 8 warps/block -> 512 threads

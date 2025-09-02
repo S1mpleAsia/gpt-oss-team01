@@ -12,16 +12,6 @@
 #ifndef GETP_RUN
 #define GETP_RUN
 
-OurTransformerWeights *weights;
-OurRunState *rs;
-
-Config *public_config;
-Transformer *public_transformer;
-Tokenizer *public_tokenizer;
-Sampler *public_sampler;
-Requests *public_requests;
-StreamTotal *total_streams;
-
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // Do not inference here
   // You should handle the warm-up process
@@ -37,10 +27,19 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     exit(1);
   }
 
+  #ifdef RUN_20B
+    if (TP != 1 || PP != 1) {
+      fprintf(stderr, "Error: TP and PP must be equal to 1 in 20B mode\n");
+      exit(1);
+    }
+  #endif
+
   weights = new OurTransformerWeights[TOTAL_GPUS_NEEDED];
   rs = new OurRunState[TOTAL_GPUS_NEEDED];
-  total_streams = new StreamTotal[TOTAL_GPUS_NEEDED];
-  our_init(transformer, weights, rs);
+  total_streams = new hipStream_t[TOTAL_GPUS_NEEDED];
+  total_events = new hipEvent_t[TOTAL_GPUS_NEEDED];
+
+  our_init(transformer, weights, rs, total_streams, total_events);
 
   public_config = &transformer->config;
   public_transformer = transformer;
@@ -59,9 +58,11 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
   // - Memory deallocation
   // - Unload model
   // - ...
-  our_free(weights, rs);
+  our_free(weights, rs, total_streams, total_events);
   delete weights;
   delete rs;
+  delete total_streams;
+  delete total_events;
 }
 
 #ifndef RUN_BATCH
@@ -177,51 +178,108 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer, Sampler *sam
 }
 #else
 
-long long batched_getp_generate(
-  const std::vector<const char *> &input_batch,
-  const std::vector<int *> &output_batch, int steps, int flow_id,
-  int tp_rank, int pp_rank
-) {
-  const int batch_size = input_batch.size();
-  if (batch_size == 0)
-    return 0;
+void *inside_thread_handler(void *arg) {
+  OnePathInsideArgs *args = (OnePathInsideArgs *)arg;
 
-  vector<vector<int>> batch_prompt_tokens(batch_size);
-  vector<int> num_prompt_tokens(batch_size);
+  int cur_device = args->id * TOTAL_PIPELINES + args->pp_rank * TP + args->tp_rank; 
+  
+  // Set the device context for this thread
+  CHECK_HIP(hipSetDevice(cur_device));
 
-  for (int i = 0; i < batch_size; i++) {
-    const char *input_seq = input_batch[i] ? input_batch[i] : "";
-    int *prompt_tokens_buffer = (int *)malloc(strlen((input_seq) + 3) * sizeof(int));
-    int count = 0;
-    encode(public_tokenizer, input_seq, -1, -1, prompt_tokens_buffer, &count, public_config->initial_context_length);
+  #ifdef RUN_20B
+    args->logits = forward_gpu_20b_batched(args->current_tokens->data(), args->pos, args->current_size, args->id);
+  #else
+    args->logits = forward_gpu_120b_batched(args->current_tokens->data(), args->pos, args->current_size, args->id, args->tp_rank, args->pp_rank, args->tp_barrier);
+  #endif
 
-    if (count < 1) {
-      fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
-      exit(EXIT_FAILURE);
-    } else {
-      batch_prompt_tokens[i] = vector<int>(prompt_tokens_buffer, prompt_tokens_buffer + count);
-      num_prompt_tokens[i] = count;
+  return nullptr;
+}
+
+void *thread_handler(void *arg) {
+  OnePathArgs *args = (OnePathArgs *)arg;
+
+  long long local_token_count = 0ll;
+  int id = args->id;
+  int max_seq_len = public_requests->max_seq_len;
+  int end_idx = args->end_idx;
+
+  pthread_t inside_threads[TP];
+  OnePathInsideArgs inside_args[TP];
+
+  pthread_barrier_init(&(args->tp_barrier), NULL, TP);
+  
+  for (int i = 0; i < TP; i++) {
+    inside_args[i].tp_rank = (i % TP);
+    inside_args[i].pp_rank = 0;
+    inside_args[i].tp_barrier = &(args->tp_barrier);
+  }
+
+  for (int cur_idx = args->start_idx; cur_idx < end_idx; cur_idx += BATCH_SIZE) {
+    int current_size = min(BATCH_SIZE, end_idx - cur_idx);
+
+    if (current_size == 0) continue;
+
+    vector<const char *> input_batch;
+    vector<int *> output_batch;
+
+    for (int j = 0; j < current_size; j++) {
+      input_batch.push_back(get_str_req_ptr(public_requests, cur_idx + j));
+      output_batch.push_back(get_tok_gen_ptr(public_requests, cur_idx + j));
     }
 
-    free(prompt_tokens_buffer);
-  }
+    vector<vector<int>> batch_prompt_tokens(current_size);
+    vector<int> num_prompt_tokens(current_size);
 
-  vector<int> current_tokens(batch_size);
-  vector<int> current_pos(batch_size, 0);
-  vector<bool> active(batch_size, true);
-  int active_count = batch_size;
-  long long total_generate_tokens = 0;
+    for (int i = 0; i < current_size; i++) {
+      const char *input_seq = input_batch[i] ? input_batch[i] : "";
+      int *prompt_tokens_buffer = (int *)malloc(strlen((input_seq) + 3) * sizeof(int));
+      int count = 0;
+      encode(public_tokenizer, input_seq, -1, -1, prompt_tokens_buffer, &count, public_config->initial_context_length);
 
-  for (int i = 0; i < batch_size; i++) {
-    current_tokens[i] = batch_prompt_tokens[i][0];
-  }
+      if (count < 1) {
+        fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
+        exit(EXIT_FAILURE);
+      } else {
+        batch_prompt_tokens[i] = vector<int>(prompt_tokens_buffer, prompt_tokens_buffer + count);
+        num_prompt_tokens[i] = count;
+      }
 
-  for (int pos = 0; pos < steps && active_count > 0; ++pos) {
-    float *batch_logits =
-      forward_gpu_120b_batched(public_config, weights, rs, current_tokens.data(), pos, batch_size, flow_id, tp_rank, pp_rank);
+      free(prompt_tokens_buffer);
+    }
 
-    if (tp_rank == 0) {
-      for (int i = 0; i < batch_size; i++) {
+    vector<int> current_tokens(current_size);
+    vector<int> current_pos(current_size, 0);
+    vector<bool> active(current_size, true);
+    int active_count = current_size;
+    long long total_generate_tokens = 0;
+
+    for (int i = 0; i < current_size; i++) {
+      current_tokens[i] = batch_prompt_tokens[i][0];
+    }
+
+    for (int i = 0; i < TP; i++) {
+      inside_args[i].current_tokens = &current_tokens;
+      inside_args[i].current_size = current_size;
+      inside_args[i].id = id;
+    }
+    
+    for (int pos = 0; pos < max_seq_len && active_count > 0; ++pos) {
+      for (int i = 0; i < TP; i++) {
+        inside_args[i].pos = pos;
+      }
+
+      for (int i = 0; i < TP; i++) {
+        pthread_create(&inside_threads[i], NULL, inside_thread_handler,
+                    (void *)&inside_args[i]);
+      }
+      
+      for (int i = 0; i < TP; i++) {
+        pthread_join(inside_threads[i], NULL);
+      }
+
+      float *batch_logits = inside_args[0].logits;
+
+      for (int i = 0; i < current_size; i++) {
         if (!active[i])
           continue;
         
@@ -268,86 +326,17 @@ long long batched_getp_generate(
         current_pos[i]++;
       }
     }
-  }
-  
-  // should be removed
-  #ifdef PRINT_LOGITS
-    printf("\n");
-  #endif
-
-  if (tp_rank == 0) {
-    for (int i = 0; i < batch_size; i++) {
-      int generated_len = current_pos[i] - num_prompt_tokens[i];
-      if (generated_len < 0)
-        generated_len = 0;
-
-      output_batch[i][generated_len + 1] = -1;
-      total_generate_tokens += generated_len;
-    }
-
-    return total_generate_tokens;
-  } else {
-    return 0ll;
-  }
-}
-
-long long inference_old(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
-                    Requests *requests) {
-  setup(sampler, requests);
-
-  long long num_token_out = 0;
-
-  for (int start_idx = 0; start_idx < requests->num_reqs; start_idx += BATCH_SIZE) {
-    int current_size = BATCH_SIZE;
-    if (start_idx + BATCH_SIZE > requests->num_reqs) {
-      current_size = requests->num_reqs - start_idx;
-    }
-
-    vector<const char *> input_batch;
-    vector<int *> output_batch;
 
     for (int i = 0; i < current_size; i++) {
-      input_batch.push_back(get_str_req_ptr(requests, i + start_idx));
-      output_batch.push_back(get_tok_gen_ptr(requests, i + start_idx));
+      int generated_len = current_pos[i] - num_prompt_tokens[i];
+      if (generated_len < 0) generated_len = 0;
+
+      output_batch[i][generated_len + 1] = -1;
+      local_token_count += generated_len;
     }
-
-    // const char *input_seq = get_str_req_ptr(requests, idx);
-    // int *output_tokens = get_tok_gen_ptr(requests, idx);
-    num_token_out += batched_getp_generate(
-      input_batch, output_batch, requests->max_seq_len, 0, 0, 0
-    );
   }
-  return num_token_out;
-}
-
-void *thread_handler(void *arg) {
-  ThreadArgs *args = (ThreadArgs *)arg;
-
-  long long local_token_count = 0ll;
-  int id = args->id;
-  int max_seq_len = public_requests->max_seq_len;
-  int end_idx = args->end_idx;
-
-  int tp_rank = (id % TP);
-  int pp_rank = 0;
-
-  CHECK_HIP(hipSetDevice(id));
-
-  for (int i = args->start_idx; i < end_idx; i += BATCH_SIZE) {
-    int current_size = min(BATCH_SIZE, end_idx - i);
-
-    vector<const char *> input_batch;
-    vector<int *> output_batch;
-
-    for (int j = 0; j < current_size; j++) {
-      input_batch.push_back(get_str_req_ptr(public_requests, i + j));
-      output_batch.push_back(get_tok_gen_ptr(public_requests, i + j));
-    }
-
-    local_token_count += batched_getp_generate(
-      input_batch, output_batch, max_seq_len, id, tp_rank, pp_rank
-    );
-  }
+  
+  pthread_barrier_destroy(&(args->tp_barrier));
 
   *(args->local_token_ptr) = local_token_count;
 
@@ -359,14 +348,14 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer, Sampler *sam
   setup(sampler, requests);
 
   long long num_token_out = 0;
-  pthread_t threads[TOTAL_STAGES];
-  ThreadArgs args[TOTAL_STAGES];
-  long long tokens_out[TOTAL_STAGES];
+  pthread_t threads[DP];
+  OnePathArgs args[DP];
+  long long tokens_out[DP];
 
   int total_reqs = public_requests->num_reqs;
   int chunk_size = (total_reqs + DP - 1) / DP;
     
-  for (int i = 0; i < TOTAL_STAGES; i++) {
+  for (int i = 0; i < DP; i++) {
     args[i].id = i;
     args[i].local_token_ptr = &tokens_out[i];
     args[i].start_idx = i * chunk_size;
@@ -385,7 +374,6 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer, Sampler *sam
 
   return num_token_out;
 }
-
 
 #endif
 

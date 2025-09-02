@@ -3,19 +3,22 @@
 #include <cstring>
 
 float *forward_gpu_120b_batched(
-  Config *p, OurTransformerWeights *weights_total, OurRunState *rs_total,
   int *tokens, int pos, int cur_batch_size, int flow_id,
-  int tp_rank, int pp_rank
+  int tp_rank, int pp_rank, pthread_barrier_t *tp_barrier
 ) {
+  Config *p = public_config;
   int cur_device = flow_id * TOTAL_PIPELINES + tp_rank;
 
-  OurTransformerWeights *weights = &weights_total[cur_device];
-  OurRunState *rs = &rs_total[cur_device];
+  OurTransformerWeights *weights_now = &weights[cur_device];
+  OurRunState *rs_now = &rs[cur_device];
+  hipStream_t stream = total_streams[cur_device];
+  hipEvent_t event = total_events[cur_device];
+  // hipStream_t stream = 0;
 
   CHECK_HIP(hipSetDevice(cur_device));
   
   // copy the token embedding into x
-  embedding_lookup_batched(weights->token_embedding_table, tokens, rs->x, false);
+  embedding_lookup_batched(weights_now->token_embedding_table, tokens, rs_now->x, false, stream);
 
   long long kv_dim = 1ll * p->n_kv_heads * p->head_dim;
   long long loff_one = 1ll * p->seq_len * kv_dim;
@@ -27,29 +30,43 @@ float *forward_gpu_120b_batched(
       cur_device += TP;
       CHECK_HIP(hipSetDevice(cur_device));
 
-      OurRunState *rs_new = &rs_total[cur_device];
+      OurRunState *rs_new = &rs[cur_device];
+      stream = total_streams[cur_device];
       
-      // sync from rs->x to rs->x
-      CHECK_HIP(hipMemcpyPeerAsync(rs_new->x->d_buf, cur_device, rs->x->d_buf, cur_device - TP, rs->x->num_elem() * rs->x->get_dtype_size(), 0));
+      // sync from rs_now->x to rs_now->x
+      CHECK_HIP(hipMemcpyPeerAsync(rs_new->x->d_buf, cur_device, rs_now->x->d_buf, cur_device - TP, rs_now->x->num_elem() * rs_now->x->get_dtype_size(), stream));
 
-      weights = &weights_total[cur_device];
-      rs = &rs_total[cur_device];
+      weights_now = &weights[cur_device];
+      rs_now = &rs[cur_device];
+      event = total_events[cur_device];
     }
     for (int l = 0; l < p->n_layers / PP; l++) {
+      #ifdef DEBUG
+        #pragma omp critical
+        {
+          if (flow_id == 0) {
+            printf("tp_rank %d, layer %d\n", tp_rank, l);
+          }
+        }
+      #endif
+
       // attention rmsnorm
-      rmsnorm_batched(rs->x, weights->rms_attn_w, rs->t, 1ll * l,
-                      false, false);
+      rmsnorm_batched(rs_now->x, weights_now->rms_attn_w, rs_now->t, 1ll * l,
+                      false, false, stream);
       
       #ifdef DEBUG
-        if (flow_id == 0) {
-          rs->t->from_device(0);
-          CHECK_HIP(hipDeviceSynchronize());
-          printf("rs->t: ");
-          for (int id_test = 0; id_test < 5; id_test++) {
-            printf("%.6f ", rs->t->buf[id_test]);
+        #pragma omp critical
+        {
+          if (flow_id == 0) {
+            rs_now->t->from_device(0);
+            CHECK_HIP(hipDeviceSynchronize());
+            printf("tp_rank %d, rs_now->t: ", tp_rank);
+            for (int id_test = 0; id_test < 5; id_test++) {
+              printf("%.6f ", rs_now->t->buf[id_test]);
+            }
+            printf("\n");
+            fflush(stdout);
           }
-          printf("\n");
-          fflush(stdout);
         }
       #endif
 
@@ -57,66 +74,76 @@ float *forward_gpu_120b_batched(
       long long loff = 1ll * l * loff_one;  // kv cache layer offset
 
       // QKV projection
-      qkv_gemm_batched(rs->t, weights->w_qkv, weights->b_qkv, rs->qkv, 1ll * l, false, false);  // This kernel diverges the most
+      qkv_gemm_batched(rs_now->t, weights_now->w_qkv, weights_now->b_qkv, rs_now->qkv, 1ll * l, false, false, stream);  // This kernel diverges the most
       
       #ifdef DEBUG
-        if (flow_id == 0) {
-          rs->qkv->from_device(0);
-          CHECK_HIP(hipDeviceSynchronize());
-          printf("rs->qkv: ");
-          for (int id_test = 0; id_test < 5; id_test++) {
-            printf("%.6f ", rs->qkv->buf[id_test]);
+        #pragma omp critical
+        {
+          if (flow_id == 0) {
+            rs_now->qkv->from_device(0);
+            CHECK_HIP(hipDeviceSynchronize());
+            printf("tp_rank %d, rs_now->qkv: ", tp_rank);
+            for (int id_test = 0; id_test < 5; id_test++) {
+              printf("%.6f ", rs_now->qkv->buf[id_test]);
+            }
+            printf("\n");
+            long long layer_offset_wqkv = 1ll * l * (weights_now->w_qkv->num_elem() / weights_now->w_qkv->shape[0]);
+            printf("tp_rank %d, weights_now->w_qkv: ", tp_rank);
+            for (int id_test = 0; id_test < 5; id_test++) {
+              printf("%.6f ", weights_now->w_qkv->buf[layer_offset_wqkv + 1ll * id_test]);
+            }
+            printf("\n");
+            long long layer_offset_bqkv = 1ll * l * (weights_now->b_qkv->num_elem() / weights_now->b_qkv->shape[0]);
+            printf("tp_rank %d, weights_now->b_qkv: ", tp_rank);
+            for (int id_test = 0; id_test < 5; id_test++) {
+              printf("%.6f ", weights_now->b_qkv->buf[layer_offset_bqkv + 1ll * id_test]);
+            }
+            printf("\n");
+            fflush(stdout);
           }
-          printf("\n");
-          long long layer_offset_wqkv = 1ll * l * (weights->w_qkv->num_elem() / weights->w_qkv->shape[0]); 
-          printf("weights->w_qkv: ");
-          for (int id_test = 0; id_test < 5; id_test++) {
-            printf("%.6f ", weights->w_qkv->buf[layer_offset_wqkv + 1ll * id_test]);
-          }
-          printf("\n");
-          long long layer_offset_bqkv = 1ll * l * (weights->b_qkv->num_elem() / weights->b_qkv->shape[0]); 
-          printf("weights->b_qkv: ");
-          for (int id_test = 0; id_test < 5; id_test++) {
-            printf("%.6f ", weights->b_qkv->buf[layer_offset_bqkv + 1ll * id_test]);
-          }
-          printf("\n");
-          fflush(stdout);
         }
       #endif
 
       // Separate q, k, v + RoPE
-      qkv_split_rope_batched(rs->qkv, rs->q, rs->k, rs->v, rs->cos_tensor,
-                            rs->sin_tensor, p->head_dim, p->n_attn_heads,
-                            p->n_kv_heads, pos, false, false, false, false);
+      qkv_split_rope_batched(rs_now->qkv, rs_now->q, rs_now->k, rs_now->v, rs_now->cos_tensor,
+                            rs_now->sin_tensor, p->head_dim, p->n_attn_heads,
+                            p->n_kv_heads, pos, false, false, false, false,
+                            stream);
       #ifdef DEBUG
-        if (flow_id == 0) {
-          rs->q->from_device(0);
-          CHECK_HIP(hipDeviceSynchronize());
-          printf("rs->q: ");
-          for (int id_test = 0; id_test < 5; id_test++) {
-            printf("%.6f ", rs->q->buf[id_test]);
+        #pragma omp critical
+        {
+          if (flow_id == 0) {
+            rs_now->q->from_device(0);
+            CHECK_HIP(hipDeviceSynchronize());
+            printf("tp_rank %d, rs_now->q: ", tp_rank);
+            for (int id_test = 0; id_test < 5; id_test++) {
+              printf("%.6f ", rs_now->q->buf[id_test]);
+            }
+            printf("\n");
+            fflush(stdout);
           }
-          printf("\n");
-          fflush(stdout);
         }
       #endif
 
       // Store k, v in cache
       for (int b = 0; b < cur_batch_size; b++) {
-        memcpy_tensor(rs->key_cache, rs->k, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim, 1ll * b * kv_dim, kv_dim, false, true);
-        memcpy_tensor(rs->value_cache, rs->v, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim, 1ll * b * kv_dim, kv_dim, false, true);
+        memcpy_tensor(rs_now->key_cache, rs_now->k, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim, 1ll * b * kv_dim, kv_dim, false, true, stream);
+        memcpy_tensor(rs_now->value_cache, rs_now->v, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim, 1ll * b * kv_dim, kv_dim, false, true, stream);
       }
       
       #ifdef DEBUG
-        if (flow_id == 0) {
-          rs->key_cache->from_device(0);
-          CHECK_HIP(hipDeviceSynchronize());
-          printf("rs->key_cache: ");
-          for (int id_test = 0; id_test < 5; id_test++) {
-            printf("%.6f ", rs->key_cache->buf[id_test]);
+        #pragma omp critical
+        {
+          if (flow_id == 0) {
+            rs_now->key_cache->from_device(0);
+            CHECK_HIP(hipDeviceSynchronize());
+            printf("tp_rank %d, rs_now->key_cache: ", tp_rank);
+            for (int id_test = 0; id_test < 5; id_test++) {
+              printf("%.6f ", rs_now->key_cache->buf[id_test]);
+            }
+            printf("\n");
+            fflush(stdout);
           }
-          printf("\n");
-          fflush(stdout);
         }
       #endif
 
@@ -124,149 +151,216 @@ float *forward_gpu_120b_batched(
       int kv_mul = p->n_attn_heads / p->n_kv_heads;  // integer multiplier for GQA
 
       // FIX single_query_attn_batched later
-      single_query_attn_batched(rs->q, rs->key_cache, rs->value_cache, rs->mask, 
-                                weights->attn_sinks, rs->tb, p->head_dim,
+      single_query_attn_batched(rs_now->q, rs_now->key_cache, rs_now->value_cache, rs_now->mask, 
+                                weights_now->attn_sinks, rs_now->tb, p->head_dim,
                                 p->n_attn_heads, kv_mul, kv_dim, p->seq_len,
                                 p->sliding_window, pos, 1ll * l, false, false,
-                                false, false, false);
+                                false, false, false, stream);
       #ifdef DEBUG
-        if (flow_id == 0) {
-          rs->tb->from_device(0);
-          CHECK_HIP(hipDeviceSynchronize());
-          printf("rs->tb: ");
-          for (int id_test = 0; id_test < 5; id_test++) {
-            printf("%.6f ", rs->tb->buf[id_test]);
+        #pragma omp critical
+        {
+          if (flow_id == 0) {
+            rs_now->tb->from_device(0);
+            CHECK_HIP(hipDeviceSynchronize());
+            printf("tp_rank %d, rs_now->tb: ", tp_rank);
+            for (int id_test = 0; id_test < 5; id_test++) {
+              printf("%.6f ", rs_now->tb->buf[id_test]);
+            }
+            printf("\n");
+            fflush(stdout);
           }
-          printf("\n");
-          fflush(stdout);
         }
       #endif
                                 
       // final matmul to get the output of the attention
-      attn_out_project_batched(rs->tb, weights->w_o, weights->b_o, rs->tb2, 1ll * l, false, false);
+      attn_out_project_batched(rs_now->tb, weights_now->w_o, weights_now->b_o, rs_now->tb2, 1ll * l, false, false, stream);
 
       #ifdef DEBUG
-        if (flow_id == 0) {
-          rs->tb2->from_device(0);
-          CHECK_HIP(hipDeviceSynchronize());
-          printf("rs->tb2: ");
-          for (int id_test = 0; id_test < 5; id_test++) {
-            printf("%.6f ", rs->tb2->buf[id_test]);
+        #pragma omp critical
+        {
+          if (flow_id == 0) {
+            rs_now->tb2->from_device(0);
+            CHECK_HIP(hipDeviceSynchronize());
+            printf("tp_rank %d, rs_now->tb2: ", tp_rank);
+            for (int id_test = 0; id_test < 5; id_test++) {
+              printf("%.6f ", rs_now->tb2->buf[id_test]);
+            }
+            printf("\n");
+            fflush(stdout);
           }
-          printf("\n");
-          fflush(stdout);
         }
       #endif
 
       // residual connection back into x
-      add_vector_batched(rs->x, rs->tb2, false, false, false);  // equals residual add
+      add_vector_batched(rs_now->x, rs_now->tb2, false, false, false, stream);  // equals residual add
 
       #ifdef DEBUG
-        if (flow_id == 0) {
-          rs->x->from_device(0);
-          CHECK_HIP(hipDeviceSynchronize());
-          printf("rs->x: ");
-          for (int id_test = 0; id_test < 5; id_test++) {
-            printf("%.6f ", rs->x->buf[id_test]);
+        #pragma omp critical
+        {
+          if (flow_id == 0) {
+            rs_now->x->from_device(0);
+            CHECK_HIP(hipDeviceSynchronize());
+            printf("tp_rank %d, rs_now->x: ", tp_rank);
+            for (int id_test = 0; id_test < 5; id_test++) {
+              printf("%.6f ", rs_now->x->buf[id_test]);
+            }
+            printf("\n");
+            fflush(stdout);
           }
-          printf("\n");
-          fflush(stdout);
         }
       #endif
 
       // ffn rmsnorm
-      rmsnorm_batched(rs->x, weights->rms_ffn_w, rs->t, 1ll * l, false, false);
+      rmsnorm_batched(rs_now->x, weights_now->rms_ffn_w, rs_now->t, 1ll * l, false, false, stream);
       
       #ifdef DEBUG
-        if (flow_id == 0) {
-          rs->t->from_device(0);
-          CHECK_HIP(hipDeviceSynchronize());
-          printf("rs->t: ");
-          for (int id_test = 0; id_test < 5; id_test++) {
-            printf("%.6f ", rs->t->buf[id_test]);
+        #pragma omp critical
+        {
+          if (flow_id == 0) {
+            rs_now->t->from_device(0);
+            CHECK_HIP(hipDeviceSynchronize());
+            printf("tp_rank %d, rs_now->t: ", tp_rank);
+            for (int id_test = 0; id_test < 5; id_test++) {
+              printf("%.6f ", rs_now->t->buf[id_test]);
+            }
+            printf("\n");
+            fflush(stdout);
           }
-          printf("\n");
-          fflush(stdout);
         }
       #endif
 
       // MoE routing
-      router_gemm_batched(weights->w_router, rs->t, weights->b_router,
-                  rs->router_score, 1ll * l, false, false);
+      router_gemm_batched(weights_now->w_router, rs_now->t, weights_now->b_router,
+                  rs_now->router_score, 1ll * l, false, false, stream);
 
       #ifdef DEBUG
-        if (flow_id == 0) {
-          rs->router_score->from_device(0);
-          CHECK_HIP(hipDeviceSynchronize());
-          printf("rs->router_score: ");
-          for (int id_test = 0; id_test < 5; id_test++) {
-            printf("%.6f ", rs->router_score->buf[id_test]);
+        #pragma omp critical
+        {
+          if (flow_id == 0) {
+            rs_now->router_score->from_device(0);
+            CHECK_HIP(hipDeviceSynchronize());
+            printf("tp_rank %d, rs_now->router_score: ", tp_rank);
+            for (int id_test = 0; id_test < 5; id_test++) {
+              printf("%.6f ", rs_now->router_score->buf[id_test]);
+            }
+            printf("\n");
+            fflush(stdout);
           }
-          printf("\n");
-          fflush(stdout);
         }
       #endif
 
       // Select top-k experts
-      topk_softmax_batched(rs->router_score, rs->topk_v, rs->topk_i, false, false, false);
+      topk_softmax_batched(rs_now->router_score, rs_now->topk_v, rs_now->topk_i, false, false, false, stream);
       
       #ifdef DEBUG
-        if (flow_id == 0) {
-          rs->topk_v->from_device(0);
-          CHECK_HIP(hipDeviceSynchronize());
-          printf("rs->topk_v: ");
-          for (int id_test = 0; id_test < 5; id_test++) {
-            printf("%.6f ", rs->topk_v->buf[id_test]);
+        #pragma omp critical
+        {
+          if (flow_id == 0) {
+            rs_now->topk_v->from_device(0);
+            CHECK_HIP(hipDeviceSynchronize());
+            printf("tp_rank %d, rs_now->topk_v: ", tp_rank);
+            for (int id_test = 0; id_test < 5; id_test++) {
+              printf("%.6f ", rs_now->topk_v->buf[id_test]);
+            }
+            printf("\n");
+            fflush(stdout);
           }
-          printf("\n");
-          fflush(stdout);
         }
       #endif
 
       // Route the tokens to their corresponding top-k experts
-      int tp_rank = cur_device % TP;
-      moe_apply_topk_batched(rs->t, weights->w_mlp1, weights->b_mlp1, weights->w_mlp2, weights->b_mlp2,
-                    rs->topk_i, rs->topk_v, rs->mlp1_out, rs->gate_up, rs->tb3, rs->e_agg,
-                    p->swiglu_limit, 1ll * l, false, false, false, false, tp_rank);
+      moe_apply_topk_batched(rs_now->t, weights_now->w_mlp1, weights_now->b_mlp1, weights_now->w_mlp2, weights_now->b_mlp2,
+                    rs_now->topk_i, rs_now->topk_v, rs_now->mlp1_out, rs_now->gate_up, rs_now->tb3, rs_now->e_agg,
+                    p->swiglu_limit, 1ll * l, false, false, false, false, tp_rank, stream);
+
+      // blocking for tensor aggregation here
+      CHECK_HIP(hipStreamSynchronize(stream));
+
+      pthread_barrier_wait(tp_barrier);
       
-      if (l == 11 && false) {
-        rs->e_agg->from_device(0);
-        CHECK_HIP(hipDeviceSynchronize());
-        printf("rs->e_agg: ");
-        for (int id_test = 0; id_test < 5; id_test++) {
-          printf("%.6f ", rs->e_agg->buf[id_test]);
+      #ifdef DEBUG
+        #pragma omp critical
+        {
+          if (flow_id == 0) {
+            printf("rs->e_agg rank id %d: ", tp_rank);
+            rs_now->e_agg->from_device(stream);
+            for (int i = 0; i < 5; i++) {
+              printf("%.6f ", rs_now->e_agg->buf[i]);
+            }
+            printf("\n");
+            fflush(stdout);
+          }
         }
-        printf("\n");
-        fflush(stdout);
+      #endif
+
+      // do tensor aggregation here, do later
+      if (tp_rank == 0) {
+        int device_from = cur_device + 1;
+        OurRunState *rs_to_agg = &rs[cur_device + 1];
+        size_t bytes_agg = rs_to_agg->e_agg->num_elem() * rs_to_agg->e_agg->get_dtype_size();
+        for (int i = 1; i < TP; i++) {
+          CHECK_HIP(hipMemcpyPeerAsync(rs_now->e_agg_buf->d_buf, cur_device, rs_to_agg->e_agg->d_buf, device_from, bytes_agg, stream));
+
+          add_vector_batched(rs_now->e_agg, rs_now->e_agg_buf, false, false, false, stream);  // equals residual add
+
+          rs_to_agg++;
+          device_from++;
+        }
+
+        CHECK_HIP(hipStreamSynchronize(stream));
+
+        device_from = cur_device + 1;
+        rs_to_agg = &rs[cur_device + 1];
+        hipStream_t *stream_to = &total_streams[cur_device + 1];
+
+        for (int i = 1; i < TP; i++) {
+          CHECK_HIP(hipSetDevice(device_from));
+          CHECK_HIP(hipMemcpyPeerAsync(rs_to_agg->e_agg->d_buf, device_from, rs_now->e_agg->d_buf, cur_device, bytes_agg, *stream_to));
+          CHECK_HIP(hipStreamSynchronize(*stream_to));
+
+          rs_to_agg++;
+          device_from++;
+          stream_to++;
+        }
+
+        CHECK_HIP(hipSetDevice(cur_device));
       }
 
+      pthread_barrier_wait(tp_barrier);
+
       #ifdef DEBUG
-        if (flow_id == 0) {
-          rs->e_agg->from_device(0);
-          CHECK_HIP(hipDeviceSynchronize());
-          printf("rs->e_agg: ");
-          for (int id_test = 0; id_test < 5; id_test++) {
-            printf("%.6f ", rs->e_agg->buf[id_test]);
+        #pragma omp critical
+        {
+          if (flow_id == 0) {
+            rs_now->e_agg->from_device(0);
+            CHECK_HIP(hipDeviceSynchronize());
+            printf("tp_rank %d, rs_now->e_agg: ", tp_rank);
+            for (int id_test = 0; id_test < 5; id_test++) {
+              printf("%.6f ", rs_now->e_agg->buf[id_test]);
+            }
+            printf("\n");
+            fflush(stdout);
           }
-          printf("\n");
-          fflush(stdout);
         }
       #endif
 
       // residual connection
-      add_vector_batched(rs->x, rs->e_agg, false, false, false);  // equals residual add
+      add_vector_batched(rs_now->x, rs_now->e_agg, false, false, false, stream);  // equals residual add
       
       #ifdef DEBUG
-        if (flow_id == 0) {
-          rs->x->from_device(0);
-          CHECK_HIP(hipDeviceSynchronize());
-          printf("rs->x: ");
-          for (int id_test = 0; id_test < 5; id_test++) {
-            printf("%.6f ", rs->x->buf[id_test]);
+        #pragma omp critical
+        {
+          if (flow_id == 0) {
+            rs_now->x->from_device(0);
+            CHECK_HIP(hipDeviceSynchronize());
+            printf("tp_rank %d, rs_now->x: ", tp_rank);
+            for (int id_test = 0; id_test < 5; id_test++) {
+              printf("%.6f ", rs_now->x->buf[id_test]);
+            }
+            printf("\n");
+            printf("tp_rank %d, Finish layer %d\n", tp_rank, l);
+            fflush(stdout);
           }
-          printf("\n");
-          printf("Finish layer %d\n", l);
-          fflush(stdout);
         }
       #endif
     }
@@ -276,29 +370,34 @@ float *forward_gpu_120b_batched(
   // exit(1);
 
   #ifdef DEBUG
-    if (flow_id == 0) {
-      exit(1);
+    #pragma omp critical
+    {
+      if (flow_id == 0) {
+        printf("tp_rank %d, exiting from debug block.\n", tp_rank);
+        fflush(stdout);
+        exit(1);
+      }
     }
   #endif
 
   // final rmsnorm
-  rmsnorm_batched(rs->x, weights->rms_out_w, rs->x, 0ll, false, false);
+  rmsnorm_batched(rs_now->x, weights_now->rms_out_w, rs_now->x, 0ll, false, false, stream);
 
   // classifier into logits
-  classifier_gemm_batched(weights->out, rs->x, rs->logits, false, true);
+  classifier_gemm_batched(weights_now->out, rs_now->x, rs_now->logits, false, true, stream);
 
-  return rs->logits->buf;
+  return rs_now->logits->buf;
 }
 
 float *forward_gpu_20b_batched(
-  Config *p, OurTransformerWeights *weights_total, OurRunState *rs_total,
   int *tokens, int pos, int cur_batch_size, int flow_id
 ) {
-  OurTransformerWeights *weights = &weights_total[flow_id];
-  OurRunState *rs = &rs_total[flow_id];
+  Config *p = public_config;
+  OurTransformerWeights *weights_now = &weights[flow_id];
+  OurRunState *rs_now = &rs[flow_id];
   
   // copy the token embedding into x
-  embedding_lookup_batched(weights->token_embedding_table, tokens, rs->x, false);
+  embedding_lookup_batched(weights_now->token_embedding_table, tokens, rs_now->x, false);
 
   long long kv_dim = 1ll * p->n_kv_heads * p->head_dim;
   long long loff_one = 1ll * p->seq_len * kv_dim;
@@ -307,68 +406,68 @@ float *forward_gpu_20b_batched(
   // forward all the layers
   for (int l = 0; l < p->n_layers; l++) {
     // attention rmsnorm
-    rmsnorm_batched(rs->x, weights->rms_attn_w, rs->t, 1ll * l,
+    rmsnorm_batched(rs_now->x, weights_now->rms_attn_w, rs_now->t, 1ll * l,
                     false, false);
 
     // key and value point to the kv cache
     long long loff = 1ll * l * loff_one;  // kv cache layer offset
 
     // QKV projection
-    qkv_gemm_batched(rs->t, weights->w_qkv, weights->b_qkv, rs->qkv, 1ll * l, false, false);  // This kernel diverges the most
+    qkv_gemm_batched(rs_now->t, weights_now->w_qkv, weights_now->b_qkv, rs_now->qkv, 1ll * l, false, false);  // This kernel diverges the most
 
     // Separate q, k, v + RoPE
-    qkv_split_rope_batched(rs->qkv, rs->q, rs->k, rs->v, rs->cos_tensor,
-                          rs->sin_tensor, p->head_dim, p->n_attn_heads,
+    qkv_split_rope_batched(rs_now->qkv, rs_now->q, rs_now->k, rs_now->v, rs_now->cos_tensor,
+                          rs_now->sin_tensor, p->head_dim, p->n_attn_heads,
                           p->n_kv_heads, pos, false, false, false, false);
 
     // Store k, v in cache
     for (int b = 0; b < cur_batch_size; b++) {
-      memcpy_tensor(rs->key_cache, rs->k, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim, 1ll * b * kv_dim, kv_dim, false, true);
-      memcpy_tensor(rs->value_cache, rs->v, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim, 1ll * b * kv_dim, kv_dim, false, true);
+      memcpy_tensor(rs_now->key_cache, rs_now->k, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim, 1ll * b * kv_dim, kv_dim, false, true);
+      memcpy_tensor(rs_now->value_cache, rs_now->v, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim, 1ll * b * kv_dim, kv_dim, false, true);
     }
 
     // multihead attention
     int kv_mul = p->n_attn_heads / p->n_kv_heads;  // integer multiplier for GQA
 
     // FIX single_query_attn_batched later
-    single_query_attn_batched(rs->q, rs->key_cache, rs->value_cache, rs->mask, 
-                              weights->attn_sinks, rs->tb, p->head_dim,
+    single_query_attn_batched(rs_now->q, rs_now->key_cache, rs_now->value_cache, rs_now->mask, 
+                              weights_now->attn_sinks, rs_now->tb, p->head_dim,
                               p->n_attn_heads, kv_mul, kv_dim, p->seq_len,
                               p->sliding_window, pos, 1ll * l, false, false,
                               false, false, false);
 
     // final matmul to get the output of the attention
-    attn_out_project_batched(rs->tb, weights->w_o, weights->b_o, rs->tb2, 1ll * l, false, false);
+    attn_out_project_batched(rs_now->tb, weights_now->w_o, weights_now->b_o, rs_now->tb2, 1ll * l, false, false);
 
     // residual connection back into x
-    add_vector_batched(rs->x, rs->tb2, false, false, false);  // equals residual add
+    add_vector_batched(rs_now->x, rs_now->tb2, false, false, false);  // equals residual add
 
     // ffn rmsnorm
-    rmsnorm_batched(rs->x, weights->rms_ffn_w, rs->t, 1ll * l, false, false);
+    rmsnorm_batched(rs_now->x, weights_now->rms_ffn_w, rs_now->t, 1ll * l, false, false);
 
     // MoE routing
-    router_gemm_batched(weights->w_router, rs->t, weights->b_router,
-                rs->router_score, 1ll * l, false, false);
+    router_gemm_batched(weights_now->w_router, rs_now->t, weights_now->b_router,
+                rs_now->router_score, 1ll * l, false, false);
 
     // Select top-k experts
-    topk_softmax_batched(rs->router_score, rs->topk_v, rs->topk_i, false, false, false);
+    topk_softmax_batched(rs_now->router_score, rs_now->topk_v, rs_now->topk_i, false, false, false);
 
     // Route the tokens to their corresponding top-k experts
-    moe_apply_topk_batched(rs->t, weights->w_mlp1, weights->b_mlp1, weights->w_mlp2, weights->b_mlp2,
-                   rs->topk_i, rs->topk_v, rs->mlp1_out, rs->gate_up, rs->tb3, rs->e_agg,
+    moe_apply_topk_batched(rs_now->t, weights_now->w_mlp1, weights_now->b_mlp1, weights_now->w_mlp2, weights_now->b_mlp2,
+                   rs_now->topk_i, rs_now->topk_v, rs_now->mlp1_out, rs_now->gate_up, rs_now->tb3, rs_now->e_agg,
                    p->swiglu_limit, 1ll * l, false, false, false, false, 0);
 
     // residual connection
-    add_vector_batched(rs->x, rs->e_agg, false, false, false);  // equals residual add
+    add_vector_batched(rs_now->x, rs_now->e_agg, false, false, false);  // equals residual add
   }
 
   // final rmsnorm
-  rmsnorm_batched(rs->x, weights->rms_out_w, rs->x, 0ll, false, false);
+  rmsnorm_batched(rs_now->x, weights_now->rms_out_w, rs_now->x, 0ll, false, false);
 
   // classifier into logits
-  classifier_gemm_batched(weights->out, rs->x, rs->logits, false, true);
+  classifier_gemm_batched(weights_now->out, rs_now->x, rs_now->logits, false, true);
 
-  return rs->logits->buf;
+  return rs_now->logits->buf;
 }
 
 float *forward_gpu_20b(

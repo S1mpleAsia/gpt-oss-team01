@@ -7,13 +7,11 @@
 #include <hip/hip_runtime.h>
 
 float *forward_gpu_120b_batched(
-    Config *p, OurTransformerWeights *weights, OurRunState *rs,
     int *tokens, int pos, int batch_size, int flow_id,
-    int tp_rank, int pp_rank
+    int tp_rank, int pp_rank, pthread_barrier_t *tp_barrier
 );
 
 float *forward_gpu_20b_batched(
-    Config *p, OurTransformerWeights *weights, OurRunState *rs,
     int *tokens, int pos, int batch_size, int flow_id
 );
 

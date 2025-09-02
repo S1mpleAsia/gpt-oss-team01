@@ -18,7 +18,7 @@ void rmsnorm_batched(
   Tensor *w,    // Shape: [hidden_dim]
   Tensor *out,  // Shape: [batch_size, hidden_dim]
   long long layer_offset, bool x_to_device, bool out_from_device,
-  float eps = 1e-5f, hipStream_t stream = 0
+  hipStream_t stream = 0, float eps = 1e-5f
 );
 
 // ---------- QKV GEMM ----------

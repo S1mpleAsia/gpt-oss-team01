@@ -3,19 +3,22 @@
 #include <cstring>
 
 void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *weights, int device_id) {
+  size_t layers_each = p->n_layers / PP;
+  size_t experts_each = p->n_experts / TP;
+
+  int tp_rank = device_id % TP;
+  int pp_rank = (device_id % TOTAL_PIPELINES) / TP;
+
+  long long pp_offset = 1ll * pp_rank * layers_each;
+  long long tp_offset = 1ll * tp_rank * experts_each;
+
   // Create Tensor wrappers for weight matrices
-  if (device_id % TOTAL_PIPELINES == 0) {
+  if (pp_rank == 0) {
     weights->token_embedding_table =
       new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->token_embedding_table, device_id);
   } else {
     weights->token_embedding_table = nullptr;
   }
-
-  size_t layers_each = p->n_layers / PP;
-  size_t experts_each = p->n_experts / TP;
-  long long pp_offset = 1ll * ((device_id % TOTAL_PIPELINES) / TP) * layers_each;
-  int tp_rank = device_id % TP;
-  long long tp_offset = 1ll * (device_id % TP) * experts_each;
 
   weights->rms_attn_w = new Tensor({layers_each * p->hidden_dim}, w->rms_attn_w + 1ll * pp_offset * p->hidden_dim, device_id);
   weights->rms_ffn_w = new Tensor({layers_each * p->hidden_dim}, w->rms_ffn_w + 1ll * pp_offset * p->hidden_dim, device_id);
@@ -156,7 +159,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     b_mlp2_d_buf += 1ll * N_;
   }
 
-  if ((device_id + 1) % TOTAL_PIPELINES == 0) {
+  if (pp_rank + 1 == PP) {
     weights->rms_out_w = new Tensor({(size_t)p->hidden_dim}, w->rms_out_w, device_id);
     weights->out = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->out, device_id);
   } else {
@@ -189,6 +192,11 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id) 
   rs->gate_up = new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, device_id);
 
   rs->e_agg = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, device_id);
+  if (device_id % TP == 0) {
+    rs->e_agg_buf = new Tensor({TP, BATCH_SIZE, (size_t)p->hidden_dim}, device_id);
+  } else {
+    rs->e_agg_buf = nullptr;
+  }
   rs->qkv = new Tensor(
     {BATCH_SIZE, ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim}, device_id);
   rs->q = new Tensor({BATCH_SIZE, (size_t)p->n_attn_heads * p->head_dim}, device_id);
@@ -210,12 +218,17 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id) 
   RopePrecomputeCS(p, rs->cos_tensor, rs->sin_tensor);
 }
 
-void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunState *rs) {
+void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunState *rs, hipStream_t *total_streams, hipEvent_t *total_events) {
   Config *p = &transformer->config;
   TransformerWeights *w = &transformer->weights;
   RunState *s = &transformer->state;
 
   for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
+    CHECK_HIP(hipSetDevice(i));
+    
+    CHECK_HIP(hipStreamCreate(&total_streams[i]));
+    CHECK_HIP(hipEventCreate(&total_events[i]));
+
     our_init_weights(w, p, &weights[i], i);
     our_init_run_state(s, p, &rs[i], i);
   }
@@ -253,6 +266,7 @@ void our_free_each(OurTransformerWeights *weights, OurRunState *rs) {
   if (rs->up) delete rs->up;
   if (rs->gate_up) delete rs->gate_up;
   if (rs->e_agg) delete rs->e_agg;
+  if (rs->e_agg_buf) delete rs->e_agg_buf;
   if (rs->qkv) delete rs->qkv;
   if (rs->q) delete rs->q;
   if (rs->k) delete rs->k;
@@ -268,11 +282,16 @@ void our_free_each(OurTransformerWeights *weights, OurRunState *rs) {
   if (rs->sin_tensor) delete rs->sin_tensor;
 }
 
-void our_free(OurTransformerWeights *weights, OurRunState *rs) {
+void our_free(OurTransformerWeights *weights, OurRunState *rs, hipStream_t *total_streams, hipEvent_t *total_events) {
   for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
     fprintf(stderr, "Freeing weights and run state of id %d\n", i);
+
     CHECK_HIP(hipSetDevice(i));
+    CHECK_HIP(hipStreamDestroy(total_streams[i]));
+    CHECK_HIP(hipEventDestroy(total_events[i]));
+
     our_free_each(&weights[i], &rs[i]);
+
     fprintf(stderr, "Finish freeing weights and run state of id %d, moving on to actual pointer\n", i);
     fprintf(stderr, "Finish everything id %d\n", i);
   }
