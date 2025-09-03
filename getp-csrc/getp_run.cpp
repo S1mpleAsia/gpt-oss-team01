@@ -64,7 +64,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     // our_init(transformer, weights, rs);
   } else {
     printf("Multi GPU here...\n");
-    std::vector<int> gpu_0 = {0, 1, 2, 3};
+    std::vector<int> gpu_0 = {0, 1};
     // std::vector<int> gpu_1 = {2, 3};
 
     context[0].init(transformer, gpu_0);

@@ -10,7 +10,7 @@
 #define RUN_BATCH
 #define BATCH_SIZE 16
 
-#define PP 2
+#define PP 1
 #define TP 2
 #define REPLICA_SIZE ((PP * TP))
 // #define PRINT_LOGITS

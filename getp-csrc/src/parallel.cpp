@@ -83,7 +83,7 @@ void Context::init(Transformer *transformer, const std::vector<int> &assigned_gp
   for (int i = 0; i < REPLICA_SIZE; i++) {
     int gpu_id = this->gpu_ids[i];
     CHECK_HIP(hipSetDevice(gpu_id));
-    CHECK_HIP(hipStreamCreate(&this->streams[i]));
+    CHECK_HIP(hipStreamCreateWithFlags(&this->streams[i], hipStreamNonBlocking));
     CHECK_HIP(hipEventCreate(&this->events[i]));
     CHECK_HIP(hipEventCreate(&this->tp_ready_event[i]));
     CHECK_HIP(hipEventCreate(&this->tp_reduce_done_event[i]));
@@ -785,7 +785,6 @@ float *forward_gpu_120b(Context *ctx, int *tokens, int pos) {
   // classifier_gemm(w_final->out, s_final->x, s_final->logits, false, true,
   //                 ctx->streams[last_local_idx]);
 
-  CHECK_HIP(hipStreamSynchronize(ctx->streams[last_local_idx]));
   s_final->logits->from_device(ctx->streams[last_local_idx]);
 
   return s_final->logits->buf;
