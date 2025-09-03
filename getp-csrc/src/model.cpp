@@ -2,6 +2,139 @@
 #include <cmath>
 #include <cstring>
 
+#ifdef RUN_20B
+
+float *forward_gpu_20b_batched(
+  int *tokens, int pos, int cur_batch_size, int flow_id
+) {
+  Config *p = public_config;
+  
+  OurTransformerWeights *weights_now = &weights[flow_id];
+  OurRunState *rs_now = &rs[flow_id];
+
+  // copy the token embedding into x
+  embedding_lookup_batched(weights_now->token_embedding_table, tokens, rs_now->x, false);
+
+  long long kv_dim = 1ll * p->n_kv_heads * p->head_dim;
+  long long loff_one = 1ll * p->seq_len * kv_dim;
+  long long loff_one_batch = 1ll * p->n_layers * loff_one;
+
+  // forward all the layers
+  for (int l = 0; l < p->n_layers; l++) {
+    // attention rmsnorm
+    rmsnorm_batched(rs_now->x, weights_now->rms_attn_w, rs_now->t, 1ll * l, false, false);
+
+    // key and value point to the kv cache
+    long long loff = 1ll * l * loff_one;  // kv cache layer offset
+
+    // QKV projection
+    qkv_gemm_batched_v2(rs_now->t, weights_now->w_qkv, weights_now->b_qkv, rs_now->qkv, 1ll * l, false,
+                        false);  // This kernel diverges the most
+
+    // // Separate q, k, v + RoPE
+    // qkv_split_rope_batched(rs_now->qkv, rs_now->q, rs_now->k, rs_now->v, rs_now->cos_tensor, rs_now->sin_tensor,
+    //                        p->head_dim, p->n_attn_heads, p->n_kv_heads, pos, false, false, false,
+    //                        false);
+
+    // // Store k, v in cache
+    // for (int b = 0; b < cur_batch_size; b++) {
+    //   memcpy_tensor(rs_now->key_cache, rs_now->k, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim,
+    //                 1ll * b * kv_dim, kv_dim, false, true);
+    //   memcpy_tensor(rs_now->value_cache, rs_now->v, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim,
+    //                 1ll * b * kv_dim, kv_dim, false, true);
+    // }
+
+    qkv_split_rope_fused(rs_now->qkv, rs_now->q, rs_now->key_cache, rs_now->value_cache, rs_now->cos_tensor,
+                         rs_now->sin_tensor, p->head_dim, p->n_attn_heads, p->n_kv_heads, pos, l);
+
+    // multihead attention
+    int kv_mul = p->n_attn_heads / p->n_kv_heads;  // integer multiplier for GQA
+
+    // FIX single_query_attn_batched later
+    single_query_attn_batched(rs_now->q, rs_now->key_cache, rs_now->value_cache, rs_now->mask, weights_now->attn_sinks,
+                              rs_now->tb, p->head_dim, p->n_attn_heads, kv_mul, kv_dim, p->seq_len,
+                              p->sliding_window, pos, 1ll * l, false, false, false, false, false);
+
+    // final matmul to get the output of the attention
+    attn_out_project_batched_v2(rs_now->tb, weights_now->w_o, weights_now->b_o, rs_now->tb2, 1ll * l, false, false);
+
+    // residual connection back into x
+    // add_vector_batched(rs_now->x, rs_now->tb2, false, false, false);  // equals residual add
+
+    // ffn rmsnorm
+    // rmsnorm_batched(rs_now->x, weights_now->rms_ffn_w, rs_now->t, 1ll * l, false, false);
+
+    residual_rmsnorm_batched(rs_now->tb2, rs_now->x, weights_now->rms_ffn_w, rs_now->t, 1ll * l, 1e-5f);
+
+    // MoE routing
+    router_gemm_batched(weights_now->w_router, rs_now->t, weights_now->b_router, rs_now->router_score, 1ll * l,
+                        false, false);
+
+    // Select top-k experts
+    topk_softmax_batched(rs_now->router_score, rs_now->topk_v, rs_now->topk_i, false, false, false);
+
+    // Route the tokens to their corresponding top-k experts
+    // moe_apply_topk_batched(rs_now->t, weights_now->w_mlp1, weights_now->b_mlp1, weights_now->w_mlp2,
+    //                        weights_now->b_mlp2, rs_now->topk_i, rs_now->topk_v, rs_now->mlp1_out, rs_now->gate_up,
+    //                        rs_now->tb3, rs_now->e_agg, p->swiglu_limit, 1ll * l, false, false, false,
+    //                        false);
+
+    // moe_mlp1_batched(rs_now->t, weights_now->w_mlp1, weights_now->b_mlp1, rs_now->topk_i, rs_now->mlp1_out, false,
+    //                  false, 1ll * l);
+
+    // moe_swiglu_batched(rs_now->mlp1_out, rs_now->gate_up, p->experts_per_token, p->swiglu_limit);
+
+    // moe_mlp2_batched(rs_now->gate_up, weights_now->w_mlp2, weights_now->b_mlp2, rs_now->tb3, rs_now->topk_i,
+    //                  p->experts_per_token, true, 1ll * l);
+
+    // moe_agg_batched(rs_now->tb3, rs_now->topk_v, rs_now->e_agg, p->experts_per_token, false);
+
+    int total_pairs = BATCH_SIZE * p->experts_per_token;
+    moe_init_buffers_hip(rs_now->e_agg, rs_now->mlp1_out, rs_now->gate_up, rs_now->tb3, rs_now->sorted_pair_ids,
+                         rs_now->expert_offsets, rs_now->x_packed, BATCH_SIZE, p->hidden_dim, 0);
+
+    moe_build_offsets_hip(rs_now->topk_i, rs_now->sorted_pair_ids, rs_now->expert_offsets, BATCH_SIZE,
+                          p->experts_per_token, p->n_experts, 0);
+
+    moe_pack_inputs_hip(rs_now->t, rs_now->sorted_pair_ids, rs_now->x_packed, BATCH_SIZE, p->hidden_dim,
+                        p->experts_per_token, 0);
+
+    int max_rows = moe_get_max_rows_per_expert_hip(rs_now->expert_offsets, p->n_experts, 0);
+    moe_mlp1_forward_hip(rs_now->x_packed, weights_now->w_mlp1, weights_now->b_mlp1, rs_now->expert_offsets,
+                         rs_now->mlp1_out, 1ll * l, p->n_experts, p->hidden_dim, p->intermediate_dim,
+                         max_rows, total_pairs, 0);
+
+    moe_swiglu_hip(rs_now->mlp1_out, rs_now->gate_up, BATCH_SIZE, p->experts_per_token, p->intermediate_dim,
+                   p->swiglu_limit, 0);
+
+    moe_mlp2_forward_hip(rs_now->gate_up, weights_now->w_mlp2, weights_now->b_mlp2, rs_now->expert_offsets, rs_now->tb3,
+                         true, 1ll * l, p->n_experts, p->intermediate_dim, p->hidden_dim, max_rows,
+                         total_pairs, 0);
+
+    moe_scatter_aggregate_hip(rs_now->tb3, rs_now->sorted_pair_ids, rs_now->topk_v, rs_now->e_agg,
+                              rs_now->expert_offsets, p->hidden_dim, p->experts_per_token, p->n_experts,
+                              max_rows, 0);
+
+    // moe_block_matmul_style_hip(rs_now->t, rs_now->topk_i, rs_now->topk_v, weights_now->w_mlp1, weights_now->b_mlp1,
+    //                            weights_now->w_mlp2, weights_now->b_mlp2, rs_now->e_agg, rs_now->mlp1_out,
+    //                            rs_now->gate_up, rs_now->tb3, rs_now->sorted_pair_ids, rs_now->expert_offsets,
+    //                            rs_now->x_packed, p->swiglu_limit, 1ll * l);
+
+    // residual connection
+    add_vector_batched(rs_now->x, rs_now->e_agg, false, false, false);  // equals residual add
+  }
+
+  // final rmsnorm
+  rmsnorm_batched(rs_now->x, weights_now->rms_out_w, rs_now->x, 0ll, false, false);
+
+  // classifier into logits
+  classifier_gemm_batched_v2(weights_now->out, rs_now->x, rs_now->logits, false, true);
+
+  return rs_now->logits->buf;
+}
+
+#else
+
 float *forward_gpu_120b_batched(
   int *tokens, int pos, int cur_batch_size, int flow_id,
   int tp_rank, int pp_rank, pthread_barrier_t *tp_barrier
@@ -219,86 +352,8 @@ float *forward_gpu_120b_batched(
   return rs_now->logits->buf;
 }
 
-float *forward_gpu_20b_batched(
-  int *tokens, int pos, int cur_batch_size, int flow_id
-) {
-  Config *p = public_config;
-  OurTransformerWeights *weights_now = &weights[flow_id];
-  OurRunState *rs_now = &rs[flow_id];
-  
-  // copy the token embedding into x
-  embedding_lookup_batched(weights_now->token_embedding_table, tokens, rs_now->x, false);
+#endif
 
-  long long kv_dim = 1ll * p->n_kv_heads * p->head_dim;
-  long long loff_one = 1ll * p->seq_len * kv_dim;
-  long long loff_one_batch = 1ll * p->n_layers * loff_one;
-
-  // forward all the layers
-  for (int l = 0; l < p->n_layers; l++) {
-    // attention rmsnorm
-    rmsnorm_batched(rs_now->x, weights_now->rms_attn_w, rs_now->t, 1ll * l,
-                    false, false);
-
-    // key and value point to the kv cache
-    long long loff = 1ll * l * loff_one;  // kv cache layer offset
-
-    // QKV projection
-    qkv_gemm_batched(rs_now->t, weights_now->w_qkv, weights_now->b_qkv, rs_now->qkv, 1ll * l, false, false);  // This kernel diverges the most
-
-    // Separate q, k, v + RoPE
-    qkv_split_rope_batched(rs_now->qkv, rs_now->q, rs_now->k, rs_now->v, rs_now->cos_tensor,
-                          rs_now->sin_tensor, p->head_dim, p->n_attn_heads,
-                          p->n_kv_heads, pos, false, false, false, false);
-
-    // Store k, v in cache
-    for (int b = 0; b < cur_batch_size; b++) {
-      memcpy_tensor(rs_now->key_cache, rs_now->k, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim, 1ll * b * kv_dim, kv_dim, false, true);
-      memcpy_tensor(rs_now->value_cache, rs_now->v, 1ll * b * loff_one_batch + loff + 1ll * pos * kv_dim, 1ll * b * kv_dim, kv_dim, false, true);
-    }
-
-    // multihead attention
-    int kv_mul = p->n_attn_heads / p->n_kv_heads;  // integer multiplier for GQA
-
-    // FIX single_query_attn_batched later
-    single_query_attn_batched(rs_now->q, rs_now->key_cache, rs_now->value_cache, rs_now->mask, 
-                              weights_now->attn_sinks, rs_now->tb, p->head_dim,
-                              p->n_attn_heads, kv_mul, kv_dim, p->seq_len,
-                              p->sliding_window, pos, 1ll * l, false, false,
-                              false, false, false);
-
-    // final matmul to get the output of the attention
-    attn_out_project_batched(rs_now->tb, weights_now->w_o, weights_now->b_o, rs_now->tb2, 1ll * l, false, false);
-
-    // residual connection back into x
-    add_vector_batched(rs_now->x, rs_now->tb2, false, false, false);  // equals residual add
-
-    // ffn rmsnorm
-    rmsnorm_batched(rs_now->x, weights_now->rms_ffn_w, rs_now->t, 1ll * l, false, false);
-
-    // MoE routing
-    router_gemm_batched(weights_now->w_router, rs_now->t, weights_now->b_router,
-                rs_now->router_score, 1ll * l, false, false);
-
-    // Select top-k experts
-    topk_softmax_batched(rs_now->router_score, rs_now->topk_v, rs_now->topk_i, false, false, false);
-
-    // Route the tokens to their corresponding top-k experts
-    moe_apply_topk_batched(rs_now->t, weights_now->w_mlp1, weights_now->b_mlp1, weights_now->w_mlp2, weights_now->b_mlp2,
-                   rs_now->topk_i, rs_now->topk_v, rs_now->mlp1_out, rs_now->gate_up, rs_now->tb3, rs_now->e_agg,
-                   p->swiglu_limit, 1ll * l, false, false, false, false, 0);
-
-    // residual connection
-    add_vector_batched(rs_now->x, rs_now->e_agg, false, false, false);  // equals residual add
-  }
-
-  // final rmsnorm
-  rmsnorm_batched(rs_now->x, weights_now->rms_out_w, rs_now->x, 0ll, false, false);
-
-  // classifier into logits
-  classifier_gemm_batched(weights_now->out, rs_now->x, rs_now->logits, false, true);
-
-  return rs_now->logits->buf;
-}
 
 float *forward_gpu_20b(
   Config *p, OurTransformerWeights *weights, OurRunState *rs,

@@ -8,6 +8,7 @@
 #include "src/model.cpp"
 #include "src/alloc.cpp"
 #include "src/utils.cpp"
+#include "src/kernel.cpp"
 
 #ifndef GETP_RUN
 #define GETP_RUN
@@ -65,18 +66,20 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
   delete total_events;
 }
 
-void *inside_thread_handler(void *arg) {
-  OnePathInsideArgs *args = (OnePathInsideArgs *)arg;
+#ifndef RUN_20B
+  void *inside_thread_handler(void *arg) {
+    OnePathInsideArgs *args = (OnePathInsideArgs *)arg;
 
-  int cur_device = args->id * TOTAL_PIPELINES + args->pp_rank * TP + args->tp_rank; 
-  
-  // Set the device context for this thread
-  CHECK_HIP(hipSetDevice(cur_device));
+    int cur_device = args->id * TOTAL_PIPELINES + args->pp_rank * TP + args->tp_rank; 
+    
+    // Set the device context for this thread
+    CHECK_HIP(hipSetDevice(cur_device));
 
-  args->logits = forward_gpu_120b_batched(args->current_tokens->data(), args->pos, args->current_size, args->id, args->tp_rank, args->pp_rank, args->tp_barrier);
+    args->logits = forward_gpu_120b_batched(args->current_tokens->data(), args->pos, args->current_size, args->id, args->tp_rank, args->pp_rank, args->tp_barrier);
 
-  return nullptr;
-}
+    return nullptr;
+  }
+#endif
 
 void *thread_handler(void *arg) {
   OnePathArgs *args = (OnePathArgs *)arg;
