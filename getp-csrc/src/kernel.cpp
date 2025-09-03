@@ -643,10 +643,163 @@ __global__ void scale_scatter_add_kernel_sorted_all(
   atomicAdd(&e_agg[(size_t)b * hidden_dim + h], val);
 }
 
+static inline void moe_init_buffers(Tensor *e_agg, Tensor *mlp1_out, Tensor *gate_up, Tensor *tb3,
+                                    TensorI32 *sorted_pair_ids, TensorI32 *expert_offsets,
+                                    Tensor *x_packed, int batch_size, int hidden_dim,
+                                    hipStream_t stream) {
+  float *e_agg_ptr = (float *)e_agg->d_buf;
+  CHECK_HIP(hipMemsetAsync(e_agg_ptr, 0, (size_t)batch_size * hidden_dim * sizeof(float), stream));
+  CHECK_HIP(
+    hipMemsetAsync(mlp1_out->d_buf, 0, mlp1_out->num_elem() * mlp1_out->get_dtype_size(), stream));
+  CHECK_HIP(
+    hipMemsetAsync(gate_up->d_buf, 0, gate_up->num_elem() * gate_up->get_dtype_size(), stream));
+  CHECK_HIP(hipMemsetAsync(tb3->d_buf, 0, tb3->num_elem() * tb3->get_dtype_size(), stream));
+  CHECK_HIP(
+    hipMemsetAsync(sorted_pair_ids->d_buf, 0, sorted_pair_ids->num_elem() * sizeof(int), stream));
+  CHECK_HIP(
+    hipMemsetAsync(expert_offsets->d_buf, 0, expert_offsets->num_elem() * sizeof(int), stream));
+  CHECK_HIP(
+    hipMemsetAsync(x_packed->d_buf, 0, x_packed->num_elem() * x_packed->get_dtype_size(), stream));
+}
+
+// 1) sort & build offsets
+static inline void moe_build_offsets(
+  TensorI32 *topk_idx,         // [batch_size, experts_per_token]
+  TensorI32 *sorted_pair_ids,  // [batch_size * experts_per_token]
+  TensorI32 *expert_offsets,   // [n_experts + 1]
+  int batch_size, int experts_per_token, int n_experts, hipStream_t stream) {
+  const int *topk_idx_ptr = (const int *)topk_idx->d_buf;
+
+  const size_t shmem_bytes = (size_t)n_experts * sizeof(int);
+  dim3 block_size(256);
+  dim3 grid_size(1);
+
+  build_expert_offsets_kernel<<<grid_size, block_size, shmem_bytes, stream>>>(
+    topk_idx_ptr, sorted_pair_ids->d_buf, expert_offsets->d_buf, batch_size, experts_per_token,
+    n_experts);
+}
+
+// 2) pack X theo sorted ids
+static inline void moe_pack_inputs(
+  Tensor *x_in,                // [batch_size, hidden_dim]
+  TensorI32 *sorted_pair_ids,  // [batch_size * experts_per_token]
+  Tensor *x_packed,            // [batch_size * experts_per_token, hidden_dim]
+  int batch_size, int hidden_dim, int experts_per_token, hipStream_t stream) {
+  const float *x_ptr = (const float *)x_in->d_buf;
+
+  const int total_pairs = batch_size * experts_per_token;
+  dim3 block_size(256, 1);
+  dim3 grid_size((hidden_dim + block_size.x - 1) / block_size.x, total_pairs);
+
+  gather_inputs_by_sorted_kernel<<<grid_size, block_size, 0, stream>>>(
+    x_ptr, sorted_pair_ids->d_buf, (float *)x_packed->d_buf, batch_size, hidden_dim,
+    experts_per_token);
+}
+
+// 3) lấy max số hàng trên mỗi expert từ offsets
+static inline int moe_get_max_rows_per_expert(TensorI32 *expert_offsets, int n_experts,
+                                              hipStream_t stream) {
+  int max_rows_per_expert = 0;
+  int *d_max_rows = nullptr;
+  CHECK_HIP(hipMalloc(&d_max_rows, sizeof(int)));
+  CHECK_HIP(hipMemsetAsync(d_max_rows, 0, sizeof(int), stream));
+  compute_max_rows_from_offsets_kernel<<<(n_experts + 255) / 256, 256, 0, stream>>>(
+    expert_offsets->d_buf, n_experts, d_max_rows);
+  CHECK_HIP(
+    hipMemcpyAsync(&max_rows_per_expert, d_max_rows, sizeof(int), hipMemcpyDeviceToHost, stream));
+  CHECK_HIP(hipStreamSynchronize(stream));
+  CHECK_HIP(hipFree(d_max_rows));
+  return max_rows_per_expert;
+}
+
+// 4) MLP1: (x_packed @ W1 + b1) -> mlp1_out  (2*inter_dim)
+// w_mlp1: [n_layers, n_experts, hidden_dim, 2*inter_dim]
+// b_mlp1: [n_layers, n_experts, 2*inter_dim]
+static inline void moe_mlp1_forward(Tensor *x_packed,  // [total_pairs, hidden_dim]
+                                    Tensor *w_mlp1, Tensor *b_mlp1,
+                                    TensorI32 *expert_offsets,  // [n_experts+1]
+                                    Tensor *mlp1_out,           // [total_pairs, 2*inter_dim]
+                                    long long layer_offset, int n_experts, int hidden_dim,
+                                    int inter_dim, int max_rows_per_expert, int total_pairs,
+                                    hipStream_t stream) {
+  const bf16 *w1_ptr =
+    (const bf16 *)w_mlp1->d_buf + (size_t)layer_offset * n_experts * hidden_dim * 2 * inter_dim;
+  const bf16 *b1_ptr =
+    (const bf16 *)b_mlp1->d_buf + (size_t)layer_offset * n_experts * 2 * inter_dim;
+
+  constexpr int BM = 16, BN = 128, BK = 16, TM = 2, TN = 8;
+  dim3 block_size(BN / TN, BM / TM);
+  dim3 grid_size((2 * inter_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
+
+  matmul_kernel_bf16_moe<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
+    (const float *)x_packed->d_buf, w1_ptr, (float *)mlp1_out->d_buf, b1_ptr, expert_offsets->d_buf,
+    total_pairs, 2 * inter_dim, hidden_dim);
+}
+
+// 5) SwiGLU (interleaved) & clamp
+static inline void moe_swiglu(Tensor *mlp1_out,  // [total_pairs, 2*inter_dim]
+                              Tensor *gate_up,   // [total_pairs, inter_dim]
+                              int batch_size, int experts_per_token, int inter_dim,
+                              float clamp_limit, hipStream_t stream) {
+  size_t total = (size_t)batch_size * experts_per_token * inter_dim;
+  dim3 block_size(256);
+  dim3 grid_size((total + 255) / 256);
+
+  swiglu_interleaved_batched_fast_v2<<<grid_size, block_size, 0, stream>>>(
+    (const float *)mlp1_out->d_buf, (float *)gate_up->d_buf, inter_dim,
+    batch_size * experts_per_token, clamp_limit);
+}
+
+// 6) MLP2: (gate_up @ W2 + b2) -> tb3  (hidden_dim)
+// w_mlp2: [n_layers, n_experts, inter_dim, hidden_dim]
+// b_mlp2: [n_layers, n_experts, hidden_dim]
+static inline void moe_mlp2_forward(Tensor *gate_up,  // [total_pairs, inter_dim]
+                                    Tensor *w_mlp2, Tensor *b_mlp2,
+                                    TensorI32 *expert_offsets,  // [n_experts+1]
+                                    Tensor *tb3,                // [total_pairs, hidden_dim]
+                                    bool has_bias, long long layer_offset, int n_experts,
+                                    int inter_dim, int hidden_dim, int max_rows_per_expert,
+                                    int total_pairs, hipStream_t stream) {
+  const bf16 *w2_ptr =
+    (const bf16 *)w_mlp2->d_buf + (size_t)layer_offset * n_experts * inter_dim * hidden_dim;
+  const bf16 *b2_ptr =
+    has_bias ? (const bf16 *)b_mlp2->d_buf + (size_t)layer_offset * n_experts * hidden_dim
+             : nullptr;
+
+  constexpr int BM = 16, BN = 128, BK = 16, TM = 2, TN = 8;
+  dim3 block_size(BN / TN, BM / TM);
+  dim3 grid_size((hidden_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
+
+  matmul_kernel_bf16_moe<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
+    (const float *)gate_up->d_buf, w2_ptr, (float *)tb3->d_buf, b2_ptr, expert_offsets->d_buf,
+    total_pairs, hidden_dim, inter_dim);
+}
+
+// 7) scatter-add có scale theo topk_v -> e_agg
+static inline void moe_scatter_aggregate(
+  Tensor *tb3,                 // [total_pairs, hidden_dim]
+  TensorI32 *sorted_pair_ids,  // [batch_size * experts_per_token]
+  Tensor *topk_v,              // [batch_size, experts_per_token]
+  Tensor *e_agg,               // [batch_size, hidden_dim]
+  TensorI32 *expert_offsets,   // [n_experts+1]
+  int hidden_dim, int experts_per_token, int n_experts, int max_rows_per_expert,
+  hipStream_t stream) {
+  const float *topk_v_ptr = (const float *)topk_v->d_buf;
+  float *e_agg_ptr = (float *)e_agg->d_buf;
+
+  dim3 block_size(32, 8, 1);
+  dim3 grid_size((hidden_dim + block_size.x - 1) / block_size.x,
+                 (max_rows_per_expert + block_size.y - 1) / block_size.y, n_experts);
+
+  scale_scatter_add_kernel_sorted_all<<<grid_size, block_size, 0, stream>>>(
+    (const float *)tb3->d_buf, (const int *)sorted_pair_ids->d_buf, topk_v_ptr, e_agg_ptr,
+    expert_offsets->d_buf, hidden_dim, experts_per_token);
+}
+
 void moe_block_matmul_style(
-  Tensor *x_in,                // [batch_size, hidden_dim] (float32)
-  TensorI32 *topk_idx,         // [batch_size, experts_per_token] (int32)
-  Tensor *topk_v,              // [batch_size, experts_per_token] (float)
+  Tensor *x_in,                // [batch_size, hidden_dim]
+  TensorI32 *topk_idx,         // [batch_size, experts_per_token]
+  Tensor *topk_v,              // [batch_size, experts_per_token]
   Tensor *w_mlp1,              // [n_layers, n_experts, hidden_dim, 2*intermediate_dim]
   Tensor *b_mlp1,              // [n_layers, n_experts, 2*intermediate_dim]
   Tensor *w_mlp2,              // [n_layers, n_experts, intermediate_dim, hidden_dim]

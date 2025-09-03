@@ -1352,6 +1352,87 @@ void moe_block_matmul_style_hip(
                          layer_offset, stream);
 }
 
+static inline void moe_init_buffers_hip(Tensor *e_agg, Tensor *mlp1_out, Tensor *gate_up,
+                                        Tensor *tb3, TensorI32 *sorted_pair_ids,
+                                        TensorI32 *expert_offsets, Tensor *x_packed, int batch_size,
+                                        int hidden_dim, hipStream_t stream) {
+  GpuTimer timer("moe_init_buffers");
+  moe_init_buffers(e_agg, mlp1_out, gate_up, tb3, sorted_pair_ids, expert_offsets, x_packed,
+                   batch_size, hidden_dim, stream);
+}
+
+static inline void moe_build_offsets_hip(
+  TensorI32 *topk_idx,         // [batch_size, experts_per_token]
+  TensorI32 *sorted_pair_ids,  // [batch_size * experts_per_token]
+  TensorI32 *expert_offsets,   // [n_experts + 1]
+  int batch_size, int experts_per_token, int n_experts, hipStream_t stream) {
+  GpuTimer timer("moe_offsets");
+
+  moe_build_offsets(topk_idx, sorted_pair_ids, expert_offsets, batch_size, experts_per_token,
+                    n_experts, stream);
+}
+
+static inline void moe_pack_inputs_hip(
+  Tensor *x_in,                // [batch_size, hidden_dim]
+  TensorI32 *sorted_pair_ids,  // [batch_size * experts_per_token]
+  Tensor *x_packed,            // [batch_size * experts_per_token, hidden_dim]
+  int batch_size, int hidden_dim, int experts_per_token, hipStream_t stream) {
+  GpuTimer timer("moe_x_packed");
+  moe_pack_inputs(x_in, sorted_pair_ids, x_packed, batch_size, hidden_dim, experts_per_token,
+                  stream);
+}
+
+static inline int moe_get_max_rows_per_expert_hip(TensorI32 *expert_offsets, int n_experts,
+                                                  hipStream_t stream) {
+  GpuTimer timer("moe_max_row");
+  return moe_get_max_rows_per_expert(expert_offsets, n_experts, stream);
+}
+
+static inline void moe_mlp1_forward_hip(Tensor *x_packed,  // [total_pairs, hidden_dim]
+                                        Tensor *w_mlp1, Tensor *b_mlp1,
+                                        TensorI32 *expert_offsets,  // [n_experts+1]
+                                        Tensor *mlp1_out,           // [total_pairs, 2*inter_dim]
+                                        long long layer_offset, int n_experts, int hidden_dim,
+                                        int inter_dim, int max_rows_per_expert, int total_pairs,
+                                        hipStream_t stream) {
+  GpuTimer timer("moe_mlp1");
+  moe_mlp1_forward(x_packed, w_mlp1, b_mlp1, expert_offsets, mlp1_out, layer_offset, n_experts,
+                   hidden_dim, inter_dim, max_rows_per_expert, total_pairs, stream);
+}
+
+static inline void moe_swiglu_hip(Tensor *mlp1_out,  // [total_pairs, 2*inter_dim]
+                                  Tensor *gate_up,   // [total_pairs, inter_dim]
+                                  int batch_size, int experts_per_token, int inter_dim,
+                                  float clamp_limit, hipStream_t stream) {
+  GpuTimer timer("moe_swiglu");
+  moe_swiglu(mlp1_out, gate_up, batch_size, experts_per_token, inter_dim, clamp_limit, stream);
+}
+
+static inline void moe_mlp2_forward_hip(Tensor *gate_up,  // [total_pairs, inter_dim]
+                                        Tensor *w_mlp2, Tensor *b_mlp2,
+                                        TensorI32 *expert_offsets,  // [n_experts+1]
+                                        Tensor *tb3,                // [total_pairs, hidden_dim]
+                                        bool has_bias, long long layer_offset, int n_experts,
+                                        int inter_dim, int hidden_dim, int max_rows_per_expert,
+                                        int total_pairs, hipStream_t stream) {
+  GpuTimer timer("moe_mlp2");
+  moe_mlp2_forward(gate_up, w_mlp2, b_mlp2, expert_offsets, tb3, has_bias, layer_offset, n_experts,
+                   inter_dim, hidden_dim, max_rows_per_expert, total_pairs, stream);
+}
+
+static inline void moe_scatter_aggregate_hip(
+  Tensor *tb3,                 // [total_pairs, hidden_dim]
+  TensorI32 *sorted_pair_ids,  // [batch_size * experts_per_token]
+  Tensor *topk_v,              // [batch_size, experts_per_token]
+  Tensor *e_agg,               // [batch_size, hidden_dim]
+  TensorI32 *expert_offsets,   // [n_experts+1]
+  int hidden_dim, int experts_per_token, int n_experts, int max_rows_per_expert,
+  hipStream_t stream) {
+  GpuTimer timer("moe_agg");
+  moe_scatter_aggregate(tb3, sorted_pair_ids, topk_v, e_agg, expert_offsets, hidden_dim,
+                        experts_per_token, n_experts, max_rows_per_expert, stream);
+}
+
 static inline void moe_mlp1_batched(Tensor *t, Tensor *w_mlp1, Tensor *b_mlp1, TensorI32 *topk_idx,
                                     Tensor *mlp1_out, bool t_to_device, bool topk_idx_to_device,
                                     long long layer_offset, hipStream_t stream) {
