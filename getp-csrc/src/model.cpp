@@ -45,12 +45,7 @@ float *forward_gpu_120b_batched(
 
     for (int l = 0; l < p->n_layers / PP; l++) {
       #ifdef DEBUG
-        #pragma omp critical
-        {
-          if (flow_id == 0) {
-            printf("tp_rank %d, layer %d\n", tp_rank, l);
-          }
-        }
+        if (flow_id == 0) printf("tp_rank %d, layer %d\n", tp_rank, l);
       #endif
 
       // attention rmsnorm
@@ -58,19 +53,7 @@ float *forward_gpu_120b_batched(
                       false, false);
       
       #ifdef DEBUG
-        #pragma omp critical
-        {
-          if (flow_id == 0) {
-            rs_now->t->from_device(0);
-            CHECK_HIP(hipDeviceSynchronize());
-            printf("tp_rank %d, rs_now->t: ", tp_rank);
-            for (int id_test = 0; id_test < 5; id_test++) {
-              printf("%.6f ", rs_now->t->buf[id_test]);
-            }
-            printf("\n");
-            fflush(stdout);
-          }
-        }
+        if (flow_id == 0) rs_now->t->printDebug("rs_now->t", tp_rank);
       #endif
 
       // key and value point to the kv cache
@@ -80,30 +63,12 @@ float *forward_gpu_120b_batched(
       qkv_gemm_batched(rs_now->t, weights_now->w_qkv, weights_now->b_qkv, rs_now->qkv, 1ll * l, false, false);  // This kernel diverges the most
       
       #ifdef DEBUG
-        #pragma omp critical
-        {
-          if (flow_id == 0) {
-            rs_now->qkv->from_device(0);
-            CHECK_HIP(hipDeviceSynchronize());
-            printf("tp_rank %d, rs_now->qkv: ", tp_rank);
-            for (int id_test = 0; id_test < 5; id_test++) {
-              printf("%.6f ", rs_now->qkv->buf[id_test]);
-            }
-            printf("\n");
-            long long layer_offset_wqkv = 1ll * l * (weights_now->w_qkv->num_elem() / weights_now->w_qkv->shape[0]);
-            printf("tp_rank %d, weights_now->w_qkv: ", tp_rank);
-            for (int id_test = 0; id_test < 5; id_test++) {
-              printf("%.6f ", weights_now->w_qkv->buf[layer_offset_wqkv + 1ll * id_test]);
-            }
-            printf("\n");
-            long long layer_offset_bqkv = 1ll * l * (weights_now->b_qkv->num_elem() / weights_now->b_qkv->shape[0]);
-            printf("tp_rank %d, weights_now->b_qkv: ", tp_rank);
-            for (int id_test = 0; id_test < 5; id_test++) {
-              printf("%.6f ", weights_now->b_qkv->buf[layer_offset_bqkv + 1ll * id_test]);
-            }
-            printf("\n");
-            fflush(stdout);
-          }
+        if (flow_id == 0) {
+          rs_now->qkv->printDebug("rs_now->qkv", tp_rank);
+          long long layer_offset_wqkv = 1ll * l * (weights_now->w_qkv->num_elem() / weights_now->w_qkv->shape[0]);
+          weights_now->w_qkv->printDebug("weights_now->w_qkv", tp_rank, layer_offset_wqkv, false);
+          long long layer_offset_bqkv = 1ll * l * (weights_now->b_qkv->num_elem() / weights_now->b_qkv->shape[0]);
+          weights_now->b_qkv->printDebug("weights_now->b_qkv", tp_rank, layer_offset_bqkv, false);
         }
       #endif
 
@@ -112,19 +77,7 @@ float *forward_gpu_120b_batched(
                             rs_now->sin_tensor, p->head_dim, p->n_attn_heads,
                             p->n_kv_heads, pos, false, false, false, false);
       #ifdef DEBUG
-        #pragma omp critical
-        {
-          if (flow_id == 0) {
-            rs_now->q->from_device(0);
-            CHECK_HIP(hipDeviceSynchronize());
-            printf("tp_rank %d, rs_now->q: ", tp_rank);
-            for (int id_test = 0; id_test < 5; id_test++) {
-              printf("%.6f ", rs_now->q->buf[id_test]);
-            }
-            printf("\n");
-            fflush(stdout);
-          }
-        }
+        if (flow_id == 0) rs_now->q->printDebug("rs_now->q", tp_rank);
       #endif
 
       // Store k, v in cache
@@ -134,19 +87,7 @@ float *forward_gpu_120b_batched(
       }
       
       #ifdef DEBUG
-        #pragma omp critical
-        {
-          if (flow_id == 0) {
-            rs_now->key_cache->from_device(0);
-            CHECK_HIP(hipDeviceSynchronize());
-            printf("tp_rank %d, rs_now->key_cache: ", tp_rank);
-            for (int id_test = 0; id_test < 5; id_test++) {
-              printf("%.6f ", rs_now->key_cache->buf[id_test]);
-            }
-            printf("\n");
-            fflush(stdout);
-          }
-        }
+        if (flow_id == 0) rs_now->key_cache->printDebug("rs_now->key_cache", tp_rank);
       #endif
 
       // multihead attention
@@ -159,76 +100,28 @@ float *forward_gpu_120b_batched(
                                 p->sliding_window, pos, 1ll * l, false, false,
                                 false, false, false);
       #ifdef DEBUG
-        #pragma omp critical
-        {
-          if (flow_id == 0) {
-            rs_now->tb->from_device(0);
-            CHECK_HIP(hipDeviceSynchronize());
-            printf("tp_rank %d, rs_now->tb: ", tp_rank);
-            for (int id_test = 0; id_test < 5; id_test++) {
-              printf("%.6f ", rs_now->tb->buf[id_test]);
-            }
-            printf("\n");
-            fflush(stdout);
-          }
-        }
+        if (flow_id == 0) rs_now->tb->printDebug("rs_now->tb", tp_rank);
       #endif
                                 
       // final matmul to get the output of the attention
       attn_out_project_batched(rs_now->tb, weights_now->w_o, weights_now->b_o, rs_now->tb2, 1ll * l, false, false);
 
       #ifdef DEBUG
-        #pragma omp critical
-        {
-          if (flow_id == 0) {
-            rs_now->tb2->from_device(0);
-            CHECK_HIP(hipDeviceSynchronize());
-            printf("tp_rank %d, rs_now->tb2: ", tp_rank);
-            for (int id_test = 0; id_test < 5; id_test++) {
-              printf("%.6f ", rs_now->tb2->buf[id_test]);
-            }
-            printf("\n");
-            fflush(stdout);
-          }
-        }
+        if (flow_id == 0) rs_now->tb2->printDebug("rs_now->tb2", tp_rank);
       #endif
 
       // residual connection back into x
       add_vector_batched(rs_now->x, rs_now->tb2, false, false, false);  // equals residual add
 
       #ifdef DEBUG
-        #pragma omp critical
-        {
-          if (flow_id == 0) {
-            rs_now->x->from_device(0);
-            CHECK_HIP(hipDeviceSynchronize());
-            printf("tp_rank %d, rs_now->x: ", tp_rank);
-            for (int id_test = 0; id_test < 5; id_test++) {
-              printf("%.6f ", rs_now->x->buf[id_test]);
-            }
-            printf("\n");
-            fflush(stdout);
-          }
-        }
+        if (flow_id == 0) rs_now->x->printDebug("rs->x", tp_rank);
       #endif
 
       // ffn rmsnorm
       rmsnorm_batched(rs_now->x, weights_now->rms_ffn_w, rs_now->t, 1ll * l, false, false);
       
       #ifdef DEBUG
-        #pragma omp critical
-        {
-          if (flow_id == 0) {
-            rs_now->t->from_device(0);
-            CHECK_HIP(hipDeviceSynchronize());
-            printf("tp_rank %d, rs_now->t: ", tp_rank);
-            for (int id_test = 0; id_test < 5; id_test++) {
-              printf("%.6f ", rs_now->t->buf[id_test]);
-            }
-            printf("\n");
-            fflush(stdout);
-          }
-        }
+        if (flow_id == 0) rs_now->t->printDebug("rs_now->t", tp_rank);
       #endif
 
       // MoE routing
@@ -236,38 +129,14 @@ float *forward_gpu_120b_batched(
                   rs_now->router_score, 1ll * l, false, false);
 
       #ifdef DEBUG
-        #pragma omp critical
-        {
-          if (flow_id == 0) {
-            rs_now->router_score->from_device(0);
-            CHECK_HIP(hipDeviceSynchronize());
-            printf("tp_rank %d, rs_now->router_score: ", tp_rank);
-            for (int id_test = 0; id_test < 5; id_test++) {
-              printf("%.6f ", rs_now->router_score->buf[id_test]);
-            }
-            printf("\n");
-            fflush(stdout);
-          }
-        }
+        if (flow_id == 0) rs_now->router_score->printDebug("rs_now->router_score", tp_rank);
       #endif
 
       // Select top-k experts
       topk_softmax_batched(rs_now->router_score, rs_now->topk_v, rs_now->topk_i, false, false, false);
       
       #ifdef DEBUG
-        #pragma omp critical
-        {
-          if (flow_id == 0) {
-            rs_now->topk_v->from_device(0);
-            CHECK_HIP(hipDeviceSynchronize());
-            printf("tp_rank %d, rs_now->topk_v: ", tp_rank);
-            for (int id_test = 0; id_test < 5; id_test++) {
-              printf("%.6f ", rs_now->topk_v->buf[id_test]);
-            }
-            printf("\n");
-            fflush(stdout);
-          }
-        }
+        if (flow_id == 0) rs_now->topk_v->printDebug("rs_now->topk_v", tp_rank);
       #endif
 
       // Route the tokens to their corresponding top-k experts
@@ -281,18 +150,7 @@ float *forward_gpu_120b_batched(
       pthread_barrier_wait(tp_barrier);
       
       #ifdef DEBUG
-        #pragma omp critical
-        {
-          if (flow_id == 0) {
-            printf("rs->e_agg rank id %d: ", tp_rank);
-            rs_now->e_agg->from_device(stream);
-            for (int i = 0; i < 5; i++) {
-              printf("%.6f ", rs_now->e_agg->buf[i]);
-            }
-            printf("\n");
-            fflush(stdout);
-          }
-        }
+        if (flow_id == 0) rs_now->e_agg->printDebug("rs_now->e_agg", tp_rank);
       #endif
 
       // do tensor aggregation here, do later
@@ -327,39 +185,14 @@ float *forward_gpu_120b_batched(
       pthread_barrier_wait(tp_barrier);
 
       #ifdef DEBUG
-        #pragma omp critical
-        {
-          if (flow_id == 0) {
-            rs_now->e_agg->from_device(0);
-            CHECK_HIP(hipDeviceSynchronize());
-            printf("tp_rank %d, rs_now->e_agg: ", tp_rank);
-            for (int id_test = 0; id_test < 5; id_test++) {
-              printf("%.6f ", rs_now->e_agg->buf[id_test]);
-            }
-            printf("\n");
-            fflush(stdout);
-          }
-        }
+        if (flow_id == 0) rs_now->e_agg->printDebug("rs_now->e_agg", tp_rank);
       #endif
 
       // residual connection
       add_vector_batched(rs_now->x, rs_now->e_agg, false, false, false);  // equals residual add
       
       #ifdef DEBUG
-        #pragma omp critical
-        {
-          if (flow_id == 0) {
-            rs_now->x->from_device(0);
-            CHECK_HIP(hipDeviceSynchronize());
-            printf("tp_rank %d, rs_now->x: ", tp_rank);
-            for (int id_test = 0; id_test < 5; id_test++) {
-              printf("%.6f ", rs_now->x->buf[id_test]);
-            }
-            printf("\n");
-            printf("tp_rank %d, Finish layer %d\n", tp_rank, l);
-            fflush(stdout);
-          }
-        }
+        if (flow_id == 0) rs_now->x->printDebug("rs_now->x", tp_rank);
       #endif
     }
   }

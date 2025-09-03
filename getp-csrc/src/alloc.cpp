@@ -2,6 +2,101 @@
 #include <cmath>
 #include <cstring>
 
+#ifdef RUN_20B
+
+void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *weights, int device_id) {
+  // Create Tensor wrappers for weight matrices
+  weights->token_embedding_table =
+    new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->token_embedding_table, device_id);
+
+  weights->rms_attn_w = new Tensor({(size_t)p->n_layers * p->hidden_dim}, w->rms_attn_w, device_id);
+  weights->rms_ffn_w = new Tensor({(size_t)p->n_layers * p->hidden_dim}, w->rms_ffn_w, device_id);
+
+  weights->w_qkv =
+    new Tensor({(size_t)p->n_layers,
+                ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * (size_t)p->head_dim,
+                (size_t)p->hidden_dim},
+               w->w_qkv, device_id);
+  weights->b_qkv = new Tensor(
+    {(size_t)p->n_layers, ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim},
+    w->b_qkv, device_id);
+
+  weights->w_o = new Tensor(
+    {(size_t)p->n_layers, (size_t)p->hidden_dim, (size_t)p->n_attn_heads * p->head_dim}, w->w_o, device_id);
+  weights->b_o = new Tensor({(size_t)p->n_layers, (size_t)p->hidden_dim}, w->b_o, device_id);
+
+  // Tensor *attn_sinks; // (n_layers, n_attn_heads)
+  weights->attn_sinks = new Tensor({(size_t)p->n_layers, (size_t)p->n_attn_heads}, w->attn_sinks, device_id);
+
+  weights->w_router =
+    new Tensor({(size_t)p->n_layers, (size_t)p->n_experts, (size_t)p->hidden_dim}, w->w_router, device_id);
+  weights->b_router = new Tensor({(size_t)p->n_layers, (size_t)p->n_experts}, w->b_router, device_id);
+
+  weights->w_mlp1 = new Tensor({(size_t)p->n_layers, (size_t)p->n_experts,
+                                2 * (size_t)p->intermediate_dim, (size_t)p->hidden_dim},
+                               w->w_mlp1, device_id, DType::BF16);
+  weights->b_mlp1 =
+    new Tensor({(size_t)p->n_layers, (size_t)p->n_experts, 2 * (size_t)p->intermediate_dim},
+               w->b_mlp1, device_id, DType::BF16);
+
+  weights->w_mlp2 = new Tensor(
+    {(size_t)p->n_layers, (size_t)p->n_experts, (size_t)p->hidden_dim, (size_t)p->intermediate_dim},
+    w->w_mlp2, device_id, DType::BF16);
+  weights->b_mlp2 = new Tensor({(size_t)p->n_layers, (size_t)p->n_experts, (size_t)p->hidden_dim},
+                               w->b_mlp2, device_id, DType::BF16);
+
+  weights->rms_out_w = new Tensor({(size_t)p->hidden_dim}, w->rms_out_w, device_id);
+  weights->out = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->out, device_id);
+}
+
+void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id) {
+  // Create Tensor wrappers for state buffers
+  rs->x = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, device_id);
+
+  rs->t = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, device_id);
+  rs->tb = new Tensor({BATCH_SIZE, (size_t)p->head_dim * p->n_attn_heads}, device_id);
+  rs->tb2 = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, device_id);
+
+  rs->tb3 = new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, device_id);
+
+  rs->router_score = new Tensor({BATCH_SIZE, (size_t)p->n_experts}, device_id);
+  rs->topk_v = new Tensor({BATCH_SIZE, (size_t)p->experts_per_token}, device_id);
+  rs->topk_i = new TensorI32({BATCH_SIZE, (size_t)p->experts_per_token}, device_id);
+
+  rs->mlp1_out =
+    new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, 2 * (size_t)p->intermediate_dim}, device_id);
+
+  rs->gate = new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, device_id);
+  rs->up = new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, device_id);
+
+  // rs->gate_up = new Tensor({(size_t)p->intermediate_dim}, s->gate_up);
+  rs->gate_up = new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, device_id);
+
+  rs->e_agg = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, device_id);
+  rs->e_agg_buf = nullptr;
+  rs->qkv = new Tensor(
+    {BATCH_SIZE, ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim}, device_id);
+  rs->q = new Tensor({BATCH_SIZE, (size_t)p->n_attn_heads * p->head_dim}, device_id);
+  rs->k = new Tensor({BATCH_SIZE, (size_t)p->n_kv_heads * p->head_dim}, device_id);
+  rs->v = new Tensor({BATCH_SIZE, (size_t)p->n_kv_heads * p->head_dim}, device_id);
+  rs->att = new Tensor({BATCH_SIZE, (size_t)p->n_attn_heads, (size_t)p->seq_len}, device_id);
+  rs->logits = new Tensor({BATCH_SIZE, (size_t)p->vocab_size}, device_id);
+
+  rs->key_cache = new Tensor(
+    {BATCH_SIZE, (size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim}, device_id);
+  rs->value_cache = new Tensor(
+    {BATCH_SIZE, (size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim}, device_id);
+
+  // mask needs to be batch because they are not zero_allocated
+  rs->mask = new Tensor({BATCH_SIZE, (size_t)p->seq_len, (size_t)p->seq_len}, s->mask, true, device_id);
+
+  rs->cos_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2}, device_id);
+  rs->sin_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2}, device_id);
+  RopePrecomputeCS(p, rs->cos_tensor, rs->sin_tensor);
+}
+
+#else
+
 void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *weights, int device_id) {
   size_t layers_each = p->n_layers / PP;
   size_t experts_each = p->n_experts / TP;
@@ -217,6 +312,8 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id) 
   rs->sin_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2}, device_id);
   RopePrecomputeCS(p, rs->cos_tensor, rs->sin_tensor);
 }
+
+#endif
 
 void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunState *rs, hipStream_t *total_streams, hipEvent_t *total_events) {
   Config *p = &transformer->config;

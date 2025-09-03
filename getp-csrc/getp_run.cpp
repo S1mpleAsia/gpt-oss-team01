@@ -65,119 +65,6 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
   delete total_events;
 }
 
-#ifndef RUN_BATCH
-long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
-                               const char *input_seq, int *output_tokens, int steps) {
-  // <|start|>: 200006
-  // <|end|>: 200007
-  // <|return|>: 200002
-  // <|message|>: 200008
-  // <|channel|>: 200005
-  // <|constrain|>: 200003
-  // <|endoftext|>: 199999
-
-  // Inference here
-  const char *empty_prompt = "";
-  if (input_seq == NULL) {
-    input_seq = empty_prompt;
-  }
-
-  // encode the (string) prompt into tokens sequence
-  int num_prompt_tokens = 0;
-  int *prompt_tokens =
-    (int *)malloc((strlen(input_seq) + 3) * sizeof(int));  // +3 for '\0', ?BOS, ?EOS
-  encode(tokenizer, input_seq, -1, -1, prompt_tokens, &num_prompt_tokens,
-         transformer->config.initial_context_length);
-  if (num_prompt_tokens < 1) {
-    fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
-    exit(EXIT_FAILURE);
-  }
-
-  // start the main loop
-  int next;                      // will store the next token in the sequence
-  int token = prompt_tokens[0];  // kick off with the first token in the prompt
-  int pos = 0;                   // position in the sequence
-
-  // print the very first token
-  // should be removed
-  const char *first_piece = decode_piece(tokenizer, 200006, token);
-  safe_printf(first_piece);
-  fflush(stdout);
-
-  while (pos < steps) {
-    // forward the transformer to get logits for the next token
-    float *logits = forward_gpu_20b(p, weights, rs, token, pos);
-    // float *logits = forward(transformer, token, pos); <---- real code from run.cpp
-
-    // advance the state machine
-    {
-      // GpuTimer timer("sample");
-      pos++;
-      if (pos < num_prompt_tokens) {
-        // if we are still processing the input prompt, force the next prompt
-        // token
-        next = prompt_tokens[pos];
-      } else {
-        // otherwise sample the next token from the logits
-        next = sample(sampler, logits);
-        // save the output token, it will be printed to file
-        output_tokens[pos - num_prompt_tokens] = next;
-      }
-
-      // --- MODIFICATION START ---
-      // This single block replaces the two original PRINT_LOGITS blocks.
-      #ifdef PRINT_LOGITS
-        // Decode the next token to get its string representation
-        const char *piece = decode_piece(tokenizer, token, next);
-
-        // Print in the requested format
-        printf("batch id 0 --> ");
-        safe_printf(piece);
-        printf("logits: ");
-        for (int j = 0; j < 5; j++) {
-            printf("%.6f ", logits[j]);
-        }
-        printf("\n");
-        fflush(stdout);
-      #endif
-      // --- MODIFICATION END ---
-
-      // data-dependent terminating condition: the EOS (=199999 or =200002) token
-      // delimits sequences
-      if (next == 199999 || next == 200002) {
-        break;
-      }
-
-      token = next;
-    }
-  }
-
-  // should be removed
-  #ifdef PRINT_LOGITS
-    printf("\n");
-  #endif
-
-  // Marker for end of sequence
-  output_tokens[pos - num_prompt_tokens + 1] = -1;
-
-  free(prompt_tokens);
-
-  return pos - num_prompt_tokens + 1;
-}
-
-long long inference(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
-                    Requests *requests) {
-  long long num_token_out = 0;
-  for (int idx = 0; idx < requests->num_reqs; ++idx) {
-    const char *input_seq = get_str_req_ptr(requests, idx);
-    int *output_tokens = get_tok_gen_ptr(requests, idx);
-    num_token_out += simple_getp_generate(transformer, tokenizer, sampler, input_seq, output_tokens,
-                                          requests->max_seq_len);
-  }
-  return num_token_out;
-}
-#else
-
 void *inside_thread_handler(void *arg) {
   OnePathInsideArgs *args = (OnePathInsideArgs *)arg;
 
@@ -186,11 +73,7 @@ void *inside_thread_handler(void *arg) {
   // Set the device context for this thread
   CHECK_HIP(hipSetDevice(cur_device));
 
-  #ifdef RUN_20B
-    args->logits = forward_gpu_20b_batched(args->current_tokens->data(), args->pos, args->current_size, args->id);
-  #else
-    args->logits = forward_gpu_120b_batched(args->current_tokens->data(), args->pos, args->current_size, args->id, args->tp_rank, args->pp_rank, args->tp_barrier);
-  #endif
+  args->logits = forward_gpu_120b_batched(args->current_tokens->data(), args->pos, args->current_size, args->id, args->tp_rank, args->pp_rank, args->tp_barrier);
 
   return nullptr;
 }
@@ -203,16 +86,20 @@ void *thread_handler(void *arg) {
   int max_seq_len = public_requests->max_seq_len;
   int end_idx = args->end_idx;
 
-  pthread_t inside_threads[TP];
-  OnePathInsideArgs inside_args[TP];
+  #ifdef RUN_20B 
+    CHECK_HIP(hipSetDevice(id));
+  #else
+    pthread_t inside_threads[TP];
+    OnePathInsideArgs inside_args[TP];
+    
+    pthread_barrier_init(&(args->tp_barrier), NULL, TP);
 
-  pthread_barrier_init(&(args->tp_barrier), NULL, TP);
-  
-  for (int i = 0; i < TP; i++) {
-    inside_args[i].tp_rank = (i % TP);
-    inside_args[i].pp_rank = 0;
-    inside_args[i].tp_barrier = &(args->tp_barrier);
-  }
+    for (int i = 0; i < TP; i++) {
+      inside_args[i].tp_rank = (i % TP);
+      inside_args[i].pp_rank = 0;
+      inside_args[i].tp_barrier = &(args->tp_barrier);
+    }
+  #endif
 
   for (int cur_idx = args->start_idx; cur_idx < end_idx; cur_idx += BATCH_SIZE) {
     int current_size = min(BATCH_SIZE, end_idx - cur_idx);
@@ -257,27 +144,33 @@ void *thread_handler(void *arg) {
       current_tokens[i] = batch_prompt_tokens[i][0];
     }
 
-    for (int i = 0; i < TP; i++) {
-      inside_args[i].current_tokens = &current_tokens;
-      inside_args[i].current_size = current_size;
-      inside_args[i].id = id;
-    }
+    #ifndef RUN_20B
+      for (int i = 0; i < TP; i++) {
+        inside_args[i].current_tokens = &current_tokens;
+        inside_args[i].current_size = current_size;
+        inside_args[i].id = id;
+      }
+    #endif
     
     for (int pos = 0; pos < max_seq_len && active_count > 0; ++pos) {
-      for (int i = 0; i < TP; i++) {
-        inside_args[i].pos = pos;
-      }
+      #ifdef RUN_20B
+        float *batch_logits = forward_gpu_20b_batched(current_tokens.data(), pos, current_size, id);
+      #else
+        for (int i = 0; i < TP; i++) {
+          inside_args[i].pos = pos;
+        }
 
-      for (int i = 0; i < TP; i++) {
-        pthread_create(&inside_threads[i], NULL, inside_thread_handler,
-                    (void *)&inside_args[i]);
-      }
-      
-      for (int i = 0; i < TP; i++) {
-        pthread_join(inside_threads[i], NULL);
-      }
-
-      float *batch_logits = inside_args[0].logits;
+        for (int i = 0; i < TP; i++) {
+          pthread_create(&inside_threads[i], NULL, inside_thread_handler,
+                      (void *)&inside_args[i]);
+        }
+        
+        for (int i = 0; i < TP; i++) {
+          pthread_join(inside_threads[i], NULL);
+        }
+        
+        float *batch_logits = inside_args[0].logits;
+      #endif
 
       for (int i = 0; i < current_size; i++) {
         if (!active[i])
@@ -336,7 +229,9 @@ void *thread_handler(void *arg) {
     }
   }
   
-  pthread_barrier_destroy(&(args->tp_barrier));
+  #ifndef RUN_20B
+    pthread_barrier_destroy(&(args->tp_barrier));
+  #endif
 
   *(args->local_token_ptr) = local_token_count;
 
@@ -374,7 +269,5 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer, Sampler *sam
 
   return num_token_out;
 }
-
-#endif
 
 #endif  // GETP_RUN

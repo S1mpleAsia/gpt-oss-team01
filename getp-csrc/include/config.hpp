@@ -6,16 +6,21 @@
 
 #include "tensor.hpp"
 
-#define RUN_BATCH
 #define BATCH_SIZE 2
 // #define PRINT_LOGITS
 // #define TIME_GPU
 // #define DEBUG
 // #define RUN_20B
 
-#define DP 1
-#define PP 1
-#define TP 1
+#ifdef RUN_20B
+  #define DP 2
+  #define PP 1
+  #define TP 1
+#else
+  #define DP 1
+  #define PP 2
+  #define TP 1
+#endif
 #define TOTAL_GPUS_NEEDED ((DP) * (PP) * (TP))
 #define TOTAL_PIPELINES ((PP) * (TP))
 
