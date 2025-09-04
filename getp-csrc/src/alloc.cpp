@@ -109,8 +109,8 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
         size_t d_offset =
           l * n_experts * hidden_dim * 2 * inter_dim + e * hidden_dim * 2 * inter_dim;
-        CHECK_HIP(hipMemcpyAsync(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16),
-                                 hipMemcpyHostToDevice, 0));
+        CHECK_HIP(hipMemcpy(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16),
+                                 hipMemcpyHostToDevice));
       }
     }
 
@@ -160,8 +160,8 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
         }
 
         size_t d_offset = l * n_experts * inter_dim * hidden_dim + e * inter_dim * hidden_dim;
-        CHECK_HIP(hipMemcpyAsync(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16),
-                                 hipMemcpyHostToDevice, 0));
+        CHECK_HIP(hipMemcpy(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16),
+                                 hipMemcpyHostToDevice));
       }
     }
 
@@ -258,6 +258,8 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   long long pp_offset = 1ll * pp_rank * layers_each;
   long long tp_offset = 1ll * tp_rank * experts_each;
 
+  int shard_dim_each = p->intermediate_dim / TP;
+
   // Create Tensor wrappers for weight matrices
   if (pp_rank == 0) {
     weights->token_embedding_table =
@@ -352,28 +354,37 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     size_t n_experts = p->n_experts;
     size_t hidden_dim = p->hidden_dim;
     size_t inter_dim = p->intermediate_dim;
+    size_t shard_dim = shard_dim_each;
 
-    weights->w_mlp1 = new Tensor({n_layers, n_experts, hidden_dim, 2 * inter_dim}, device_id, DType::BF16);
+    weights->w_mlp1 = new Tensor({n_layers, n_experts, hidden_dim, 2 * shard_dim}, device_id, DType::BF16);
 
-    size_t tmp_elems = hidden_dim * 2 * inter_dim;
+    size_t tmp_elems = hidden_dim * 2 * shard_dim;
     bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
 
     bf16 *d_buf = (bf16 *)(weights->w_mlp1->d_buf);
 
+    w_mlp1_ptr += tp_rank * (2 * shard_dim) * hidden_dim; // offset shard_dim;
+
+    size_t l_offset = 1ll * n_experts * hidden_dim * 2 * inter_dim;
+    size_t e_offset = 1ll * hidden_dim * 2 * inter_dim;
+
+    size_t l_offset_d = 1ll * n_experts * hidden_dim * 2 * shard_dim;
+    size_t e_offset_d = 1ll * hidden_dim * 2 * shard_dim;
+
     for (size_t l = 0; l < n_layers; l++) {
       for (size_t e = 0; e < n_experts; e++) {
-        size_t base = l * n_experts * hidden_dim * 2 * inter_dim + e * hidden_dim * 2 * inter_dim;
+        size_t base = 1ll * l * l_offset + 1ll * e * e_offset;
+
         for (size_t h = 0; h < hidden_dim; h++) {
-          for (size_t i = 0; i < 2 * inter_dim; i++) {
+          for (size_t i = 0; i < 2 * shard_dim; i++) {
             float value = w_mlp1_ptr[base + i * hidden_dim + h];
-            tmp[h * 2 * inter_dim + i] = bf16(value);
+            tmp[h * 2 * shard_dim + i] = bf16(value);
           }
         }
 
-        size_t d_offset =
-          l * n_experts * hidden_dim * 2 * inter_dim + e * hidden_dim * 2 * inter_dim;
-        CHECK_HIP(hipMemcpyAsync(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16),
-                                 hipMemcpyHostToDevice, 0));
+        size_t d_offset = 1ll * l * l_offset_d + 1ll * e * e_offset_d;
+        CHECK_HIP(hipMemcpy(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16),
+                                 hipMemcpyHostToDevice));
       }
     }
 
@@ -405,10 +416,56 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   
   // Initialize pointer with pipeline parallelism (pp) offset
   float *b_mlp1_ptr = w->b_mlp1 + 1ll * pp_offset * (size_t)p->n_experts * 2 * (size_t)p->intermediate_dim;
-  weights->b_mlp1 = new Tensor(
-    {layers_each, experts_each, 2 * (size_t)p->intermediate_dim},
-    b_mlp1_ptr, device_id, DType::BF16
-  );
+  /** w->b_mlp1
+    weights->b_mlp1 = new Tensor(
+      {layers_each, experts_each, 2 * (size_t)p->intermediate_dim},
+      b_mlp1_ptr, device_id, DType::BF16
+    );
+  */
+  {
+    printf("Starting alloc b_mlp1\n");
+    fflush(stdout);
+    size_t n_layers = layers_each;
+    size_t n_experts = p->n_experts;
+    size_t inter_dim = p->intermediate_dim;
+    size_t shard_dim = shard_dim_each;
+
+    weights->b_mlp1 = new Tensor({n_layers, n_experts, 2 * shard_dim}, device_id, DType::BF16);
+
+    size_t tmp_elems = 2 * shard_dim;
+    bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
+
+    bf16 *d_buf = (bf16 *)(weights->b_mlp1->d_buf);
+
+    b_mlp1_ptr += 1ll * tp_rank * (2 * shard_dim); // offset shard_dim;
+
+    size_t l_offset = 1ll * n_experts * 2 * inter_dim;
+    size_t e_offset = 1ll * 2 * inter_dim;
+
+    size_t l_offset_d = 1ll * n_experts * 2 * shard_dim;
+    size_t e_offset_d = 1ll * 2 * shard_dim;
+
+    for (size_t l = 0; l < n_layers; l++) {
+      for (size_t e = 0; e < n_experts; e++) {
+        size_t base = 1ll * l * l_offset + 1ll * e * e_offset;
+
+        for (size_t i = 0; i < 2 * shard_dim; i++) {
+          float value = b_mlp1_ptr[base + i];
+          tmp[i] = bf16(value);
+        }
+
+        size_t d_offset = 1ll * l * l_offset_d + 1ll * e * e_offset_d;
+        CHECK_HIP(hipMemcpy(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16),
+                                 hipMemcpyHostToDevice));
+      }
+    }
+
+    CHECK_HIP(hipStreamSynchronize(0));
+    free(tmp);
+
+    printf("End alloc b_mlp1\n");
+    fflush(stdout);
+  }
 
   /** b_mlp1 EXPERT PARALLELISM
     // Apply tensor parallelism (tp) offset for the expert dimension
@@ -450,32 +507,37 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     size_t n_experts = p->n_experts;
     size_t hidden_dim = p->hidden_dim;
     size_t inter_dim = p->intermediate_dim;
+    size_t shard_dim = shard_dim_each;
 
-    weights->w_mlp2 = new Tensor({n_layers, n_experts, inter_dim, hidden_dim}, device_id, DType::BF16);
+    weights->w_mlp2 = new Tensor({n_layers, n_experts, shard_dim, hidden_dim}, device_id, DType::BF16);
 
-    size_t tmp_elems = inter_dim * hidden_dim;
+    size_t tmp_elems = shard_dim * hidden_dim;
     bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
 
     bf16 *d_buf = (bf16 *)(weights->w_mlp2->d_buf);
 
+    w_mlp2_ptr += 1ll * tp_rank * shard_dim * hidden_dim; // offset shard_dim;
+
+    size_t l_offset = 1ll * n_experts * hidden_dim * inter_dim;
+    size_t e_offset = 1ll * hidden_dim * inter_dim;
+
+    size_t l_offset_d = 1ll * n_experts * hidden_dim * shard_dim;
+    size_t e_offset_d = 1ll * hidden_dim * shard_dim;
+
     for (size_t l = 0; l < n_layers; l++) {
       for (size_t e = 0; e < n_experts; e++) {
-        size_t base = l * n_experts * hidden_dim * inter_dim + e * hidden_dim * inter_dim;
+        size_t base = 1ll * l * l_offset + 1ll * e * e_offset;
 
-        for (size_t i = 0; i < inter_dim; i++) {
+        for (size_t i = 0; i < shard_dim; i++) {
           for (size_t h = 0; h < hidden_dim; h++) {
             float value = w_mlp2_ptr[base + h * inter_dim + i];
             tmp[i * hidden_dim + h] = bf16(value);
-            // weights->w_mlp2->buf[l * n_experts * inter_dim * hidden_dim +
-            //                      e * inter_dim * hidden_dim + i * hidden_dim + h] =
-            //   w->w_mlp2[l * n_experts * inter_dim * hidden_dim + e * inter_dim * hidden_dim +
-            //             h * inter_dim + i];
           }
         }
 
-        size_t d_offset = l * n_experts * inter_dim * hidden_dim + e * inter_dim * hidden_dim;
-        CHECK_HIP(hipMemcpyAsync(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16),
-                                 hipMemcpyHostToDevice, 0));
+        size_t d_offset = 1ll * l * l_offset_d + 1ll * e * e_offset_d;
+        CHECK_HIP(hipMemcpy(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16),
+                                 hipMemcpyHostToDevice));
       }
     }
 
