@@ -94,6 +94,9 @@ typedef struct {
   TensorI32 *expert_offsets;   // [n_experts + 1]
   Tensor *x_packed;            // [batch_size * experts_per_token, hidden_dim]
   int max_rows;
+
+  // Multi-GPU related
+  Tensor *reduce_temp_buffer;
 } OurRunState;
 
 typedef struct {

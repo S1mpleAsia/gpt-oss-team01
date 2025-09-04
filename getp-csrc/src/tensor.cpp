@@ -69,6 +69,7 @@ void Tensor::from_device(hipStream_t stream) {
   size_t N_ = num_elem();
   if (dtype == DType::FP32) {
     CHECK_HIP(hipMemcpyAsync(buf, d_buf, N_ * sizeof(float), hipMemcpyDeviceToHost, stream));
+    CHECK_HIP(hipStreamSynchronize(stream));
   } else {
     // Convert and copy for BF16
     bf16 *temp_bf16 = (bf16 *)malloc(N_ * sizeof(bf16));

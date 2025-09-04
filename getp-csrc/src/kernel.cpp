@@ -851,7 +851,6 @@ void moe_block_matmul_style(
 
   // ====== 1) sort & offsets ======
   {
-    GpuTimer timer("moe_offsets");
     const size_t shmem_bytes = (size_t)n_experts * sizeof(int);
     dim3 block_size(256);
     dim3 grid_size(1);
@@ -863,7 +862,6 @@ void moe_block_matmul_style(
 
   // ====== 2) pack X theo sorted_ids ======
   {
-    GpuTimer timer("moe_x_packed");
     dim3 block_size(256, 1);
     dim3 grid_size((hidden_dim + block_size.x - 1) / block_size.x, total_pairs);
     gather_inputs_by_sorted_kernel<<<grid_size, block_size, 0, stream>>>(
@@ -873,7 +871,6 @@ void moe_block_matmul_style(
 
   int max_rows_per_expert = 0;
   {
-    GpuTimer timer("moe_max_row");
     int *d_max_rows = nullptr;
     CHECK_HIP(hipMalloc(&d_max_rows, sizeof(int)));
     CHECK_HIP(hipMemsetAsync(d_max_rows, 0, sizeof(int), stream));
@@ -886,7 +883,6 @@ void moe_block_matmul_style(
   }
 
   {
-    GpuTimer timer("moe_mlp1");
     constexpr int BM = 16, BN = 128, BK = 16, TM = 2, TN = 8;
     dim3 block_size(BN / TN, BM / TM);
     dim3 grid_size((2 * inter_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
@@ -896,7 +892,6 @@ void moe_block_matmul_style(
   }
 
   {
-    GpuTimer timer("moe_swiglu");
     size_t total = (size_t)batch_size * experts_per_token * inter_dim;
     dim3 block_size(256);
     dim3 grid_size((total + 255) / 256);
@@ -906,7 +901,6 @@ void moe_block_matmul_style(
   }
 
   {
-    GpuTimer timer("moe_mlp2");
     constexpr int BM = 16, BN = 128, BK = 16, TM = 2, TN = 8;
     dim3 block_size(BN / TN, BM / TM);
     dim3 grid_size((hidden_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
@@ -916,7 +910,6 @@ void moe_block_matmul_style(
   }
 
   {
-    GpuTimer timer("moe_agg");
     dim3 block_size(32, 8, 1);
     dim3 grid_size((hidden_dim + block_size.x - 1) / block_size.x,
                    (max_rows_per_expert + block_size.y - 1) / block_size.y, n_experts);
