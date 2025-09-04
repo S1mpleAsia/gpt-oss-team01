@@ -6,14 +6,14 @@
 
 #include "tensor.hpp"
 
-#define BATCH_SIZE 64
+#define BATCH_SIZE 2
 // #define PRINT_LOGITS
 // #define TIME_GPU
 // #define DEBUG
-#define RUN_20B
+// #define RUN_20B
 
 #ifdef RUN_20B
-  #define DP 1
+  #define DP 2
   #define PP 1
   #define TP 1
 #else
@@ -92,11 +92,13 @@ typedef struct {
   Tensor *mask;
 
   // MoE buffer
-
   TensorI32 *sorted_pair_ids;  // [batch_size * experts_per_token]
   TensorI32 *expert_offsets;   // [n_experts + 1]
   Tensor *x_packed;            // [batch_size * experts_per_token, hidden_dim]
   int max_rows;
+
+  // Multi-GPU related
+  Tensor *reduce_temp_buffer;
 } OurRunState;
 
 typedef struct {

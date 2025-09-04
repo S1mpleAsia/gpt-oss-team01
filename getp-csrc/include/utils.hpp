@@ -10,23 +10,24 @@ void memset_tensor(Tensor *in, int value, bool set_host, bool set_device, hipStr
 struct GpuTimer {
   hipEvent_t start_event, stop_event;
   const char *function_name;
+  hipStream_t stream;
 
   // Constructor: Records the start event.
-  GpuTimer(const char *name) : function_name(name) {
+  GpuTimer(const char *name, hipStream_t s = 0) : function_name(name), stream(s) {
     CHECK_HIP(hipEventCreate(&start_event));
     CHECK_HIP(hipEventCreate(&stop_event));
-    CHECK_HIP(hipEventRecord(start_event));
+    CHECK_HIP(hipEventRecord(start_event, s));
   }
 
   // Destructor: Records the stop event, synchronizes, and prints the time.
   ~GpuTimer() {
-    CHECK_HIP(hipEventRecord(stop_event));
+    CHECK_HIP(hipEventRecord(stop_event, stream));
     CHECK_HIP(hipEventSynchronize(stop_event));
     float milliseconds = 0;
     CHECK_HIP(hipEventElapsedTime(&milliseconds, start_event, stop_event));
-    #ifdef TIME_GPU
-      printf("%s: %f ms\n", function_name, milliseconds);
-    #endif
+#ifdef TIME_GPU
+    printf("%s: %f ms\n", function_name, milliseconds);
+#endif
     CHECK_HIP(hipEventDestroy(start_event));
     CHECK_HIP(hipEventDestroy(stop_event));
   }

@@ -114,7 +114,7 @@ void residual_rmsnorm_batched(Tensor *x,         // Shape: [batch_size, hidden_d
                               Tensor *w,         // Shape: [n_layers, hidden_dim]
                               Tensor *out,       // Shape: [batch_size, hidden_dim]
                               long long layer_offset, float epsilon, hipStream_t stream) {
-  GpuTimer timer("residual_rmsnorm");
+  GpuTimer timer("residual_rmsnorm", stream);
   const int batch_size = (int)residual->shape[0];
   const int hidden_dim = (int)residual->shape[1];
 
@@ -134,7 +134,7 @@ void embedding_lookup_batched(Tensor *embedding,  // Shape: [vocab_size, hidden_
                               int *tokens,        // Shape: [batch_size]
                               Tensor *x,          // Shape: [batch_size, hidden_dim]
                               bool x_from_device, hipStream_t stream) {
-  GpuTimer timer("embedding_lookup");
+  GpuTimer timer("embedding_lookup", stream);
 
   const int batch_size = x->shape[0];
   const size_t hidden_dim = x->shape[1];
@@ -203,7 +203,7 @@ void rmsnorm_batched(Tensor *x,    // Shape: [batch_size, hidden_dim]
                      Tensor *out,  // Shape: [batch_size, hidden_dim]
                      long long layer_offset, bool x_to_device, bool out_from_device, float eps,
                      hipStream_t stream) {
-  GpuTimer timer("rmsnorm");
+  GpuTimer timer("rmsnorm", stream);
   if (x_to_device) {
     x->to_device(stream);
   }
@@ -317,7 +317,7 @@ void qkv_gemm_batched(Tensor *x,            // Shape: [batch_size, hidden_dim]
                       Tensor *qkv,          // Shape: [batch_size, out_features]
                       long long layer_offset, bool x_to_device, bool qkv_from_device,
                       hipStream_t stream) {
-  GpuTimer timer("qkv_gemm");
+  GpuTimer timer("qkv_gemm", stream);
   if (x_to_device) {
     x->to_device(stream);
   }
@@ -358,7 +358,7 @@ void qkv_gemm_batched_v2(Tensor *x,            // Shape: [batch_size, hidden_dim
                          Tensor *qkv,          // Shape: [batch_size, out_features]
                          long long layer_offset, bool x_to_device, bool qkv_from_device,
                          hipStream_t stream) {
-  GpuTimer timer("qkv_gemm_v2");
+  GpuTimer timer("qkv_gemm_v2", stream);
   if (x_to_device) {
     x->to_device(stream);
   }
@@ -472,7 +472,7 @@ void qkv_split_rope_batched(Tensor *qkv_out,             // Shape: [batch_size, 
                             int head_dim, int n_q, int n_kv, int pos, bool qkv_out_to_device,
                             bool q_out_from_device, bool k_out_from_device, bool v_out_from_device,
                             hipStream_t stream) {
-  GpuTimer timer("qkv_split_rope");
+  GpuTimer timer("qkv_split_rope", stream);
   if (qkv_out_to_device) {
     qkv_out->to_device(stream);
   }
@@ -619,7 +619,7 @@ void qkv_split_rope_fused(Tensor *qkv_out,  // Shape: [batch_size, (n_q + 2*n_kv
                           const Tensor *rope_sin_pos,  // Shape: [seq_len, hd/2]
                           int head_dim, int n_q, int n_kv, int pos, long long layer_offset,
                           hipStream_t stream) {
-  GpuTimer timer("qkv_split_fused");
+  GpuTimer timer("qkv_split_fused", stream);
   const int batch_size = (int)qkv_out->shape[0];
   const int kv_dim = n_kv * head_dim;
 
@@ -662,7 +662,7 @@ void add_vector_batched(Tensor *y,  // Shape: [batch_size, hidden_dim]
                         Tensor *b,  // Shape: [batch_size, hidden_dim]
                         bool y_to_device, bool b_to_device, bool y_from_device,
                         hipStream_t stream) {
-  GpuTimer timer("add_vector");
+  GpuTimer timer("add_vector", stream);
   if (y_to_device)
     y->to_device(stream);
   if (b_to_device)
@@ -828,7 +828,7 @@ void single_query_attn_batched(Tensor *q,           // [B, n_q*hd]
                                int sliding_window, int pos, long long layer_offset,
                                bool q_to_device, bool k_cache_to_device, bool v_cache_to_device,
                                bool mask_to_device, bool tb_from_device, hipStream_t stream) {
-  GpuTimer timer("single_query_attn_batched");
+  GpuTimer timer("single_query_attn_batched", stream);
   if (q_to_device)
     q->to_device(stream);
   if (k_cache_to_device)
@@ -876,7 +876,7 @@ void attn_out_project_batched(Tensor *tb,         // Shape: [batch_size, n_q*hd]
                               Tensor *y,          // Shape: [batch_size, hidden_dim]
                               long long layer_offset, bool tb_to_device, bool y_from_device,
                               hipStream_t stream) {
-  GpuTimer timer("attn_out_project");
+  GpuTimer timer("attn_out_project", stream);
   if (tb_to_device) {
     tb->to_device(stream);
   }
@@ -923,7 +923,7 @@ void attn_out_project_batched_v2(Tensor *tb,         // Shape: [batch_size, n_at
                                  Tensor *y,          // Shape: [batch_size, hidden_dim]
                                  long long layer_offset, bool tb_to_device, bool y_from_device,
                                  hipStream_t stream) {
-  GpuTimer timer("attn_out_project_v2");
+  GpuTimer timer("attn_out_project_v2", stream);
   if (tb_to_device) {
     tb->to_device(stream);
   }
@@ -968,7 +968,7 @@ void router_gemm_batched(const Tensor *w_router,  // [n_experts, hidden_dim]
                          Tensor *router_scores,   // [B, n_experts]
                          long long layer_offset, bool t_to_device, bool r_from_device,
                          hipStream_t stream) {
-  GpuTimer timer("router_gemm_batched");
+  GpuTimer timer("router_gemm_batched", stream);
   if (t_to_device)
     t->to_device(stream);
 
@@ -1075,7 +1075,7 @@ void topk_softmax_batched(Tensor *r,            // Shape: [batch_size, n_experts
                           TensorI32 *topk_idx,  // Shape: [batch_size, k]
                           bool r_to_device, bool topk_vals_from_device, bool topk_idx_from_device,
                           hipStream_t stream) {
-  GpuTimer timer("topk_softmax_batched");
+  GpuTimer timer("topk_softmax_batched", stream);
   if (r_to_device) {
     r->to_device(stream);
   }
@@ -1247,7 +1247,7 @@ void moe_apply_topk_batched(Tensor *t,            // [B,H]
                             float clamp_limit, long long layer_offset, bool t_to_device,
                             bool topk_idx_to_device, bool topk_vals_to_device,
                             bool e_agg_from_device, hipStream_t stream) {
-  GpuTimer timer("moe_apply_topk_batched");
+  GpuTimer timer("moe_apply_topk_batched", stream);
   if (t_to_device)
     t->to_device(stream);
   if (topk_idx_to_device)
@@ -1344,7 +1344,7 @@ void moe_block_matmul_style_hip(
   TensorI32 *expert_offsets,   // [n_experts + 1]
   Tensor *x_packed,            // [batch_size * experts_per_token, hidden_dim]
   float clamp_limit, long long layer_offset, hipStream_t stream) {
-  GpuTimer timer("moe_v2");
+  GpuTimer timer("moe_v2", stream);
   moe_block_matmul_style(x_in, topk_idx, topk_v, w_mlp1, b_mlp1, w_mlp2, b_mlp2, e_agg, mlp1_out,
                          gate_up, tb3, sorted_pair_ids, expert_offsets, x_packed, clamp_limit,
                          layer_offset, stream);
@@ -1354,7 +1354,7 @@ static inline void moe_init_buffers_hip(Tensor *e_agg, Tensor *mlp1_out, Tensor 
                                         Tensor *tb3, TensorI32 *sorted_pair_ids,
                                         TensorI32 *expert_offsets, Tensor *x_packed, int batch_size,
                                         int hidden_dim, hipStream_t stream) {
-  GpuTimer timer("moe_init_buffers");
+  GpuTimer timer("moe_init_buffers", stream);
   moe_init_buffers(e_agg, mlp1_out, gate_up, tb3, sorted_pair_ids, expert_offsets, x_packed,
                    batch_size, hidden_dim, stream);
 }
@@ -1364,7 +1364,7 @@ static inline void moe_build_offsets_hip(
   TensorI32 *sorted_pair_ids,  // [batch_size * experts_per_token]
   TensorI32 *expert_offsets,   // [n_experts + 1]
   int batch_size, int experts_per_token, int n_experts, hipStream_t stream) {
-  GpuTimer timer("moe_offsets");
+  GpuTimer timer("moe_offsets", stream);
 
   moe_build_offsets(topk_idx, sorted_pair_ids, expert_offsets, batch_size, experts_per_token,
                     n_experts, stream);
@@ -1375,14 +1375,14 @@ static inline void moe_pack_inputs_hip(
   TensorI32 *sorted_pair_ids,  // [batch_size * experts_per_token]
   Tensor *x_packed,            // [batch_size * experts_per_token, hidden_dim]
   int batch_size, int hidden_dim, int experts_per_token, hipStream_t stream) {
-  GpuTimer timer("moe_x_packed");
+  GpuTimer timer("moe_x_packed", stream);
   moe_pack_inputs(x_in, sorted_pair_ids, x_packed, batch_size, hidden_dim, experts_per_token,
                   stream);
 }
 
 static inline int moe_get_max_rows_per_expert_hip(TensorI32 *expert_offsets, int n_experts,
                                                   hipStream_t stream) {
-  GpuTimer timer("moe_max_row");
+  GpuTimer timer("moe_max_row", stream);
   return moe_get_max_rows_per_expert(expert_offsets, n_experts, stream);
 }
 
@@ -1393,7 +1393,7 @@ static inline void moe_mlp1_forward_hip(Tensor *x_packed,  // [total_pairs, hidd
                                         long long layer_offset, int n_experts, int hidden_dim,
                                         int inter_dim, int max_rows_per_expert, int total_pairs,
                                         hipStream_t stream) {
-  GpuTimer timer("moe_mlp1");
+  GpuTimer timer("moe_mlp1", stream);
   moe_mlp1_forward(x_packed, w_mlp1, b_mlp1, expert_offsets, mlp1_out, layer_offset, n_experts,
                    hidden_dim, inter_dim, max_rows_per_expert, total_pairs, stream);
 }
@@ -1402,7 +1402,7 @@ static inline void moe_swiglu_hip(Tensor *mlp1_out,  // [total_pairs, 2*inter_di
                                   Tensor *gate_up,   // [total_pairs, inter_dim]
                                   int batch_size, int experts_per_token, int inter_dim,
                                   float clamp_limit, hipStream_t stream) {
-  GpuTimer timer("moe_swiglu");
+  GpuTimer timer("moe_swiglu", stream);
   moe_swiglu(mlp1_out, gate_up, batch_size, experts_per_token, inter_dim, clamp_limit, stream);
 }
 
@@ -1413,7 +1413,7 @@ static inline void moe_mlp2_forward_hip(Tensor *gate_up,  // [total_pairs, inter
                                         bool has_bias, long long layer_offset, int n_experts,
                                         int inter_dim, int hidden_dim, int max_rows_per_expert,
                                         int total_pairs, hipStream_t stream) {
-  GpuTimer timer("moe_mlp2");
+  GpuTimer timer("moe_mlp2", stream);
   moe_mlp2_forward(gate_up, w_mlp2, b_mlp2, expert_offsets, tb3, has_bias, layer_offset, n_experts,
                    inter_dim, hidden_dim, max_rows_per_expert, total_pairs, stream);
 }
@@ -1426,7 +1426,7 @@ static inline void moe_scatter_aggregate_hip(
   TensorI32 *expert_offsets,   // [n_experts+1]
   int hidden_dim, int experts_per_token, int n_experts, int max_rows_per_expert,
   hipStream_t stream) {
-  GpuTimer timer("moe_agg");
+  GpuTimer timer("moe_agg", stream);
   moe_scatter_aggregate(tb3, sorted_pair_ids, topk_v, e_agg, expert_offsets, hidden_dim,
                         experts_per_token, n_experts, max_rows_per_expert, stream);
 }
@@ -1434,7 +1434,7 @@ static inline void moe_scatter_aggregate_hip(
 static inline void moe_mlp1_batched(Tensor *t, Tensor *w_mlp1, Tensor *b_mlp1, TensorI32 *topk_idx,
                                     Tensor *mlp1_out, bool t_to_device, bool topk_idx_to_device,
                                     long long layer_offset, hipStream_t stream) {
-  GpuTimer timer("moe_mlp1");
+  GpuTimer timer("moe_mlp1", stream);
   if (t_to_device)
     t->to_device(stream);
 
@@ -1475,7 +1475,7 @@ static inline void moe_mlp1_batched(Tensor *t, Tensor *w_mlp1, Tensor *b_mlp1, T
 
 static inline void moe_swiglu_batched(Tensor *mlp1_out, Tensor *gate_up, int k, float clamp_limit,
                                       hipStream_t stream) {
-  GpuTimer timer("moe_swiglu");
+  GpuTimer timer("moe_swiglu", stream);
   const int batch_size = (int)mlp1_out->shape[0];
   const int inter_dim = (int)gate_up->shape[2];
   const size_t total_size = (size_t)batch_size * k * inter_dim;
@@ -1492,7 +1492,7 @@ static inline void moe_swiglu_batched(Tensor *mlp1_out, Tensor *gate_up, int k, 
 static inline void moe_mlp2_batched(Tensor *gate_up, Tensor *w_mlp2, Tensor *b_mlp2, Tensor *tb3,
                                     TensorI32 *topk_idx, int k, bool has_bias,
                                     long long layer_offset, hipStream_t stream) {
-  GpuTimer timer("moe_mlp2");
+  GpuTimer timer("moe_mlp2", stream);
   const int batch_size = (int)gate_up->shape[0];
   const int inter_dim = (int)gate_up->shape[2];
   const int hidden_dim = (int)tb3->shape[2];
@@ -1521,7 +1521,7 @@ static inline void moe_mlp2_batched(Tensor *gate_up, Tensor *w_mlp2, Tensor *b_m
 
 static inline void moe_agg_batched(Tensor *tb3, Tensor *topk_val, Tensor *e_agg, int k,
                                    bool e_agg_from_device, hipStream_t stream) {
-  GpuTimer timer("moe_agg");
+  GpuTimer timer("moe_agg", stream);
   const int batch_size = (int)tb3->shape[0];
   const int hidden_dim = (int)tb3->shape[2];
 
@@ -1548,7 +1548,7 @@ void classifier_gemm_batched(const Tensor *W_out,  // Shape: [vocab_size, hidden
                              Tensor *x,            // Shape: [batch_size, hidden_dim]
                              Tensor *logits,       // Shape: [batch_size, vocab_size]
                              bool x_to_device, bool logits_from_device, hipStream_t stream) {
-  GpuTimer timer("classifier_batched");
+  GpuTimer timer("classifier_batched", stream);
   if (x_to_device) {
     x->to_device(stream);
   }
@@ -1596,7 +1596,7 @@ void classifier_gemm_batched_v2(const Tensor *W_out,  // Shape: [hidden_dim, voc
                                 Tensor *x,            // Shape: [batch_size, hidden_dim]
                                 Tensor *logits,       // Shape: [batch_size, vocab_size]
                                 bool x_to_device, bool logits_from_device, hipStream_t stream) {
-  GpuTimer timer("classifier_v2");
+  GpuTimer timer("classifier_v2", stream);
   if (x_to_device) {
     x->to_device(stream);
   }

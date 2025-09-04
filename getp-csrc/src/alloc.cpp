@@ -269,17 +269,66 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   weights->rms_attn_w = new Tensor({layers_each * p->hidden_dim}, w->rms_attn_w + 1ll * pp_offset * p->hidden_dim, device_id);
   weights->rms_ffn_w = new Tensor({layers_each * p->hidden_dim}, w->rms_ffn_w + 1ll * pp_offset * p->hidden_dim, device_id);
 
-  weights->w_qkv =
-    new Tensor({layers_each,
-                ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * (size_t)p->head_dim,
-                (size_t)p->hidden_dim},
-               w->w_qkv + 1ll * pp_offset * ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * (size_t)p->head_dim * (size_t)p->hidden_dim, device_id);
+  /** w_qkv
+    weights->w_qkv =
+      new Tensor({layers_each, (size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * (size_t)p->head_dim, (size_t)p->hidden_dim},
+                w->w_qkv + 1ll * pp_offset * ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * (size_t)p->head_dim * (size_t)p->hidden_dim, device_id);
+  */
+  {
+    size_t n_layers = layers_each;
+    size_t n_heads = p->n_attn_heads + 2 * p->n_kv_heads;
+    size_t head_dim = p->head_dim;
+    size_t hidden_dim = p->hidden_dim;
+
+    weights->w_qkv = new Tensor({n_layers, hidden_dim, n_heads * head_dim}, device_id);
+
+    float *w_qkv_ptr = w->w_qkv + 1ll * pp_offset * ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * (size_t)p->head_dim * (size_t)p->hidden_dim;
+
+    for (size_t l = 0; l < n_layers; l++) {
+      for (size_t i = 0; i < n_heads * head_dim; i++) {
+        for (size_t j = 0; j < hidden_dim; j++) {
+          // hoán vị 2 chiều cuối
+          weights->w_qkv
+            ->buf[l * (hidden_dim * n_heads * head_dim) + j * (n_heads * head_dim) + i] =
+            w_qkv_ptr[l * ((n_heads * head_dim) * hidden_dim) + i * hidden_dim + j];
+        }
+      }
+    }
+
+    weights->w_qkv->to_device(0);
+  }
+
   weights->b_qkv = new Tensor(
     {layers_each, ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim},
     w->b_qkv + 1ll * pp_offset * ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim, device_id);
 
-  weights->w_o = new Tensor(
+  /** w_o
+    weights->w_o = new Tensor(
     {layers_each, (size_t)p->hidden_dim, (size_t)p->n_attn_heads * p->head_dim}, w->w_o + 1ll * pp_offset * (size_t)p->hidden_dim * (size_t)p->n_attn_heads * p->head_dim, device_id);
+  */
+  {
+    size_t n_layers = layers_each;
+    size_t hidden_dim = p->hidden_dim;
+    size_t n_heads = p->n_attn_heads;
+    size_t head_dim = p->head_dim;
+
+    // Tạo tensor với shape transposed
+    weights->w_o = new Tensor({n_layers, n_heads * head_dim, hidden_dim}, device_id);
+
+    float *w_o_ptr = w->w_o + 1ll * pp_offset * (size_t)p->hidden_dim * (size_t)p->n_attn_heads * p->head_dim;
+
+    for (size_t l = 0; l < n_layers; l++) {
+      for (size_t i = 0; i < hidden_dim; i++) {
+        for (size_t j = 0; j < n_heads * head_dim; j++) {
+          weights->w_o->buf[l * (n_heads * head_dim * hidden_dim) + j * hidden_dim + i] =
+            w_o_ptr[l * (hidden_dim * n_heads * head_dim) + i * (n_heads * head_dim) + j];
+        }
+      }
+    }
+
+    weights->w_o->to_device(0);
+  }
+
   weights->b_o = new Tensor({layers_each, (size_t)p->hidden_dim}, w->b_o + 1ll * pp_offset * (size_t)p->hidden_dim, device_id);
 
   // Tensor *attn_sinks; // (n_layers, n_attn_heads)
@@ -291,27 +340,68 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
   float *w_mlp1_ptr = w->w_mlp1 + 1ll * pp_offset * (size_t)p->n_experts *
                                 2 * (size_t)p->intermediate_dim * (size_t)p->hidden_dim;
-  weights->w_mlp1 = new Tensor(
-    {layers_each, experts_each, 2 * (size_t)p->intermediate_dim, (size_t)p->hidden_dim}, w_mlp1_ptr, device_id, DType::BF16
-  );
+  /** w_mlp1
+    weights->w_mlp1 = new Tensor(
+      {layers_each, experts_each, 2 * (size_t)p->intermediate_dim, (size_t)p->hidden_dim}, w_mlp1_ptr, device_id, DType::BF16
+    );
+  */
+  {
+    printf("Starting alloc mlp1\n");
+    fflush(stdout);
+    size_t n_layers = layers_each;
+    size_t n_experts = p->n_experts;
+    size_t hidden_dim = p->hidden_dim;
+    size_t inter_dim = p->intermediate_dim;
 
-  w_mlp1_ptr += 1ll * tp_offset * 2 * (size_t)p->intermediate_dim * (size_t)p->hidden_dim;
-  bf16 *w_mlp1_d_buf = (bf16 *)weights->w_mlp1->d_buf;
+    weights->w_mlp1 = new Tensor({n_layers, n_experts, hidden_dim, 2 * inter_dim}, device_id, DType::BF16);
 
-  for (int l = 0; l < layers_each; l++) {
-    // Convert and copy for BF16
-    size_t N_ = experts_each * 2 * (size_t)p->intermediate_dim *(size_t)p->hidden_dim;
-    bf16 *temp_bf16 = (bf16 *)malloc(N_ * sizeof(bf16));
-    for (size_t i = 0; i < N_; i++) {
-      temp_bf16[i] = hip_bfloat16(w_mlp1_ptr[i]);
+    size_t tmp_elems = hidden_dim * 2 * inter_dim;
+    bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
+
+    bf16 *d_buf = (bf16 *)(weights->w_mlp1->d_buf);
+
+    for (size_t l = 0; l < n_layers; l++) {
+      for (size_t e = 0; e < n_experts; e++) {
+        size_t base = l * n_experts * hidden_dim * 2 * inter_dim + e * hidden_dim * 2 * inter_dim;
+        for (size_t h = 0; h < hidden_dim; h++) {
+          for (size_t i = 0; i < 2 * inter_dim; i++) {
+            float value = w_mlp1_ptr[base + i * hidden_dim + h];
+            tmp[h * 2 * inter_dim + i] = bf16(value);
+          }
+        }
+
+        size_t d_offset =
+          l * n_experts * hidden_dim * 2 * inter_dim + e * hidden_dim * 2 * inter_dim;
+        CHECK_HIP(hipMemcpyAsync(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16),
+                                 hipMemcpyHostToDevice, 0));
+      }
     }
-    CHECK_HIP(hipMemcpy(w_mlp1_d_buf, temp_bf16, N_ * sizeof(bf16), hipMemcpyHostToDevice));
-    free(temp_bf16);
-    
-    w_mlp1_ptr += 1ll * (size_t)p->n_experts *
-                                2 * (size_t)p->intermediate_dim * (size_t)p->hidden_dim;
-    w_mlp1_d_buf += 1ll * N_;
+
+    CHECK_HIP(hipStreamSynchronize(0));
+    free(tmp);
+
+    printf("End alloc mlp1\n");
+    fflush(stdout);
   }
+  /** w_mlp1 EXPERT PARALLELISM
+    w_mlp1_ptr += 1ll * tp_offset * 2 * (size_t)p->intermediate_dim * (size_t)p->hidden_dim;
+    bf16 *w_mlp1_d_buf = (bf16 *)weights->w_mlp1->d_buf;
+
+    for (int l = 0; l < layers_each; l++) {
+      // Convert and copy for BF16
+      size_t N_ = experts_each * 2 * (size_t)p->intermediate_dim *(size_t)p->hidden_dim;
+      bf16 *temp_bf16 = (bf16 *)malloc(N_ * sizeof(bf16));
+      for (size_t i = 0; i < N_; i++) {
+        temp_bf16[i] = hip_bfloat16(w_mlp1_ptr[i]);
+      }
+      CHECK_HIP(hipMemcpy(w_mlp1_d_buf, temp_bf16, N_ * sizeof(bf16), hipMemcpyHostToDevice));
+      free(temp_bf16);
+      
+      w_mlp1_ptr += 1ll * (size_t)p->n_experts *
+                                  2 * (size_t)p->intermediate_dim * (size_t)p->hidden_dim;
+      w_mlp1_d_buf += 1ll * N_;
+    }
+  */
   
   // Initialize pointer with pipeline parallelism (pp) offset
   float *b_mlp1_ptr = w->b_mlp1 + 1ll * pp_offset * (size_t)p->n_experts * 2 * (size_t)p->intermediate_dim;
@@ -320,59 +410,108 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     b_mlp1_ptr, device_id, DType::BF16
   );
 
-  // Apply tensor parallelism (tp) offset for the expert dimension
-  b_mlp1_ptr += 1ll * tp_offset * 2 * (size_t)p->intermediate_dim;
-  bf16 *b_mlp1_d_buf = (bf16 *)weights->b_mlp1->d_buf;
+  /** b_mlp1 EXPERT PARALLELISM
+    // Apply tensor parallelism (tp) offset for the expert dimension
+    b_mlp1_ptr += 1ll * tp_offset * 2 * (size_t)p->intermediate_dim;
+    bf16 *b_mlp1_d_buf = (bf16 *)weights->b_mlp1->d_buf;
 
-  for (int l = 0; l < layers_each; l++) {
-    // Calculate the total number of elements for one layer on this device
-    size_t N_ = experts_each * 2 * (size_t)p->intermediate_dim;
-    bf16 *temp_bf16 = (bf16 *)malloc(N_ * sizeof(bf16));
-    
-    // Convert from FP32 to BF16 on the host
-    for (size_t i = 0; i < N_; i++) {
-      temp_bf16[i] = hip_bfloat16(b_mlp1_ptr[i]);
+    for (int l = 0; l < layers_each; l++) {
+      // Calculate the total number of elements for one layer on this device
+      size_t N_ = experts_each * 2 * (size_t)p->intermediate_dim;
+      bf16 *temp_bf16 = (bf16 *)malloc(N_ * sizeof(bf16));
+      
+      // Convert from FP32 to BF16 on the host
+      for (size_t i = 0; i < N_; i++) {
+        temp_bf16[i] = hip_bfloat16(b_mlp1_ptr[i]);
+      }
+      
+      // Copy the converted data to the device
+      CHECK_HIP(hipMemcpy(b_mlp1_d_buf, temp_bf16, N_ * sizeof(bf16), hipMemcpyHostToDevice));
+      free(temp_bf16);
+      
+      // Advance host pointer to the start of the next layer's full set of experts
+      b_mlp1_ptr += 1ll * (size_t)p->n_experts * 2 * (size_t)p->intermediate_dim;
+      // Advance device pointer to the next layer's destination block
+      b_mlp1_d_buf += 1ll * N_;
     }
-    
-    // Copy the converted data to the device
-    CHECK_HIP(hipMemcpy(b_mlp1_d_buf, temp_bf16, N_ * sizeof(bf16), hipMemcpyHostToDevice));
-    free(temp_bf16);
-    
-    // Advance host pointer to the start of the next layer's full set of experts
-    b_mlp1_ptr += 1ll * (size_t)p->n_experts * 2 * (size_t)p->intermediate_dim;
-    // Advance device pointer to the next layer's destination block
-    b_mlp1_d_buf += 1ll * N_;
-  }
+  */
 
   // Initialize pointer with pipeline parallelism (pp) offset
   float *w_mlp2_ptr = w->w_mlp2 + 1ll * pp_offset * (size_t)p->n_experts * (size_t)p->hidden_dim * (size_t)p->intermediate_dim;
-  weights->w_mlp2 = new Tensor(
-    {layers_each, experts_each, (size_t)p->hidden_dim, (size_t)p->intermediate_dim}, w_mlp2_ptr, device_id, DType::BF16
-  );
+  /** w_mlp2
+    weights->w_mlp2 = new Tensor(
+      {layers_each, experts_each, (size_t)p->hidden_dim, (size_t)p->intermediate_dim}, w_mlp2_ptr, device_id, DType::BF16
+    );
+  */
+  {
+    printf("Starting alloc mlp2\n");
+    fflush(stdout);
+    size_t n_layers = layers_each;
+    size_t n_experts = p->n_experts;
+    size_t hidden_dim = p->hidden_dim;
+    size_t inter_dim = p->intermediate_dim;
 
-  // Apply tensor parallelism (tp) offset for the expert dimension
-  w_mlp2_ptr += 1ll * tp_offset * (size_t)p->hidden_dim * (size_t)p->intermediate_dim;
-  bf16 *w_mlp2_d_buf = (bf16 *)weights->w_mlp2->d_buf;
+    weights->w_mlp2 = new Tensor({n_layers, n_experts, inter_dim, hidden_dim}, device_id, DType::BF16);
 
-  for (int l = 0; l < layers_each; l++) {
-    // Calculate the total number of elements for one layer on this device
-    size_t N_ = experts_each * (size_t)p->hidden_dim * (size_t)p->intermediate_dim;
-    bf16 *temp_bf16 = (bf16 *)malloc(N_ * sizeof(bf16));
+    size_t tmp_elems = inter_dim * hidden_dim;
+    bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
 
-    // Convert from FP32 to BF16 on the host
-    for (size_t i = 0; i < N_; i++) {
-      temp_bf16[i] = hip_bfloat16(w_mlp2_ptr[i]);
+    bf16 *d_buf = (bf16 *)(weights->w_mlp2->d_buf);
+
+    for (size_t l = 0; l < n_layers; l++) {
+      for (size_t e = 0; e < n_experts; e++) {
+        size_t base = l * n_experts * hidden_dim * inter_dim + e * hidden_dim * inter_dim;
+
+        for (size_t i = 0; i < inter_dim; i++) {
+          for (size_t h = 0; h < hidden_dim; h++) {
+            float value = w_mlp2_ptr[base + h * inter_dim + i];
+            tmp[i * hidden_dim + h] = bf16(value);
+            // weights->w_mlp2->buf[l * n_experts * inter_dim * hidden_dim +
+            //                      e * inter_dim * hidden_dim + i * hidden_dim + h] =
+            //   w->w_mlp2[l * n_experts * inter_dim * hidden_dim + e * inter_dim * hidden_dim +
+            //             h * inter_dim + i];
+          }
+        }
+
+        size_t d_offset = l * n_experts * inter_dim * hidden_dim + e * inter_dim * hidden_dim;
+        CHECK_HIP(hipMemcpyAsync(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16),
+                                 hipMemcpyHostToDevice, 0));
+      }
     }
-    
-    // Copy the converted data to the device
-    CHECK_HIP(hipMemcpy(w_mlp2_d_buf, temp_bf16, N_ * sizeof(bf16), hipMemcpyHostToDevice));
-    free(temp_bf16);
-    
-    // Advance host pointer to the start of the next layer's full set of experts
-    w_mlp2_ptr += 1ll * (size_t)p->n_experts * (size_t)p->hidden_dim * (size_t)p->intermediate_dim;
-    // Advance device pointer to the next layer's destination block
-    w_mlp2_d_buf += 1ll * N_;
+
+    CHECK_HIP(hipStreamSynchronize(0));
+    free(tmp);
+
+    // weights->w_mlp2->to_device(0);
+    printf("End alloc mlp2\n");
+    fflush(stdout);
   }
+
+  /** w_mlp2 EXPERT PARALLELISM
+    // Apply tensor parallelism (tp) offset for the expert dimension
+    w_mlp2_ptr += 1ll * tp_offset * (size_t)p->hidden_dim * (size_t)p->intermediate_dim;
+    bf16 *w_mlp2_d_buf = (bf16 *)weights->w_mlp2->d_buf;
+
+    for (int l = 0; l < layers_each; l++) {
+      // Calculate the total number of elements for one layer on this device
+      size_t N_ = experts_each * (size_t)p->hidden_dim * (size_t)p->intermediate_dim;
+      bf16 *temp_bf16 = (bf16 *)malloc(N_ * sizeof(bf16));
+
+      // Convert from FP32 to BF16 on the host
+      for (size_t i = 0; i < N_; i++) {
+        temp_bf16[i] = hip_bfloat16(w_mlp2_ptr[i]);
+      }
+      
+      // Copy the converted data to the device
+      CHECK_HIP(hipMemcpy(w_mlp2_d_buf, temp_bf16, N_ * sizeof(bf16), hipMemcpyHostToDevice));
+      free(temp_bf16);
+      
+      // Advance host pointer to the start of the next layer's full set of experts
+      w_mlp2_ptr += 1ll * (size_t)p->n_experts * (size_t)p->hidden_dim * (size_t)p->intermediate_dim;
+      // Advance device pointer to the next layer's destination block
+      w_mlp2_d_buf += 1ll * N_;
+    }
+  */
 
   // Initialize pointer with pipeline parallelism (pp) offset
   float *b_mlp2_ptr = w->b_mlp2 + 1ll * pp_offset * (size_t)p->n_experts * (size_t)p->hidden_dim;
@@ -381,33 +520,51 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     b_mlp2_ptr, device_id, DType::BF16
   );
 
-  // Apply tensor parallelism (tp) offset for the expert dimension
-  b_mlp2_ptr += 1ll * tp_offset * (size_t)p->hidden_dim;
-  bf16 *b_mlp2_d_buf = (bf16 *)weights->b_mlp2->d_buf;
+  /** b_mlp2 EXPERT PARALLELISM
+    // Apply tensor parallelism (tp) offset for the expert dimension
+    b_mlp2_ptr += 1ll * tp_offset * (size_t)p->hidden_dim;
+    bf16 *b_mlp2_d_buf = (bf16 *)weights->b_mlp2->d_buf;
 
-  for (int l = 0; l < layers_each; l++) {
-    // Calculate the total number of elements for one layer on this device
-    size_t N_ = experts_each * (size_t)p->hidden_dim;
-    bf16 *temp_bf16 = (bf16 *)malloc(N_ * sizeof(bf16));
-    
-    // Convert from FP32 to BF16 on the host
-    for (size_t i = 0; i < N_; i++) {
-      temp_bf16[i] = hip_bfloat16(b_mlp2_ptr[i]);
+    for (int l = 0; l < layers_each; l++) {
+      // Calculate the total number of elements for one layer on this device
+      size_t N_ = experts_each * (size_t)p->hidden_dim;
+      bf16 *temp_bf16 = (bf16 *)malloc(N_ * sizeof(bf16));
+      
+      // Convert from FP32 to BF16 on the host
+      for (size_t i = 0; i < N_; i++) {
+        temp_bf16[i] = hip_bfloat16(b_mlp2_ptr[i]);
+      }
+      
+      // Copy the converted data to the device
+      CHECK_HIP(hipMemcpy(b_mlp2_d_buf, temp_bf16, N_ * sizeof(bf16), hipMemcpyHostToDevice));
+      free(temp_bf16);
+      
+      // Advance host pointer to the start of the next layer's full set of experts
+      b_mlp2_ptr += 1ll * (size_t)p->n_experts * (size_t)p->hidden_dim;
+      // Advance device pointer to the next layer's destination block
+      b_mlp2_d_buf += 1ll * N_;
     }
-    
-    // Copy the converted data to the device
-    CHECK_HIP(hipMemcpy(b_mlp2_d_buf, temp_bf16, N_ * sizeof(bf16), hipMemcpyHostToDevice));
-    free(temp_bf16);
-    
-    // Advance host pointer to the start of the next layer's full set of experts
-    b_mlp2_ptr += 1ll * (size_t)p->n_experts * (size_t)p->hidden_dim;
-    // Advance device pointer to the next layer's destination block
-    b_mlp2_d_buf += 1ll * N_;
-  }
+  */
 
   if (pp_rank + 1 == PP) {
     weights->rms_out_w = new Tensor({(size_t)p->hidden_dim}, w->rms_out_w, device_id);
-    weights->out = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->out, device_id);
+    /** w->out
+      weights->out = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->out, device_id);
+    */
+    {
+      size_t vocab_size = p->vocab_size;
+      size_t hidden_dim = p->hidden_dim;
+
+      weights->out = new Tensor({hidden_dim, vocab_size}, device_id, DType::BF16);
+
+      for (size_t i = 0; i < vocab_size; i++) {
+        for (size_t j = 0; j < hidden_dim; j++) {
+          weights->out->buf[j * vocab_size + i] = w->out[i * hidden_dim + j];
+        }
+      }
+
+      weights->out->to_device(0);
+    }
   } else {
     weights->rms_out_w = nullptr;
     weights->out = nullptr;
@@ -458,6 +615,11 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id) 
 
   // mask needs to be batch because they are not zero_allocated
   rs->mask = new Tensor({BATCH_SIZE, (size_t)p->seq_len, (size_t)p->seq_len}, s->mask, true, device_id);
+
+  // MoE buffers
+  rs->sorted_pair_ids = new TensorI32({(size_t)BATCH_SIZE * p->experts_per_token}, device_id);
+  rs->expert_offsets = new TensorI32({(size_t)(p->n_experts + 1)}, device_id);
+  rs->x_packed = new Tensor({(size_t)BATCH_SIZE * p->experts_per_token, (size_t)p->hidden_dim}, device_id);
 
   rs->cos_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2}, device_id);
   rs->sin_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2}, device_id);
