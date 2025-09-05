@@ -10,7 +10,7 @@
 #define RUN_BATCH
 #define BATCH_SIZE 16
 
-#define PP 2
+#define PP 1
 #define TP 2
 #define REPLICA_SIZE ((PP * TP))
 // #define PRINT_LOGITS
@@ -93,6 +93,10 @@ typedef struct {
   TensorI32 *sorted_pair_ids;  // [batch_size * experts_per_token]
   TensorI32 *expert_offsets;   // [n_experts + 1]
   Tensor *x_packed;            // [batch_size * experts_per_token, hidden_dim]
+  int max_rows;
+
+  // Multi-GPU related
+  Tensor *reduce_temp_buffer;
 } OurRunState;
 
 typedef struct {

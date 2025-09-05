@@ -137,6 +137,58 @@ void moe_block_matmul_style_hip(
   Tensor *x_packed,            // [batch_size * experts_per_token, hidden_dim]
   float clamp_limit, long long layer_offset, hipStream_t stream = 0);
 
+/*  --------------  Start MoE  --------------------  */
+static inline void moe_init_buffers_hip(Tensor *e_agg, Tensor *mlp1_out, Tensor *gate_up,
+                                        Tensor *tb3, TensorI32 *sorted_pair_ids,
+                                        TensorI32 *expert_offsets, Tensor *x_packed, int batch_size,
+                                        int hidden_dim, hipStream_t stream);
+
+static inline void moe_build_offsets_hip(
+  TensorI32 *topk_idx,         // [batch_size, experts_per_token]
+  TensorI32 *sorted_pair_ids,  // [batch_size * experts_per_token]
+  TensorI32 *expert_offsets,   // [n_experts + 1]
+  int batch_size, int experts_per_token, int n_experts, hipStream_t stream);
+
+static inline void moe_pack_inputs_hip(
+  Tensor *x_in,                // [batch_size, hidden_dim]
+  TensorI32 *sorted_pair_ids,  // [batch_size * experts_per_token]
+  Tensor *x_packed,            // [batch_size * experts_per_token, hidden_dim]
+  int batch_size, int hidden_dim, int experts_per_token, hipStream_t stream);
+
+static inline int moe_get_max_rows_per_expert_hip(TensorI32 *expert_offsets, int n_experts,
+                                                  hipStream_t stream);
+
+static inline void moe_mlp1_forward_hip(Tensor *x_packed,  // [total_pairs, hidden_dim]
+                                        Tensor *w_mlp1, Tensor *b_mlp1,
+                                        TensorI32 *expert_offsets,  // [n_experts+1]
+                                        Tensor *mlp1_out,           // [total_pairs, 2*inter_dim]
+                                        long long layer_offset, int n_experts, int hidden_dim,
+                                        int inter_dim, int max_rows_per_expert, int total_pairs,
+                                        hipStream_t stream);
+
+static inline void moe_swiglu_hip(Tensor *mlp1_out,  // [total_pairs, 2*inter_dim]
+                                  Tensor *gate_up,   // [total_pairs, inter_dim]
+                                  int batch_size, int experts_per_token, int inter_dim,
+                                  float clamp_limit, hipStream_t stream);
+
+static inline void moe_mlp2_forward_hip(Tensor *gate_up,  // [total_pairs, inter_dim]
+                                        Tensor *w_mlp2, Tensor *b_mlp2,
+                                        TensorI32 *expert_offsets,  // [n_experts+1]
+                                        Tensor *tb3,                // [total_pairs, hidden_dim]
+                                        bool has_bias, long long layer_offset, int n_experts,
+                                        int inter_dim, int hidden_dim, int max_rows_per_expert,
+                                        int total_pairs, hipStream_t stream);
+
+static inline void moe_scatter_aggregate_hip(
+  Tensor *tb3,                 // [total_pairs, hidden_dim]
+  TensorI32 *sorted_pair_ids,  // [batch_size * experts_per_token]
+  Tensor *topk_v,              // [batch_size, experts_per_token]
+  Tensor *e_agg,               // [batch_size, hidden_dim]
+  TensorI32 *expert_offsets,   // [n_experts+1]
+  int hidden_dim, int experts_per_token, int n_experts, int max_rows_per_expert,
+  hipStream_t stream);
+/*  --------------  End MoE  --------------------  */
+
 static inline void moe_mlp1_batched(Tensor *t, Tensor *w_mlp1, Tensor *b_mlp1, TensorI32 *topk_idx,
                                     Tensor *mlp1_out, bool t_to_device, bool topk_idx_to_device,
                                     long long layer_offset, hipStream_t stream = 0);

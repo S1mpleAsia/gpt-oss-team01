@@ -85,10 +85,36 @@ float *forward_gpu_20b_batched(Config *p, OurTransformerWeights *weights_total,
 
     // moe_agg_batched(rs->tb3, rs->topk_v, rs->e_agg, p->experts_per_token, false);
 
-    moe_block_matmul_style_hip(rs->t, rs->topk_i, rs->topk_v, weights->w_mlp1, weights->b_mlp1,
-                               weights->w_mlp2, weights->b_mlp2, rs->e_agg, rs->mlp1_out,
-                               rs->gate_up, rs->tb3, rs->sorted_pair_ids, rs->expert_offsets,
-                               rs->x_packed, p->swiglu_limit, 1ll * l);
+    int total_pairs = BATCH_SIZE * p->experts_per_token;
+    moe_init_buffers_hip(rs->e_agg, rs->mlp1_out, rs->gate_up, rs->tb3, rs->sorted_pair_ids,
+                         rs->expert_offsets, rs->x_packed, BATCH_SIZE, p->hidden_dim, 0);
+
+    moe_build_offsets_hip(rs->topk_i, rs->sorted_pair_ids, rs->expert_offsets, BATCH_SIZE,
+                          p->experts_per_token, p->n_experts, 0);
+
+    moe_pack_inputs_hip(rs->t, rs->sorted_pair_ids, rs->x_packed, BATCH_SIZE, p->hidden_dim,
+                        p->experts_per_token, 0);
+
+    int max_rows = moe_get_max_rows_per_expert_hip(rs->expert_offsets, p->n_experts, 0);
+    moe_mlp1_forward_hip(rs->x_packed, weights->w_mlp1, weights->b_mlp1, rs->expert_offsets,
+                         rs->mlp1_out, 1ll * l, p->n_experts, p->hidden_dim, p->intermediate_dim,
+                         max_rows, total_pairs, 0);
+
+    moe_swiglu_hip(rs->mlp1_out, rs->gate_up, BATCH_SIZE, p->experts_per_token, p->intermediate_dim,
+                   p->swiglu_limit, 0);
+
+    moe_mlp2_forward_hip(rs->gate_up, weights->w_mlp2, weights->b_mlp2, rs->expert_offsets, rs->tb3,
+                         true, 1ll * l, p->n_experts, p->intermediate_dim, p->hidden_dim, max_rows,
+                         total_pairs, 0);
+
+    moe_scatter_aggregate_hip(rs->tb3, rs->sorted_pair_ids, rs->topk_v, rs->e_agg,
+                              rs->expert_offsets, p->hidden_dim, p->experts_per_token, p->n_experts,
+                              max_rows, 0);
+
+    // moe_block_matmul_style_hip(rs->t, rs->topk_i, rs->topk_v, weights->w_mlp1, weights->b_mlp1,
+    //                            weights->w_mlp2, weights->b_mlp2, rs->e_agg, rs->mlp1_out,
+    //                            rs->gate_up, rs->tb3, rs->sorted_pair_ids, rs->expert_offsets,
+    //                            rs->x_packed, p->swiglu_limit, 1ll * l);
 
     // residual connection
     add_vector_batched(rs->x, rs->e_agg, false, false, false);  // equals residual add

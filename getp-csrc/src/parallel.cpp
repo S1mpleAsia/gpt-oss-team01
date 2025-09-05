@@ -20,8 +20,7 @@ void reduce_broadcast_tb3(Context *ctx, int start_idx, int end_idx, Tensor *tens
   size_t num_elements = tensor->num_elem();
 
   CHECK_HIP(hipSetDevice(leader_gpu_id));
-  float *temp_buffer;
-  CHECK_HIP(hipMalloc(&temp_buffer, num_elements * tensor->get_dtype_size()));
+  float *temp_buffer = (float *)ctx->run_state[leader_idx]->reduce_temp_buffer->d_buf;
 
   const int block_size = 256;
   const int grid_size = (num_elements + block_size - 1) / block_size;
@@ -61,7 +60,7 @@ void reduce_broadcast_tb3(Context *ctx, int start_idx, int end_idx, Tensor *tens
   //   CHECK_HIP(hipStreamWaitEvent(ctx->streams[leader_idx], ctx->events[i], 0));
   // }
 
-  CHECK_HIP(hipFree(temp_buffer));
+  // CHECK_HIP(hipFree(temp_buffer));
 }
 
 void Context::init(Transformer *transformer, const std::vector<int> &assigned_gpu_ids) {
@@ -83,7 +82,7 @@ void Context::init(Transformer *transformer, const std::vector<int> &assigned_gp
   for (int i = 0; i < REPLICA_SIZE; i++) {
     int gpu_id = this->gpu_ids[i];
     CHECK_HIP(hipSetDevice(gpu_id));
-    CHECK_HIP(hipStreamCreate(&this->streams[i]));
+    CHECK_HIP(hipStreamCreateWithFlags(&this->streams[i], hipStreamNonBlocking));
     CHECK_HIP(hipEventCreate(&this->events[i]));
     CHECK_HIP(hipEventCreate(&this->tp_ready_event[i]));
     CHECK_HIP(hipEventCreate(&this->tp_reduce_done_event[i]));
@@ -160,7 +159,6 @@ void Context::destroy() {
     int gpu_id = this->gpu_ids[i];
     CHECK_HIP(hipSetDevice(gpu_id));
 
-    // free run states (chỉ khi bạn đã new trong init)
     if (this->run_state[i]) {
       auto rs = this->run_state[i];
       delete rs->x;
@@ -185,8 +183,12 @@ void Context::destroy() {
       delete rs->key_cache;
       delete rs->value_cache;
       delete rs->mask;
+
+      delete rs->sorted_pair_ids;
+      delete rs->expert_offsets;
+      delete rs->x_packed;
+      delete rs->reduce_temp_buffer;
       delete this->run_state[i];
-      this->run_state[i] = nullptr;
     }
 
     if (this->weights[i]) {
@@ -208,7 +210,6 @@ void Context::destroy() {
       delete w->out;
       delete w->rms_out_w;
       delete this->weights[i];
-      this->weights[i] = nullptr;
     }
 
     delete this->cos_tensor[i];
@@ -296,6 +297,8 @@ void our_init_run_state_120b(Context *ctx, int local_gpu_id) {
   // rs->cos_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2});
   // rs->sin_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2});
 
+  rs->reduce_temp_buffer =
+    new Tensor({(size_t)BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
   // RoPE is computed on Context::init
 }
 
@@ -396,149 +399,161 @@ void our_init_weights_120b(Context *ctx, int local_gpu_id) {
   // Sharding weights MLP1
   float *w_mlp1_stage_base = w->w_mlp1 + 1ll * pp_rank * layers_per_stage * experts_per_gpu * 2 *
                                            p->intermediate_dim * p->hidden_dim;
-  // float *tmp_buffer = (float *)malloc(layers_per_stage * experts_per_gpu * 2 *
-  //                                     sharded_intermediate_dim * p->hidden_dim * sizeof(float));
-
-  // for (int l = 0; l < layers_per_stage; l++) {
-  //   for (int e = 0; e < experts_per_gpu; e++) {
-  //     float *src = w_mlp1_stage_base +
-  //                  1ll * (l * experts_per_gpu + e) * 2 * p->intermediate_dim * p->hidden_dim +
-  //                  1ll * tp_rank * 2 * sharded_intermediate_dim * p->hidden_dim;
-
-  //     float *dst =
-  //       tmp_buffer + 1ll * (l * experts_per_gpu + e) * 2 * sharded_intermediate_dim * p->hidden_dim;
-
-  //     memcpy(dst, src, 2 * sharded_intermediate_dim * p->hidden_dim * sizeof(float));
-  //   }
-  // }
-
-  // weights->w_mlp1 = new Tensor({(size_t)layers_per_stage, (size_t)experts_per_gpu,
-  //                               2 * sharded_intermediate_dim, (size_t)p->hidden_dim},
-  //                              tmp_buffer, stream, DType::BF16);
-  // free(tmp_buffer);
 
   {
-    weights->w_mlp1 = new Tensor({(size_t)layers_per_stage, (size_t)experts_per_gpu,
-                                  2 * sharded_intermediate_dim, (size_t)p->hidden_dim},
-                                 stream, DType::BF16);
-    bf16 *tmp = (bf16 *)malloc(2 * sharded_intermediate_dim * p->hidden_dim * sizeof(bf16));
-    bf16 *dst = (bf16 *)weights->w_mlp1->d_buf;
+    printf("Allocated w_mlp1\n");
+    fflush(stdout);
+    float *tmp_buffer = (float *)malloc(layers_per_stage * experts_per_gpu * 2 *
+                                        sharded_intermediate_dim * p->hidden_dim * sizeof(float));
+
     for (int l = 0; l < layers_per_stage; l++) {
       for (int e = 0; e < experts_per_gpu; e++) {
-        float *src = w_mlp1_stage_base +
-                     1ll * (l * experts_per_gpu + e) * 2 * p->intermediate_dim * p->hidden_dim +
-                     1ll * tp_rank * 2 * sharded_intermediate_dim * p->hidden_dim;
-        for (size_t t = 0; t < 2 * sharded_intermediate_dim * p->hidden_dim; t++) {
-          tmp[t] = bf16(src[t]);
-        }
-        size_t dst_off =
+        size_t offset = 1ll * (l * experts_per_gpu + e) * 2 * p->intermediate_dim * p->hidden_dim;
+        size_t dst_offset =
           1ll * (l * experts_per_gpu + e) * 2 * sharded_intermediate_dim * p->hidden_dim;
-        CHECK_HIP(hipMemcpyAsync(dst + dst_off, tmp,
-                                 2 * sharded_intermediate_dim * p->hidden_dim * sizeof(bf16),
-                                 hipMemcpyHostToDevice, stream));
+        float *src =
+          w_mlp1_stage_base + offset + 1ll * tp_rank * 2 * sharded_intermediate_dim * p->hidden_dim;
+
+        for (int i = 0; i < p->hidden_dim; i++) {
+          for (int j = 0; j < 2 * sharded_intermediate_dim; j++) {
+            tmp_buffer[dst_offset + i * 2 * sharded_intermediate_dim + j] =
+              src[j * p->hidden_dim + i];
+          }
+        }
       }
     }
+
+    weights->w_mlp1 = new Tensor({(size_t)layers_per_stage, (size_t)experts_per_gpu,
+                                  (size_t)p->hidden_dim, 2 * sharded_intermediate_dim},
+                                 tmp_buffer, stream, DType::BF16);
     CHECK_HIP(hipStreamSynchronize(stream));
-    free(tmp);
+    free(tmp_buffer);
   }
+
+  // {
+  //   float *tmp_buffer = (float *)malloc(layers_per_stage * experts_per_gpu * 2 *
+  //                                       sharded_intermediate_dim * p->hidden_dim * sizeof(float));
+
+  //   for (int l = 0; l < layers_per_stage; l++) {
+  //     for (int e = 0; e < experts_per_gpu; e++) {
+  //       float *src = w_mlp1_stage_base +
+  //                    1ll * (l * experts_per_gpu + e) * 2 * p->intermediate_dim * p->hidden_dim +
+  //                    1ll * tp_rank * 2 * sharded_intermediate_dim * p->hidden_dim;
+
+  //       float *dst = tmp_buffer +
+  //                    1ll * (l * experts_per_gpu + e) * 2 * sharded_intermediate_dim * p->hidden_dim;
+
+  //       memcpy(dst, src, 2 * sharded_intermediate_dim * p->hidden_dim * sizeof(float));
+  //     }
+  //   }
+
+  //   weights->w_mlp1 = new Tensor({(size_t)layers_per_stage, (size_t)experts_per_gpu,
+  //                                 2 * sharded_intermediate_dim, (size_t)p->hidden_dim},
+  //                                tmp_buffer, stream, DType::BF16);
+  //   free(tmp_buffer);
+  // }
 
   // Sharding bias MLP1
   float *b_mlp1_stage_base =
     w->b_mlp1 + 1ll * pp_rank * layers_per_stage * experts_per_gpu * 2 * p->intermediate_dim;
-  // tmp_buffer = (float *)malloc(layers_per_stage * experts_per_gpu * 2 * sharded_intermediate_dim *
-  //                              sizeof(float));
-  // for (int l = 0; l < layers_per_stage; l++) {
-  //   for (int e = 0; e < experts_per_gpu; e++) {
-  //     float *src = b_mlp1_stage_base + 1ll * (l * experts_per_gpu + e) * 2 * p->intermediate_dim +
-  //                  1ll * tp_rank * 2 * sharded_intermediate_dim;
-
-  //     float *dst = tmp_buffer + 1ll * (l * experts_per_gpu + e) * 2 * sharded_intermediate_dim;
-  //     memcpy(dst, src, 2 * sharded_intermediate_dim * sizeof(float));
-  //   }
-  // }
-
-  // weights->b_mlp1 =
-  //   new Tensor({(size_t)layers_per_stage, (size_t)experts_per_gpu, 2 * sharded_intermediate_dim},
-  //              tmp_buffer, stream, DType::BF16);
-  // free(tmp_buffer);
 
   {
-    weights->b_mlp1 =
-      new Tensor({(size_t)layers_per_stage, (size_t)experts_per_gpu, 2 * sharded_intermediate_dim},
-                 stream, DType::BF16);
-    bf16 *dst = (bf16 *)weights->b_mlp1->d_buf;
-    bf16 *tmp = (bf16 *)malloc(2 * sharded_intermediate_dim * sizeof(bf16));
+    float *tmp_buffer = (float *)malloc(layers_per_stage * experts_per_gpu * 2 *
+                                        sharded_intermediate_dim * sizeof(float));
     for (int l = 0; l < layers_per_stage; l++) {
       for (int e = 0; e < experts_per_gpu; e++) {
         float *src = b_mlp1_stage_base + 1ll * (l * experts_per_gpu + e) * 2 * p->intermediate_dim +
                      1ll * tp_rank * 2 * sharded_intermediate_dim;
-        for (size_t t = 0; t < 2 * sharded_intermediate_dim; t++) {
-          tmp[t] = hip_bfloat16(src[t]);
-        }
-        size_t dst_off = 1ll * (l * experts_per_gpu + e) * 2 * sharded_intermediate_dim;
-        CHECK_HIP(hipMemcpyAsync(dst + dst_off, tmp, 2 * sharded_intermediate_dim * sizeof(bf16),
-                                 hipMemcpyHostToDevice, stream));
+
+        float *dst = tmp_buffer + 1ll * (l * experts_per_gpu + e) * 2 * sharded_intermediate_dim;
+        memcpy(dst, src, 2 * sharded_intermediate_dim * sizeof(float));
       }
     }
+
+    weights->b_mlp1 =
+      new Tensor({(size_t)layers_per_stage, (size_t)experts_per_gpu, 2 * sharded_intermediate_dim},
+                 tmp_buffer, stream, DType::BF16);
+
     CHECK_HIP(hipStreamSynchronize(stream));
-    free(tmp);
+    free(tmp_buffer);
   }
 
   // Sharding weights MLP2
   float *w_mlp2_stage_base = w->w_mlp2 + 1ll * pp_rank * layers_per_stage * experts_per_gpu *
                                            p->hidden_dim * p->intermediate_dim;
 
-  // tmp_buffer = (float *)malloc(layers_per_stage * experts_per_gpu * sharded_intermediate_dim *
-  //                              p->hidden_dim * sizeof(float));
-
-  // for (int l = 0; l < layers_per_stage; l++) {
-  //   for (int e = 0; e < experts_per_gpu; e++) {
-  //     for (int h = 0; h < p->hidden_dim; h++) {
-  //       float *src = w_mlp2_stage_base +
-  //                    1ll * (l * experts_per_gpu + e) * p->hidden_dim * p->intermediate_dim +
-  //                    1ll * h * p->intermediate_dim + 1ll * tp_rank * sharded_intermediate_dim;
-
-  //       float *dst = tmp_buffer +
-  //                    1ll * (l * experts_per_gpu + e) * p->hidden_dim * sharded_intermediate_dim +
-  //                    1ll * h * sharded_intermediate_dim;
-
-  //       memcpy(dst, src, sharded_intermediate_dim * sizeof(float));
-  //     }
-  //   }
-  // }
-
-  // weights->w_mlp2 = new Tensor({(size_t)layers_per_stage, (size_t)experts_per_gpu,
-  //                               (size_t)p->hidden_dim, sharded_intermediate_dim},
-  //                              tmp_buffer, stream, DType::BF16);
-
-  // free(tmp_buffer);
-
   {
-    weights->w_mlp2 = new Tensor({(size_t)layers_per_stage, (size_t)experts_per_gpu,
-                                  (size_t)p->hidden_dim, sharded_intermediate_dim},
-                                 stream, DType::BF16);
-    bf16 *tmp = (bf16 *)malloc(sharded_intermediate_dim * sizeof(bf16));
-    bf16 *dst = (bf16 *)weights->w_mlp2->d_buf;
-    for (int l = 0; l < layers_per_stage; l++) {
-      for (int e = 0; e < experts_per_gpu; e++) {
-        for (int h = 0; h < p->hidden_dim; h++) {
+    printf("Allocate w_mlp2\n");
+    fflush(stdout);
+    float *tmp_transposed = (float *)malloc(layers_per_stage * experts_per_gpu * p->hidden_dim *
+                                            sharded_intermediate_dim * sizeof(float));
+
+    float *tmp_buffer = (float *)malloc(layers_per_stage * experts_per_gpu * p->hidden_dim *
+                                        sharded_intermediate_dim * sizeof(float));
+
+    for (size_t l = 0; l < layers_per_stage; l++) {
+      for (size_t e = 0; e < experts_per_gpu; e++) {
+        for (size_t h = 0; h < p->hidden_dim; h++) {
           float *src = w_mlp2_stage_base +
                        1ll * (l * experts_per_gpu + e) * p->hidden_dim * p->intermediate_dim +
                        1ll * h * p->intermediate_dim + 1ll * tp_rank * sharded_intermediate_dim;
-          for (size_t t = 0; t < sharded_intermediate_dim; t++) {
-            tmp[t] = bf16(src[t]);
-          }
-          size_t dst_off =
-            1ll * (l * experts_per_gpu + e) * p->hidden_dim * sharded_intermediate_dim +
-            1ll * h * sharded_intermediate_dim;
-          CHECK_HIP(hipMemcpyAsync(dst + dst_off, tmp, sharded_intermediate_dim * sizeof(bf16),
-                                   hipMemcpyHostToDevice, stream));
+
+          float *dst = tmp_buffer +
+                       1ll * (l * experts_per_gpu + e) * p->hidden_dim * sharded_intermediate_dim +
+                       1ll * h * sharded_intermediate_dim;
+
+          memcpy(dst, src, sharded_intermediate_dim * sizeof(float));
         }
       }
     }
+
+    for (size_t l = 0; l < layers_per_stage; l++) {
+      for (size_t e = 0; e < experts_per_gpu; e++) {
+        size_t offset = 1ll * (l * experts_per_gpu + e) * p->hidden_dim * sharded_intermediate_dim;
+        for (size_t i = 0; i < sharded_intermediate_dim; i++) {
+          for (size_t h = 0; h < p->hidden_dim; h++) {
+            tmp_transposed[offset + i * p->hidden_dim + h] =
+              tmp_buffer[offset + h * sharded_intermediate_dim + i];
+          }
+        }
+      }
+    }
+
+    weights->w_mlp2 = new Tensor({(size_t)layers_per_stage, (size_t)experts_per_gpu,
+                                  sharded_intermediate_dim, (size_t)p->hidden_dim},
+                                 tmp_transposed, stream, DType::BF16);
+
     CHECK_HIP(hipStreamSynchronize(stream));
-    free(tmp);
+    free(tmp_buffer);
+    free(tmp_transposed);
   }
+
+  // {
+  //   float *tmp_buffer = (float *)malloc(layers_per_stage * experts_per_gpu *
+  //                                       sharded_intermediate_dim * p->hidden_dim * sizeof(float));
+
+  //   for (int l = 0; l < layers_per_stage; l++) {
+  //     for (int e = 0; e < experts_per_gpu; e++) {
+  //       for (int h = 0; h < p->hidden_dim; h++) {
+  //         float *src = w_mlp2_stage_base +
+  //                      1ll * (l * experts_per_gpu + e) * p->hidden_dim * p->intermediate_dim +
+  //                      1ll * h * p->intermediate_dim + 1ll * tp_rank * sharded_intermediate_dim;
+
+  //         float *dst = tmp_buffer +
+  //                      1ll * (l * experts_per_gpu + e) * p->hidden_dim * sharded_intermediate_dim +
+  //                      1ll * h * sharded_intermediate_dim;
+
+  //         memcpy(dst, src, sharded_intermediate_dim * sizeof(float));
+  //       }
+  //     }
+  //   }
+
+  //   weights->w_mlp2 = new Tensor({(size_t)layers_per_stage, (size_t)experts_per_gpu,
+  //                                 (size_t)p->hidden_dim, sharded_intermediate_dim},
+  //                                tmp_buffer, stream, DType::BF16);
+
+  //   free(tmp_buffer);
+  // }
 
   // Sharding bias MLP2
   float *b_mlp2_stage_base =
@@ -621,7 +636,8 @@ float *forward_gpu_120b(Context *ctx, int *tokens, int pos) {
       // printf("stage %d - pipeline recv\n", current_stage_idx);
     }
 
-    // Attention layers
+// Attention layers
+#pragma omp parallel for num_threads(TP)
     for (int i = start_local_idx; i < end_local_idx; i++) {
       CHECK_HIP(hipSetDevice(ctx->gpu_ids[i]));
       OurRunState *s = ctx->run_state[i];
@@ -686,12 +702,35 @@ float *forward_gpu_120b(Context *ctx, int *tokens, int pos) {
       // topk_softmax(s->router_score, s->topk_v, s->topk_i, false, false, false, ctx->streams[i]);
       // printf("stage %d - Done topk_softmax\n", current_stage_idx);
 
-      moe_mlp1_batched(s->t, w->w_mlp1, w->b_mlp1, s->topk_i, s->mlp1_out, false, false,
-                       local_layer_idx, stream);
+      int total_pairs = BATCH_SIZE * p->experts_per_token;
+      moe_init_buffers_hip(s->e_agg, s->mlp1_out, s->gate_up, s->tb3, s->sorted_pair_ids,
+                           s->expert_offsets, s->x_packed, BATCH_SIZE, p->hidden_dim, stream);
 
-      moe_swiglu_batched(s->mlp1_out, s->gate_up, p->experts_per_token, p->swiglu_limit, stream);
-      moe_mlp2_batched(s->gate_up, w->w_mlp2, w->b_mlp2, s->tb3, s->topk_i, p->experts_per_token,
-                       (i == start_local_idx), local_layer_idx, stream);
+      moe_build_offsets_hip(s->topk_i, s->sorted_pair_ids, s->expert_offsets, BATCH_SIZE,
+                            p->experts_per_token, p->n_experts, stream);
+
+      moe_pack_inputs_hip(s->t, s->sorted_pair_ids, s->x_packed, BATCH_SIZE, p->hidden_dim,
+                          p->experts_per_token, stream);
+
+      s->max_rows = moe_get_max_rows_per_expert_hip(s->expert_offsets, p->n_experts, stream);
+      moe_mlp1_forward_hip(s->x_packed, w->w_mlp1, w->b_mlp1, s->expert_offsets, s->mlp1_out,
+                           local_layer_idx, p->n_experts, p->hidden_dim, p->intermediate_dim / TP,
+                           s->max_rows, total_pairs, stream);
+
+      moe_swiglu_hip(s->mlp1_out, s->gate_up, BATCH_SIZE, p->experts_per_token,
+                     p->intermediate_dim / TP, p->swiglu_limit, stream);
+
+      moe_mlp2_forward_hip(s->gate_up, w->w_mlp2, w->b_mlp2, s->expert_offsets, s->tb3,
+                           (i == start_local_idx), local_layer_idx, p->n_experts,
+                           p->intermediate_dim / TP, p->hidden_dim, s->max_rows, total_pairs,
+                           stream);
+
+      // moe_mlp1_batched(s->t, w->w_mlp1, w->b_mlp1, s->topk_i, s->mlp1_out, false, false,
+      //                  local_layer_idx, stream);
+
+      // moe_swiglu_batched(s->mlp1_out, s->gate_up, p->experts_per_token, p->swiglu_limit, stream);
+      // moe_mlp2_batched(s->gate_up, w->w_mlp2, w->b_mlp2, s->tb3, s->topk_i, p->experts_per_token,
+      //                  (i == start_local_idx), local_layer_idx, stream);
 
       CHECK_HIP(hipEventRecord(ctx->tp_ready_event[i], ctx->streams[i]));
     }
@@ -712,18 +751,16 @@ float *forward_gpu_120b(Context *ctx, int *tokens, int pos) {
     //   }
     // }
 
+#pragma omp parallel for num_threads(TP)
     for (int i = start_local_idx; i < end_local_idx; i++) {
       CHECK_HIP(hipSetDevice(ctx->gpu_ids[i]));
       OurRunState *s = ctx->run_state[i];
       hipStream_t stream = ctx->streams[i];
 
-      // const int k = s->topk_i->num_elem();
-      // const int hidden_dim = s->t->shape[1];
-      // float *tb3_ptr = (float *)s->tb3->d_buf;
-      // const float *topk_v_ptr = (const float *)s->topk_v->d_buf;
-      // float *e_agg_ptr = (float *)s->e_agg->d_buf;
-
-      moe_agg_batched(s->tb3, s->topk_v, s->e_agg, p->experts_per_token, false, stream);
+      moe_scatter_aggregate_hip(s->tb3, s->sorted_pair_ids, s->topk_v, s->e_agg, s->expert_offsets,
+                                p->hidden_dim, p->experts_per_token, p->n_experts, s->max_rows,
+                                stream);
+      // moe_agg_batched(s->tb3, s->topk_v, s->e_agg, p->experts_per_token, false, stream);
       // moe_agg(tb3_ptr, topk_v_ptr, e_agg_ptr, k, hidden_dim, ctx->streams[i]);
 
       add_vector_batched(s->x, s->e_agg, false, false, false, stream);
@@ -774,7 +811,6 @@ float *forward_gpu_120b(Context *ctx, int *tokens, int pos) {
   // classifier_gemm(w_final->out, s_final->x, s_final->logits, false, true,
   //                 ctx->streams[last_local_idx]);
 
-  CHECK_HIP(hipStreamSynchronize(ctx->streams[last_local_idx]));
   s_final->logits->from_device(ctx->streams[last_local_idx]);
 
   return s_final->logits->buf;
