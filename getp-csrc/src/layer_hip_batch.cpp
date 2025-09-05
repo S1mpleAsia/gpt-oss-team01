@@ -323,8 +323,6 @@ void qkv_gemm_batched(Tensor *x,            // Shape: [batch_size, hidden_dim]
   if (x_to_device) {
     x->to_device(stream);
   }
-
-  // --- MODIFIED: Get dimensions based on batched shapes ---
   // Assuming Tensor has a shape member or method, e.g., x->shape[0]
   const int batch_size = x->shape[0];      // M
   const int in_features = x->shape[1];     // K
@@ -370,23 +368,23 @@ void qkv_gemm_batched_v2(Tensor *x,            // Shape: [batch_size, hidden_dim
   const int out_features = qkv->shape[1];  // N
 
   const float *x_ptr = (float *)x->d_buf;
-  const float *w_qkv_ptr = (float *)W_qkv->d_buf + 1ll * layer_offset * out_features * in_features;
-  const float *b_qkv_ptr = (float *)b_qkv->d_buf + 1ll * layer_offset * out_features;
+  const bf16 *w_qkv_ptr = (bf16 *)W_qkv->d_buf + 1ll * layer_offset * out_features * in_features;
+  const bf16 *b_qkv_ptr = (bf16 *)b_qkv->d_buf + 1ll * layer_offset * out_features;
   float *qkv_ptr = (float *)qkv->d_buf;
-
   {
     constexpr int BM = 16;
     constexpr int BN = 128;
     constexpr int BK = 16;
     constexpr int TM = 1;
-    constexpr int TN = 4;
+    constexpr int TN = 8;
 
     const int BLOCK_SIZE_X = BN / TN;
     const int BLOCK_SIZE_Y = BM / TM;
     dim3 block_size(BLOCK_SIZE_X, BLOCK_SIZE_Y);
     dim3 grid_size((out_features + BN - 1) / BN, (batch_size + BM - 1) / BM);
-
-    matmul_kernel<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
+    
+    //printf("qkv gemm v2: M=%d N=%d K=%d\n", batch_size, out_features, in_features);
+    matmul_kernel_bf16<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
       x_ptr, w_qkv_ptr, qkv_ptr, b_qkv_ptr, batch_size, out_features, in_features);
     CHECK_HIP(hipGetLastError());
   }
@@ -952,6 +950,7 @@ void attn_out_project_batched_v2(Tensor *tb,         // Shape: [batch_size, n_at
     dim3 block_size(BLOCK_SIZE_X, BLOCK_SIZE_Y);
     dim3 grid_size((out_features + BN - 1) / BN, (batch_size + BM - 1) / BM);
 
+    //printf("attn out gemm: %d %d %d\n", batch_size, out_features, in_features);
     matmul_kernel<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
       tb_ptr, w_o_ptr, y_ptr, b_o_ptr, batch_size, out_features, in_features);
     CHECK_HIP(hipGetLastError());
@@ -1542,6 +1541,7 @@ void classifier_gemm_batched_v2(const Tensor *W_out,  // Shape: [hidden_dim, voc
     dim3 block_size(BLOCK_SIZE_X, BLOCK_SIZE_Y);
     dim3 grid_size((vocab_size + BN - 1) / BN, (batch_size + BM - 1) / BM);
 
+    //printf("classifier gemm: %d %d %d \n", batch_size, vocab_size, hidden_dim);
     matmul_kernel_bf16<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
       x_ptr, w_out_ptr, logits_buf, nullptr, batch_size, vocab_size, hidden_dim);
     CHECK_HIP(hipGetLastError());

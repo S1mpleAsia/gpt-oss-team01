@@ -17,36 +17,58 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   //               ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * (size_t)p->head_dim,
   //               (size_t)p->hidden_dim},
   //              w->w_qkv);
+    {
+        {
+            printf("Starting alloc w_qkv\n");
+            fflush(stdout);
+            size_t n_layers = p->n_layers;
+            size_t n_heads = p->n_attn_heads + 2 * p->n_kv_heads;
+            size_t head_dim = p->head_dim;
+            size_t hidden_dim = p->hidden_dim;
+            size_t out_dim = n_heads * head_dim;
 
-  {
-    size_t n_layers = p->n_layers;
-    size_t n_heads = p->n_attn_heads + 2 * p->n_kv_heads;
-    size_t head_dim = p->head_dim;
-    size_t hidden_dim = p->hidden_dim;
+            // 1. Allocate the final Tensor on the device with the transposed shape and BF16 type
+            weights->w_qkv = new Tensor({n_layers, hidden_dim, out_dim}, 0, DType::BF16);
 
-    weights->w_qkv = new Tensor({n_layers, hidden_dim, n_heads * head_dim});
+            // 2. Allocate a temporary host buffer for one layer's worth of data
+            size_t tmp_elems = hidden_dim * out_dim;
+            bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
+            
+            // Get a direct pointer to the device buffer
+            bf16 *d_buf = (bf16 *)(weights->w_qkv->d_buf);
 
-    for (size_t l = 0; l < n_layers; l++) {
-      for (size_t i = 0; i < n_heads * head_dim; i++) {
-        for (size_t j = 0; j < hidden_dim; j++) {
-          // hoán vị 2 chiều cuối
-          weights->w_qkv
-            ->buf[l * (hidden_dim * n_heads * head_dim) + j * (n_heads * head_dim) + i] =
-            w->w_qkv[l * ((n_heads * head_dim) * hidden_dim) + i * hidden_dim + j];
+            // 3. Loop over each layer to process it individually
+            for (size_t l = 0; l < n_layers; l++) {
+            
+            // 4. Transpose the last two dimensions and convert from FP32 to BF16
+            //    Original layout: [out_dim, hidden_dim]
+            //    New layout:      [hidden_dim, out_dim]
+            for (size_t i = 0; i < out_dim; i++) {
+                for (size_t j = 0; j < hidden_dim; j++) {
+                float value = w->w_qkv[l * (out_dim * hidden_dim) + i * hidden_dim + j];
+                tmp[j * out_dim + i] = bf16(value);
+                }
+            }
+
+            // 5. Copy the reordered and converted layer from host to device
+            size_t d_offset = l * tmp_elems;
+            CHECK_HIP(hipMemcpyAsync(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16),
+                                    hipMemcpyHostToDevice, 0));
+            }
+
+            // 6. Wait for all copies to finish and clean up the host buffer
+            CHECK_HIP(hipStreamSynchronize(0));
+            free(tmp);
+            
+            printf("End alloc w_qkv\n");
+            fflush(stdout);
         }
-      }
+         weights->b_qkv = new Tensor({(size_t)p->n_layers, ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim},
+            w->b_qkv, 0, DType::BF16);
     }
-
-    weights->w_qkv->to_device(0);
-  }
-
-  weights->b_qkv = new Tensor(
-    {(size_t)p->n_layers, ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim},
-    w->b_qkv);
-
-  // weights->w_o =
-  //   new Tensor({(size_t)p->n_layers, (size_t)p->hidden_dim, (size_t)p->n_attn_heads * p->head_dim},
-  //              w->w_o);
+//   weights->w_o =
+//     new Tensor({(size_t)p->n_layers, (size_t)p->hidden_dim, (size_t)p->n_attn_heads * p->head_dim},
+//                w->w_o);
   {
     size_t n_layers = p->n_layers;
     size_t hidden_dim = p->hidden_dim;
@@ -324,3 +346,4 @@ void our_free(OurTransformerWeights *weights, OurRunState *rs) {
     fprintf(stderr, "Finish everything id %d\n", i);
   }
 }
+

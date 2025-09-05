@@ -5,6 +5,7 @@
 #include "src/layer.cpp"
 #include "src/layer_hip.cpp"
 #include "src/layer_hip_batch.cpp"
+#include "src/flash_attn_hip.cpp"
 #include "src/model.cpp"
 #include "src/alloc.cpp"
 #include "src/utils.cpp"
@@ -19,7 +20,7 @@
 
 Context context[DP_120B];
 
-bool multi_gpu = true;
+bool multi_gpu = false;
 long long getp_generate_120b(Context *context, Tokenizer *tokenizer, Sampler *sampler,
                              const char *input_seq, int *output_tokens, int steps);
 
