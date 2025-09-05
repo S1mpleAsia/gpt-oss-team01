@@ -323,8 +323,6 @@ void qkv_gemm_batched(Tensor *x,            // Shape: [batch_size, hidden_dim]
   if (x_to_device) {
     x->to_device(stream);
   }
-
-  // --- MODIFIED: Get dimensions based on batched shapes ---
   // Assuming Tensor has a shape member or method, e.g., x->shape[0]
   const int batch_size = x->shape[0];      // M
   const int in_features = x->shape[1];     // K
@@ -374,7 +372,6 @@ void qkv_gemm_batched_v2(Tensor *x,            // Shape: [batch_size, hidden_dim
     (const bf16 *)W_qkv->d_buf + 1ll * layer_offset * out_features * in_features;
   const bf16 *b_qkv_ptr = (const bf16 *)b_qkv->d_buf + 1ll * layer_offset * out_features;
   float *qkv_ptr = (float *)qkv->d_buf;
-
   {
     constexpr int BM = 16;
     constexpr int BN = 128;

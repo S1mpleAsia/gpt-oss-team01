@@ -34,7 +34,8 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
             ->buf[l * (hidden_dim * n_heads * head_dim) + j * (n_heads * head_dim) + i] =
             w->w_qkv[l * ((n_heads * head_dim) * hidden_dim) + i * hidden_dim + j];
         }
-      }
+         weights->b_qkv = new Tensor({(size_t)p->n_layers, ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim},
+            w->b_qkv, 0, DType::BF16);
     }
 
     weights->w_qkv->to_device(0);
@@ -324,3 +325,4 @@ void our_free(OurTransformerWeights *weights, OurRunState *rs) {
     fprintf(stderr, "Finish everything id %d\n", i);
   }
 }
+
