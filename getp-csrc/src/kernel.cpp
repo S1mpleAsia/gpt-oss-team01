@@ -758,7 +758,8 @@ static inline void moe_mlp2_forward(Tensor *gate_up,  // [total_pairs, inter_dim
                                     Tensor *tb3,                // [total_pairs, hidden_dim]
                                     bool has_bias, long long layer_offset, int n_experts,
                                     int inter_dim, int hidden_dim, int max_rows_per_expert,
-                                    int total_pairs, hipStream_t stream) {
+                                    int total_pairs, hipStream_t stream
+) {
   const bf16 *w2_ptr =
     (const bf16 *)w_mlp2->d_buf + (size_t)layer_offset * n_experts * inter_dim * hidden_dim;
   const bf16 *b2_ptr =

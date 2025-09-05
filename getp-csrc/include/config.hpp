@@ -19,7 +19,7 @@
 #else
   #define DP 1
   #define PP 2
-  #define TP 1
+  #define TP 2
 #endif
 #define TOTAL_GPUS_NEEDED ((DP) * (PP) * (TP))
 #define TOTAL_PIPELINES ((PP) * (TP))
@@ -70,6 +70,7 @@ typedef struct {
   Tensor *tb;            // (head_dim * n_attn_heads, )
   Tensor *tb2;           // (hidden_dim, )
   Tensor *tb3;           // (n_experts, hidden_dim)
+  Tensor *tb3_buf;
   Tensor *router_score;  // router score (n_experts, )
   Tensor *topk_v;        // topk expert weights (experts_per_token, )
   TensorI32 *topk_i;     // topk expert indices (experts_per_token, )
@@ -120,6 +121,12 @@ typedef struct {
   pthread_barrier_t *tp_barrier;
 } OnePathInsideArgs;
 
+typedef struct {
+  hipEvent_t *tp_ready;
+  hipEvent_t *tp_finish;
+  hipEvent_t *pp_sync;
+} hipTotalEvents_t;
+
 OurTransformerWeights *weights;
 OurRunState *rs;
 
@@ -130,4 +137,4 @@ Sampler *public_sampler;
 Requests *public_requests;
 
 hipStream_t *total_streams;
-hipEvent_t *total_events;
+hipTotalEvents_t *total_events;

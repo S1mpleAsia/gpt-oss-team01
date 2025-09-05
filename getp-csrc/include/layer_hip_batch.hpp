@@ -59,6 +59,8 @@ void qkv_split_rope_fused(Tensor *qkv_out,  // Shape: [batch_size, (n_q + 2*n_kv
                           int head_dim, int n_q, int n_kv, int pos, long long layer_offset,
                           hipStream_t stream = 0);
 
+__global__ void add_vector_kernel_batched(float *y, const float *b, int len);
+
 void add_vector_batched(Tensor *y,  // Shape: [batch_size, hidden_dim]
                         Tensor *b,  // Shape: [batch_size, hidden_dim]
                         bool y_to_device, bool b_to_device, bool y_from_device,

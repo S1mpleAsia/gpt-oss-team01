@@ -38,7 +38,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   weights = new OurTransformerWeights[TOTAL_GPUS_NEEDED];
   rs = new OurRunState[TOTAL_GPUS_NEEDED];
   total_streams = new hipStream_t[TOTAL_GPUS_NEEDED];
-  total_events = new hipEvent_t[TOTAL_GPUS_NEEDED];
+  total_events = new hipTotalEvents_t;
 
   our_init(transformer, weights, rs, total_streams, total_events);
 

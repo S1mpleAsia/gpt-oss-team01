@@ -250,7 +250,7 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id) 
 
 void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *weights, int device_id) {
   size_t layers_each = p->n_layers / PP;
-  size_t experts_each = p->n_experts / TP;
+  size_t experts_each = p->n_experts / 1;
 
   int tp_rank = device_id % TP;
   int pp_rank = (device_id % TOTAL_PIPELINES) / TP;
@@ -365,11 +365,11 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
     w_mlp1_ptr += tp_rank * (2 * shard_dim) * hidden_dim; // offset shard_dim;
 
-    size_t l_offset = 1ll * n_experts * hidden_dim * 2 * inter_dim;
-    size_t e_offset = 1ll * hidden_dim * 2 * inter_dim;
+    size_t l_offset = 1ll * n_experts * (2 * inter_dim) * hidden_dim;
+    size_t e_offset = 1ll * (2 * inter_dim) * hidden_dim;
 
-    size_t l_offset_d = 1ll * n_experts * hidden_dim * 2 * shard_dim;
-    size_t e_offset_d = 1ll * hidden_dim * 2 * shard_dim;
+    size_t l_offset_d = 1ll * n_experts * hidden_dim * (2 * shard_dim);
+    size_t e_offset_d = 1ll * hidden_dim * (2 * shard_dim);
 
     for (size_t l = 0; l < n_layers; l++) {
       for (size_t e = 0; e < n_experts; e++) {
@@ -516,13 +516,13 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
     bf16 *d_buf = (bf16 *)(weights->w_mlp2->d_buf);
 
-    w_mlp2_ptr += 1ll * tp_rank * shard_dim * hidden_dim; // offset shard_dim;
+    w_mlp2_ptr += 1ll * tp_rank * shard_dim; // offset shard_dim;
 
     size_t l_offset = 1ll * n_experts * hidden_dim * inter_dim;
     size_t e_offset = 1ll * hidden_dim * inter_dim;
 
-    size_t l_offset_d = 1ll * n_experts * hidden_dim * shard_dim;
-    size_t e_offset_d = 1ll * hidden_dim * shard_dim;
+    size_t l_offset_d = 1ll * n_experts * shard_dim * hidden_dim;
+    size_t e_offset_d = 1ll * shard_dim * hidden_dim;
 
     for (size_t l = 0; l < n_layers; l++) {
       for (size_t e = 0; e < n_experts; e++) {
@@ -642,6 +642,11 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id) 
   rs->tb2 = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, device_id);
 
   rs->tb3 = new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, device_id);
+  if (device_id % TP == 0) {
+    rs->tb3_buf = new Tensor({TP, BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, device_id);
+  } else {
+    rs->tb3_buf = nullptr;
+  }
 
   rs->router_score = new Tensor({BATCH_SIZE, (size_t)p->n_experts}, device_id);
   rs->topk_v = new Tensor({BATCH_SIZE, (size_t)p->experts_per_token}, device_id);
@@ -658,10 +663,11 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id) 
 
   rs->e_agg = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, device_id);
   if (device_id % TP == 0) {
-    rs->e_agg_buf = new Tensor({TP, BATCH_SIZE, (size_t)p->hidden_dim}, device_id);
+    rs->e_agg_buf = nullptr;
   } else {
     rs->e_agg_buf = nullptr;
   }
+
   rs->qkv = new Tensor(
     {BATCH_SIZE, ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim}, device_id);
   rs->q = new Tensor({BATCH_SIZE, (size_t)p->n_attn_heads * p->head_dim}, device_id);
@@ -690,16 +696,22 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id) 
 
 #endif
 
-void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunState *rs, hipStream_t *total_streams, hipEvent_t *total_events) {
+void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunState *rs, hipStream_t *total_streams, hipTotalEvents_t *total_events) {
   Config *p = &transformer->config;
   TransformerWeights *w = &transformer->weights;
   RunState *s = &transformer->state;
+  
+  total_events->tp_ready = new hipEvent_t[TOTAL_GPUS_NEEDED];
+  total_events->tp_finish = new hipEvent_t[TOTAL_GPUS_NEEDED];
+  total_events->pp_sync = new hipEvent_t[TOTAL_GPUS_NEEDED];
 
   for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
     CHECK_HIP(hipSetDevice(i));
     
     CHECK_HIP(hipStreamCreate(&total_streams[i]));
-    CHECK_HIP(hipEventCreate(&total_events[i]));
+    CHECK_HIP(hipEventCreate(&(total_events->tp_ready[i])));
+    CHECK_HIP(hipEventCreate(&(total_events->tp_finish[i])));
+    CHECK_HIP(hipEventCreate(&(total_events->pp_sync[i])));
 
     our_init_weights(w, p, &weights[i], i);
     our_init_run_state(s, p, &rs[i], i);
@@ -754,17 +766,23 @@ void our_free_each(OurTransformerWeights *weights, OurRunState *rs) {
   if (rs->sin_tensor) delete rs->sin_tensor;
 }
 
-void our_free(OurTransformerWeights *weights, OurRunState *rs, hipStream_t *total_streams, hipEvent_t *total_events) {
+void our_free(OurTransformerWeights *weights, OurRunState *rs, hipStream_t *total_streams, hipTotalEvents_t *total_events) {
   for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
     fprintf(stderr, "Freeing weights and run state of id %d\n", i);
 
     CHECK_HIP(hipSetDevice(i));
     CHECK_HIP(hipStreamDestroy(total_streams[i]));
-    CHECK_HIP(hipEventDestroy(total_events[i]));
+    CHECK_HIP(hipEventDestroy(total_events->tp_ready[i]));
+    CHECK_HIP(hipEventDestroy(total_events->tp_finish[i]));
+    CHECK_HIP(hipEventDestroy(total_events->pp_sync[i]));
 
     our_free_each(&weights[i], &rs[i]);
 
     fprintf(stderr, "Finish freeing weights and run state of id %d, moving on to actual pointer\n", i);
     fprintf(stderr, "Finish everything id %d\n", i);
   }
+  
+  delete total_events->tp_ready;
+  delete total_events->tp_finish;
+  delete total_events->pp_sync;
 }
