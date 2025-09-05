@@ -24,7 +24,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     size_t head_dim = p->head_dim;
     size_t hidden_dim = p->hidden_dim;
 
-    weights->w_qkv = new Tensor({n_layers, hidden_dim, n_heads * head_dim});
+    weights->w_qkv = new Tensor({n_layers, hidden_dim, n_heads * head_dim}, 0, DType::BF16);
 
     for (size_t l = 0; l < n_layers; l++) {
       for (size_t i = 0; i < n_heads * head_dim; i++) {
@@ -42,7 +42,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
   weights->b_qkv = new Tensor(
     {(size_t)p->n_layers, ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim},
-    w->b_qkv);
+    w->b_qkv, 0, DType::BF16);
 
   // weights->w_o =
   //   new Tensor({(size_t)p->n_layers, (size_t)p->hidden_dim, (size_t)p->n_attn_heads * p->head_dim},
@@ -54,7 +54,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     size_t head_dim = p->head_dim;
 
     // Tạo tensor với shape transposed
-    weights->w_o = new Tensor({n_layers, n_heads * head_dim, hidden_dim});
+    weights->w_o = new Tensor({n_layers, n_heads * head_dim, hidden_dim}, 0, DType::BF16);
 
     for (size_t l = 0; l < n_layers; l++) {
       for (size_t i = 0; i < hidden_dim; i++) {
@@ -68,7 +68,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     weights->w_o->to_device(0);
   }
 
-  weights->b_o = new Tensor({(size_t)p->n_layers, (size_t)p->hidden_dim}, w->b_o);
+  weights->b_o = new Tensor({(size_t)p->n_layers, (size_t)p->hidden_dim}, w->b_o, 0, DType::BF16);
 
   // Tensor *attn_sinks; // (n_layers, n_attn_heads)
   weights->attn_sinks = new Tensor({(size_t)p->n_layers, (size_t)p->n_attn_heads}, w->attn_sinks);

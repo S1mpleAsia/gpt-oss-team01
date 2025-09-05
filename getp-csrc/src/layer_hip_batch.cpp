@@ -2,7 +2,7 @@
 #include <cmath>
 #include <cfloat>
 #include "kernel.cpp"
-#include <rocblas/rocblas.h>
+// #include "matrix_core.cpp"
 
 #define DEFAULT_BLOCK_SIZE 256
 
@@ -370,26 +370,42 @@ void qkv_gemm_batched_v2(Tensor *x,            // Shape: [batch_size, hidden_dim
   const int out_features = qkv->shape[1];  // N
 
   const float *x_ptr = (float *)x->d_buf;
-  const float *w_qkv_ptr = (float *)W_qkv->d_buf + 1ll * layer_offset * out_features * in_features;
-  const float *b_qkv_ptr = (float *)b_qkv->d_buf + 1ll * layer_offset * out_features;
+  const bf16 *w_qkv_ptr =
+    (const bf16 *)W_qkv->d_buf + 1ll * layer_offset * out_features * in_features;
+  const bf16 *b_qkv_ptr = (const bf16 *)b_qkv->d_buf + 1ll * layer_offset * out_features;
   float *qkv_ptr = (float *)qkv->d_buf;
 
   {
     constexpr int BM = 16;
     constexpr int BN = 128;
-    constexpr int BK = 16;
-    constexpr int TM = 1;
-    constexpr int TN = 4;
+    constexpr int BK = 32;
+    constexpr int TM = 16;
+    constexpr int TN = 16;
+    constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 
-    const int BLOCK_SIZE_X = BN / TN;
-    const int BLOCK_SIZE_Y = BM / TM;
-    dim3 block_size(BLOCK_SIZE_X, BLOCK_SIZE_Y);
-    dim3 grid_size((out_features + BN - 1) / BN, (batch_size + BM - 1) / BM);
+    dim3 block_size(blockDim);
+    dim3 grid_size((out_features + BN - 1) / BN, ((batch_size + BM - 1) / BM));
 
-    matmul_kernel<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
+    gemm_mfma<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size>>>(
       x_ptr, w_qkv_ptr, qkv_ptr, b_qkv_ptr, batch_size, out_features, in_features);
-    CHECK_HIP(hipGetLastError());
   }
+
+  // {
+  //   constexpr int BM = 16;
+  //   constexpr int BN = 128;
+  //   constexpr int BK = 16;
+  //   constexpr int TM = 1;
+  //   constexpr int TN = 4;
+
+  //   const int BLOCK_SIZE_X = BN / TN;
+  //   const int BLOCK_SIZE_Y = BM / TM;
+  //   dim3 block_size(BLOCK_SIZE_X, BLOCK_SIZE_Y);
+  //   dim3 grid_size((out_features + BN - 1) / BN, (batch_size + BM - 1) / BM);
+
+  //   matmul_kernel<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
+  //     x_ptr, w_qkv_ptr, qkv_ptr, b_qkv_ptr, batch_size, out_features, in_features);
+  //   CHECK_HIP(hipGetLastError());
+  // }
 
   if (qkv_from_device) {
     qkv->from_device(stream);
@@ -934,8 +950,8 @@ void attn_out_project_batched_v2(Tensor *tb,         // Shape: [batch_size, n_at
   const int in_features = tb->shape[1];  // n_attn_heads * head_dim
   const int out_features = y->shape[1];  // hidden_dim
 
-  const float *w_o_ptr = (float *)W_o->d_buf + 1ll * layer_offset * out_features * in_features;
-  const float *b_o_ptr = (float *)b_o->d_buf + 1ll * layer_offset * out_features;
+  const bf16 *w_o_ptr = (const bf16 *)W_o->d_buf + 1ll * layer_offset * out_features * in_features;
+  const bf16 *b_o_ptr = (const bf16 *)b_o->d_buf + 1ll * layer_offset * out_features;
 
   const float *tb_ptr = (float *)tb->d_buf;
   float *y_ptr = (float *)y->d_buf;
@@ -943,19 +959,34 @@ void attn_out_project_batched_v2(Tensor *tb,         // Shape: [batch_size, n_at
   {
     constexpr int BM = 16;
     constexpr int BN = 128;
-    constexpr int BK = 16;
-    constexpr int TM = 1;
-    constexpr int TN = 4;
+    constexpr int BK = 32;
+    constexpr int TM = 16;
+    constexpr int TN = 16;
+    constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 
-    const int BLOCK_SIZE_X = BN / TN;
-    const int BLOCK_SIZE_Y = BM / TM;
-    dim3 block_size(BLOCK_SIZE_X, BLOCK_SIZE_Y);
-    dim3 grid_size((out_features + BN - 1) / BN, (batch_size + BM - 1) / BM);
+    dim3 block_size(blockDim);
+    dim3 grid_size((out_features + BN - 1) / BN, ((batch_size + BM - 1) / BM));
 
-    matmul_kernel<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
+    gemm_mfma<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size>>>(
       tb_ptr, w_o_ptr, y_ptr, b_o_ptr, batch_size, out_features, in_features);
-    CHECK_HIP(hipGetLastError());
   }
+
+  // {
+  //   constexpr int BM = 16;
+  //   constexpr int BN = 128;
+  //   constexpr int BK = 16;
+  //   constexpr int TM = 1;
+  //   constexpr int TN = 4;
+
+  //   const int BLOCK_SIZE_X = BN / TN;
+  //   const int BLOCK_SIZE_Y = BM / TM;
+  //   dim3 block_size(BLOCK_SIZE_X, BLOCK_SIZE_Y);
+  //   dim3 grid_size((out_features + BN - 1) / BN, (batch_size + BM - 1) / BM);
+
+  //   matmul_kernel<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
+  //     tb_ptr, w_o_ptr, y_ptr, b_o_ptr, batch_size, out_features, in_features);
+  //   CHECK_HIP(hipGetLastError());
+  // }
 
   if (y_from_device) {
     y->from_device(stream);
@@ -1613,20 +1644,35 @@ void classifier_gemm_batched_v2(const Tensor *W_out,  // Shape: [hidden_dim, voc
 
   {
     constexpr int BM = 16;
-    constexpr int BN = 256;
-    constexpr int BK = 16;
-    constexpr int TM = 2;
-    constexpr int TN = 8;
+    constexpr int BN = 128;
+    constexpr int BK = 32;
+    constexpr int TM = 16;
+    constexpr int TN = 16;
+    constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 
-    const int BLOCK_SIZE_X = BN / TN;
-    const int BLOCK_SIZE_Y = BM / TM;
-    dim3 block_size(BLOCK_SIZE_X, BLOCK_SIZE_Y);
-    dim3 grid_size((vocab_size + BN - 1) / BN, (batch_size + BM - 1) / BM);
+    dim3 block_size(blockDim);
+    dim3 grid_size((vocab_size + BN - 1) / BN, ((batch_size + BM - 1) / BM));
 
-    matmul_kernel_bf16<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
+    gemm_mfma<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size>>>(
       x_ptr, w_out_ptr, logits_buf, nullptr, batch_size, vocab_size, hidden_dim);
-    CHECK_HIP(hipGetLastError());
   }
+
+  // {
+  //   constexpr int BM = 16;
+  //   constexpr int BN = 256;
+  //   constexpr int BK = 16;
+  //   constexpr int TM = 2;
+  //   constexpr int TN = 8;
+
+  //   const int BLOCK_SIZE_X = BN / TN;
+  //   const int BLOCK_SIZE_Y = BM / TM;
+  //   dim3 block_size(BLOCK_SIZE_X, BLOCK_SIZE_Y);
+  //   dim3 grid_size((vocab_size + BN - 1) / BN, (batch_size + BM - 1) / BM);
+
+  //   matmul_kernel_bf16<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
+  //     x_ptr, w_out_ptr, logits_buf, nullptr, batch_size, vocab_size, hidden_dim);
+  //   CHECK_HIP(hipGetLastError());
+  // }
 
   if (logits_from_device) {
     logits->from_device(stream);

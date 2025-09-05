@@ -19,7 +19,7 @@
 
 Context context[DP_120B];
 
-bool multi_gpu = true;
+bool multi_gpu = false;
 long long getp_generate_120b(Context *context, Tokenizer *tokenizer, Sampler *sampler,
                              const char *input_seq, int *output_tokens, int steps);
 

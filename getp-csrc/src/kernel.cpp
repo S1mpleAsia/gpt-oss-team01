@@ -1,5 +1,6 @@
 #include <hip/hip_runtime.h>
 #include "../include/tensor.hpp"
+#include "matrix_core.cpp"
 
 template <int BM = 16, int BN = 128, int BK = 16, int TM = 2, int TN = 8>
 __global__ void matmul_kernel(const float *__restrict__ A, const float *__restrict__ B,
@@ -727,13 +728,29 @@ static inline void moe_mlp1_forward(Tensor *x_packed,  // [total_pairs, hidden_d
   const bf16 *b1_ptr =
     (const bf16 *)b_mlp1->d_buf + (size_t)layer_offset * n_experts * 2 * inter_dim;
 
-  constexpr int BM = 16, BN = 128, BK = 16, TM = 2, TN = 8;
-  dim3 block_size(BN / TN, BM / TM);
-  dim3 grid_size((2 * inter_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
+  // constexpr int BM = 16, BN = 128, BK = 16, TM = 2, TN = 8;
+  // dim3 block_size(BN / TN, BM / TM);
+  // dim3 grid_size((2 * inter_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
 
-  matmul_kernel_bf16_moe<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
-    (const float *)x_packed->d_buf, w1_ptr, (float *)mlp1_out->d_buf, b1_ptr, expert_offsets->d_buf,
-    total_pairs, 2 * inter_dim, hidden_dim);
+  // matmul_kernel_bf16_moe<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
+  //   (const float *)x_packed->d_buf, w1_ptr, (float *)mlp1_out->d_buf, b1_ptr, expert_offsets->d_buf,
+  //   total_pairs, 2 * inter_dim, hidden_dim);
+
+  {
+    constexpr int BM = 16;
+    constexpr int BN = 128;
+    constexpr int BK = 32;
+    constexpr int TM = 16;
+    constexpr int TN = 16;
+    constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
+
+    dim3 block_size(blockDim);
+    dim3 grid_size((2 * inter_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
+
+    gemm_mfma_moe<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+      (const float *)x_packed->d_buf, w1_ptr, (float *)mlp1_out->d_buf, b1_ptr,
+      expert_offsets->d_buf, total_pairs, 2 * inter_dim, hidden_dim);
+  }
 }
 
 // 5) SwiGLU (interleaved) & clamp
@@ -766,13 +783,29 @@ static inline void moe_mlp2_forward(Tensor *gate_up,  // [total_pairs, inter_dim
     has_bias ? (const bf16 *)b_mlp2->d_buf + (size_t)layer_offset * n_experts * hidden_dim
              : nullptr;
 
-  constexpr int BM = 16, BN = 128, BK = 16, TM = 2, TN = 8;
-  dim3 block_size(BN / TN, BM / TM);
-  dim3 grid_size((hidden_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
+  // constexpr int BM = 16, BN = 128, BK = 16, TM = 2, TN = 8;
+  // dim3 block_size(BN / TN, BM / TM);
+  // dim3 grid_size((hidden_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
 
-  matmul_kernel_bf16_moe<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
-    (const float *)gate_up->d_buf, w2_ptr, (float *)tb3->d_buf, b2_ptr, expert_offsets->d_buf,
-    total_pairs, hidden_dim, inter_dim);
+  // matmul_kernel_bf16_moe<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
+  //   (const float *)gate_up->d_buf, w2_ptr, (float *)tb3->d_buf, b2_ptr, expert_offsets->d_buf,
+  //   total_pairs, hidden_dim, inter_dim);
+
+  {
+    constexpr int BM = 16;
+    constexpr int BN = 128;
+    constexpr int BK = 32;
+    constexpr int TM = 16;
+    constexpr int TN = 16;
+    constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
+
+    dim3 block_size(blockDim);
+    dim3 grid_size((hidden_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
+
+    gemm_mfma_moe<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+      (const float *)gate_up->d_buf, w2_ptr, (float *)tb3->d_buf, b2_ptr, expert_offsets->d_buf,
+      total_pairs, hidden_dim, inter_dim);
+  }
 }
 
 // 7) scatter-add có scale theo topk_v -> e_agg
