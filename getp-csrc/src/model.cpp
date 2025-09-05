@@ -47,7 +47,7 @@ float *forward_gpu_20b_batched(Config *p, OurTransformerWeights *weights_total,
     int kv_mul = p->n_attn_heads / p->n_kv_heads;  // integer multiplier for GQA
 
     // FIX single_query_attn_batched later
-    single_query_attn_batched(rs->q, rs->key_cache, rs->value_cache, rs->mask, weights->attn_sinks,
+    single_query_attn_flash_batched(rs->q, rs->key_cache, rs->value_cache, rs->mask, weights->attn_sinks,
                               rs->tb, p->head_dim, p->n_attn_heads, kv_mul, kv_dim, p->seq_len,
                               p->sliding_window, pos, 1ll * l, false, false, false, false, false);
 
@@ -125,7 +125,6 @@ float *forward_gpu_20b_batched(Config *p, OurTransformerWeights *weights_total,
 
   // classifier into logits
   classifier_gemm_batched_v2(weights->out, rs->x, rs->logits, false, true);
-
   return rs->logits->buf;
 }
 
@@ -242,6 +241,7 @@ float *forward_gpu_20b(Config *p, OurTransformerWeights *weights, OurRunState *r
   // classifier into logits
   classifier_gemm(weights->out, rs->x, rs->logits, false, true);
 
+  
   return rs->logits->buf;
 }
 
