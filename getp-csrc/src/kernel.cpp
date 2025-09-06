@@ -1,8 +1,7 @@
-#include <hip/hip_runtime.h>
-#include "../include/tensor.hpp"
-#include "matrix_core.cpp"
+#include "../include/kernel.hpp"
+// #include "matrix_core.cpp"
 
-template <int BM = 16, int BN = 128, int BK = 16, int TM = 2, int TN = 8>
+template <int BM, int BN, int BK, int TM, int TN>
 __global__ void matmul_kernel(const float *__restrict__ A, const float *__restrict__ B,
                               float *__restrict__ C, const float *bias, int M, int N, int K) {
   const int VEC_SIZE = 4;
@@ -118,7 +117,7 @@ __global__ void matmul_kernel(const float *__restrict__ A, const float *__restri
   }
 }
 
-template <int BM = 16, int BN = 128, int BK = 16, int TM = 2, int TN = 8>
+template <int BM, int BN, int BK, int TM, int TN>
 __global__ void matmul_kernel_bf16(const float *__restrict__ A, const bf16 *__restrict__ B,
                                    float *__restrict__ C, const bf16 *bias, int M, int N, int K) {
   const int VEC_SIZE = 4;

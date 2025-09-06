@@ -95,11 +95,31 @@ void Tensor::reshape(const vector<int> &shape_) {
 }
 
 void Tensor::printShape(const std::string &descr) const {
-  printf("Shape of %s tensor: ", descr.c_str());
-  for (size_t i = 0; i < ndim; i++) {
-    printf("%zu ", shape[i]);
+#pragma omp critical
+  {
+    printf("Shape of %s tensor: ", descr.c_str());
+    for (size_t i = 0; i < ndim; i++) {
+      printf("%zu ", shape[i]);
+    }
+    printf("\n");
+    fflush(stdout);
   }
-  printf("\n");
+}
+
+void Tensor::printDebug(const std::string &descr, int tp_rank, long long offset,
+                        bool from_device_debug) {
+#pragma omp critical
+  {
+    if (from_device_debug)
+      from_device(0);
+    CHECK_HIP(hipStreamSynchronize(0));
+    printf("Print debug of %s tensor, tp_rank %d: ", descr.c_str(), tp_rank);
+    for (long long id_test = 0; id_test < 5; id_test++) {
+      printf("%.6f ", buf[id_test + offset]);
+    }
+    printf("\n");
+    fflush(stdout);
+  }
 }
 
 /* INT TENSOR */
@@ -155,5 +175,21 @@ void TensorI32::reshape(const vector<int> &shape_) {
   for (size_t i = 0; i < ndim; i++) {
     shape[i] = shape_[i];
     n *= shape[i];
+  }
+}
+
+void TensorI32::printDebug(const std::string &descr, int tp_rank, long long offset,
+                           bool from_device_debug) {
+#pragma omp critical
+  {
+    if (from_device_debug)
+      from_device(0);
+    CHECK_HIP(hipStreamSynchronize(0));
+    printf("Print debug of %s tensor, tp_rank %d: ", descr.c_str(), tp_rank);
+    for (long long id_test = 0; id_test < 5; id_test++) {
+      printf("%d ", buf[id_test + offset]);
+    }
+    printf("\n");
+    fflush(stdout);
   }
 }

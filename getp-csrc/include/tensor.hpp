@@ -41,8 +41,10 @@ struct Tensor {
 
   size_t num_elem() const;
   size_t get_dtype_size() const;  // Add this declaration
-  void printShape(const std::string &descr) const;
   void reshape(const vector<int> &shape_);
+  void printShape(const std::string &descr) const;
+  void printDebug(const std::string &descr, int tp_rank, long long offset = 0,
+                  bool from_device_debug = true);
 
   void to_device(hipStream_t stream = 0);
   void from_device(hipStream_t stream = 0);
@@ -62,6 +64,8 @@ struct TensorI32 {
 
   size_t num_elem() const;
   void reshape(const vector<int> &shape_);
+  void printDebug(const std::string &descr, int tp_rank, long long offset = 0,
+                  bool from_device_debug = true);
 
   void to_device(hipStream_t stream = 0);
   void from_device(hipStream_t stream = 0);

@@ -18,104 +18,103 @@
 #include <unistd.h>
 #endif
 
-// #include "tokenizer.hpp"
+#include "tokenizer.hpp"
 
 // ----------------------------------------------------------------------------
 
-#include "getp-csrc/include/config_run.hpp"
-// typedef struct {
-//   // Model Config
-//   int vocab_size;  // vocabulary size
-//   int hidden_dim;  // model dim
-//   // MLP Config
-//   int n_experts;          // number of experts
-//   int experts_per_token;  // num top-k
-//   int intermediate_dim;   // for ffn layers
-//   int n_layers;           // num hidden layers
-//   // Attention Config
-//   int head_dim;                // head dimension
-//   int n_attn_heads;            // number of query heads
-//   int n_kv_heads;              // number of key/value heads (can be < query heads because of
-//                                // MQA)
-//   int seq_len;                 // max sequence length e.g., 1024
-//   int initial_context_length;  // e.g., 4096
-//   float rope_theta;            // rope theta e.g., 150000.0
-//   float rope_scaling_factor;   // e.g., 32.0
-//   int sliding_window;          // e.g., 128
-//   float swiglu_limit;          // e.g., 7.0
-// } Config;
+typedef struct {
+  // Model Config
+  int vocab_size;  // vocabulary size
+  int hidden_dim;  // model dim
+  // MLP Config
+  int n_experts;          // number of experts
+  int experts_per_token;  // num top-k
+  int intermediate_dim;   // for ffn layers
+  int n_layers;           // num hidden layers
+  // Attention Config
+  int head_dim;                // head dimension
+  int n_attn_heads;            // number of query heads
+  int n_kv_heads;              // number of key/value heads (can be < query heads because of
+                               // MQA)
+  int seq_len;                 // max sequence length e.g., 1024
+  int initial_context_length;  // e.g., 4096
+  float rope_theta;            // rope theta e.g., 150000.0
+  float rope_scaling_factor;   // e.g., 32.0
+  int sliding_window;          // e.g., 128
+  float swiglu_limit;          // e.g., 7.0
+} Config;
 
-// typedef struct {
-//   // token_embedding_table - embedding.weight
-//   float *token_embedding_table;  // (vocab_size, hidden_dim) (in, out)
-//   // weights for rmsnorms
-//   float *rms_attn_w;  // (n_layers, hidden_dim) [attn.norm.scale]
-//   float *rms_ffn_w;   // (n_layers, hidden_dim) [mlp.norm.scale]
-//   // weights for attention [attn.qkv.weight & attn.qkv.bias]
-//   float *w_qkv;       // (n_layers, head_dim * n_attn_heads + 2 * head_dim * n_kv_heads,
-//                       // hidden_dim) where w_q (head_dim * n_attn_heads, hidden_dim)
-//                       // (out_features, in_features) w_k (head_dim * n_kv_heads,
-//                       // hidden_dim)  (out_features, in_features) w_v (head_dim *
-//                       // n_kv_heads, hidden_dim)  (out_features, in_features)
-//   float *w_o;         // (n_layers, hidden_dim, head_dim * n_attn_heads)
-//   float *b_qkv;       // (n_layers, head_dim * n_attn_heads + 2 * head_dim *
-//                       // n_kv_heads) (head_dim * n_attn_heads) (head_dim * n_kv_heads)
-//                       // (head_dim * n_kv_heads)
-//   float *b_o;         // (n_layers, hidden_dim)
-//   float *attn_sinks;  // (n_layers, n_attn_heads)
-//   // weights for router [mlp.gate.weight & mlp.gate.bias]
-//   float *w_router;  // (n_layers, hidden_dim, n_experts)
-//   float *b_router;  // (n_layers, n_experts)
-//   // weights for MoE [mlp.mlp1_weight & mlp.mlp1_bias & mlp.mlp2_weight &
-//   // mlp.mlp2_bias] NOTE: gate_up projects from hidden_dim to intermediate_dim,
-//   // the shape is kinda reverted because the original code use einsum to reduce
-//   // over hidden_dim
-//   float *w_mlp1;  // gate_up_proj (n_layers, n_experts, 2 * intermediate_dim,
-//                   // hidden_dim)
-//   float *w_mlp2;  // down_proj (n_layers, n_experts, hidden_dim, intermediate_dim)
-//   float *b_mlp1;  // gate_up proj (n_layers, n_experts, 2 * intermediate_dim)
-//   float *b_mlp2;  // down_proj (n_layers, n_experts, hidden_dim)
-//   // final norm [norm.scale]
-//   float *rms_out_w;  // (hidden_dim, )
-//   // classifier weights for the logits [unembedding.weight]
-//   float *out;  // (vocab_size, hidden_dim) (out, in)
-// } TransformerWeights;
+typedef struct {
+  // token_embedding_table - embedding.weight
+  float *token_embedding_table;  // (vocab_size, hidden_dim) (in, out)
+  // weights for rmsnorms
+  float *rms_attn_w;  // (n_layers, hidden_dim) [attn.norm.scale]
+  float *rms_ffn_w;   // (n_layers, hidden_dim) [mlp.norm.scale]
+  // weights for attention [attn.qkv.weight & attn.qkv.bias]
+  float *w_qkv;       // (n_layers, head_dim * n_attn_heads + 2 * head_dim * n_kv_heads,
+                      // hidden_dim) where w_q (head_dim * n_attn_heads, hidden_dim)
+                      // (out_features, in_features) w_k (head_dim * n_kv_heads,
+                      // hidden_dim)  (out_features, in_features) w_v (head_dim *
+                      // n_kv_heads, hidden_dim)  (out_features, in_features)
+  float *w_o;         // (n_layers, hidden_dim, head_dim * n_attn_heads)
+  float *b_qkv;       // (n_layers, head_dim * n_attn_heads + 2 * head_dim *
+                      // n_kv_heads) (head_dim * n_attn_heads) (head_dim * n_kv_heads)
+                      // (head_dim * n_kv_heads)
+  float *b_o;         // (n_layers, hidden_dim)
+  float *attn_sinks;  // (n_layers, n_attn_heads)
+  // weights for router [mlp.gate.weight & mlp.gate.bias]
+  float *w_router;  // (n_layers, hidden_dim, n_experts)
+  float *b_router;  // (n_layers, n_experts)
+  // weights for MoE [mlp.mlp1_weight & mlp.mlp1_bias & mlp.mlp2_weight &
+  // mlp.mlp2_bias] NOTE: gate_up projects from hidden_dim to intermediate_dim,
+  // the shape is kinda reverted because the original code use einsum to reduce
+  // over hidden_dim
+  float *w_mlp1;  // gate_up_proj (n_layers, n_experts, 2 * intermediate_dim,
+                  // hidden_dim)
+  float *w_mlp2;  // down_proj (n_layers, n_experts, hidden_dim, intermediate_dim)
+  float *b_mlp1;  // gate_up proj (n_layers, n_experts, 2 * intermediate_dim)
+  float *b_mlp2;  // down_proj (n_layers, n_experts, hidden_dim)
+  // final norm [norm.scale]
+  float *rms_out_w;  // (hidden_dim, )
+  // classifier weights for the logits [unembedding.weight]
+  float *out;  // (vocab_size, hidden_dim) (out, in)
+} TransformerWeights;
 
-// typedef struct {
-//   // current wave of activations
-//   float *x;             // activation at current time stamp (hidden_dim, )
-//   float *t;             // same, but inside a residual branch (hidden_dim, )
-//   float *tb;            // (head_dim * n_attn_heads, )
-//   float *tb2;           // (hidden_dim, )
-//   float *router_score;  // router score (n_experts, )
-//   float *topk_v;        // topk expert weights (experts_per_token, )
-//   int *topk_i;          // topk expert indices (experts_per_token, )
-//   float *mlp1_out;
-//   float *gate;
-//   float *up;
-//   float *gate_up;
-//   float *e_agg;
-//   float *qkv;     // an additional buffer just for convenience (head_dim *
-//                   // (n_attn_heads + 2 * n_kv_heads), )
-//   float *q;       // query (n_attn_heads * head_dim,)
-//   float *k;       // key (n_kv_heads * head_dim,)
-//   float *v;       // value (n_kv_heads * head_dim,)
-//   float *att;     // buffer for scores/attention values (n_heads, seq_len)
-//   float *logits;  // output logits
-//   // kv cache
-//   float *key_cache;    // (layer, seq_len, kv_dim)
-//   float *value_cache;  // (layer, seq_len, kv_dim)
-//   float *mask;
-// } RunState;
+typedef struct {
+  // current wave of activations
+  float *x;             // activation at current time stamp (hidden_dim, )
+  float *t;             // same, but inside a residual branch (hidden_dim, )
+  float *tb;            // (head_dim * n_attn_heads, )
+  float *tb2;           // (hidden_dim, )
+  float *router_score;  // router score (n_experts, )
+  float *topk_v;        // topk expert weights (experts_per_token, )
+  int *topk_i;          // topk expert indices (experts_per_token, )
+  float *mlp1_out;
+  float *gate;
+  float *up;
+  float *gate_up;
+  float *e_agg;
+  float *qkv;     // an additional buffer just for convenience (head_dim *
+                  // (n_attn_heads + 2 * n_kv_heads), )
+  float *q;       // query (n_attn_heads * head_dim,)
+  float *k;       // key (n_kv_heads * head_dim,)
+  float *v;       // value (n_kv_heads * head_dim,)
+  float *att;     // buffer for scores/attention values (n_heads, seq_len)
+  float *logits;  // output logits
+  // kv cache
+  float *key_cache;    // (layer, seq_len, kv_dim)
+  float *value_cache;  // (layer, seq_len, kv_dim)
+  float *mask;
+} RunState;
 
-// typedef struct {
-//   Config config;
-//   TransformerWeights weights;
-//   RunState state;     // buffers for the "wave" of activations in the forward pass
-//   int fd;             // file descriptor for memory mapping
-//   float *data;        // memory mapped data pointer
-//   ssize_t file_size;  // size of the checkpoint file in bytes
-// } Transformer;
+typedef struct {
+  Config config;
+  TransformerWeights weights;
+  RunState state;     // buffers for the "wave" of activations in the forward pass
+  int fd;             // file descriptor for memory mapping
+  float *data;        // memory mapped data pointer
+  ssize_t file_size;  // size of the checkpoint file in bytes
+} Transformer;
 
 void malloc_run_state(RunState *s, Config *p) {
   // we calloc instead of malloc to keep valgrind happy
@@ -522,10 +521,6 @@ float *forward(Transformer *transformer, int token, int pos) {
     // s->t (hidden_dim, )
     rmsnorm(s->t, x, w->rms_attn_w + 1ll * l * hidden_dim, hidden_dim);
 
-    // for (int i = 0; i < 10; i++) {
-    //   printf("t[%d] = %f\n", i, s->t[i]);
-    // }
-
     // key and value point to the kv cache
     int loff = l * p->seq_len * kv_dim;  // kv cache layer offset for convenience
     s->k = s->key_cache + loff + pos * kv_dim;
@@ -541,11 +536,6 @@ float *forward(Transformer *transformer, int token, int pos) {
     for (int i = 0; i < (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim; ++i) {
       s->qkv[i] += b_qkv[i];
     }
-
-    // for (int i = 0; i < head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads; i++) {
-    //   printf("qkv[%d] = %f\n", i, s->qkv[i]);
-    // }
-
     // Separate q, k, v
     memcpy(s->q, s->qkv, head_dim * p->n_attn_heads * sizeof(float));  // gate
     memcpy(s->k, s->qkv + head_dim * p->n_attn_heads,
@@ -568,23 +558,6 @@ float *forward(Transformer *transformer, int token, int pos) {
 
     free(cos_vals);
     free(sin_vals);
-
-    // if (l == 0) {
-    //   printf("Q vector:\n");
-    //   for (int i = 0; i < head_dim * p->n_attn_heads; i++) {
-    //     printf("\tq[%d] = %f\n", i, s->q[i]);
-    //   }
-
-    //   printf("K vector:\n");
-    //   for (int i = 0; i < head_dim * p->n_kv_heads; i++) {
-    //     printf("\tk[%d] = %f\n", i, s->k[i]);
-    //   }
-
-    //   printf("V vector:\n");
-    //   for (int i = 0; i < head_dim * p->n_kv_heads; i++) {
-    //     printf("\tv[%d] = %f\n", i, s->v[i]);
-    //   }
-    // }
 
     // multihead attention. iterate over all heads
     int h;
@@ -632,11 +605,6 @@ float *forward(Transformer *transformer, int token, int pos) {
         }
       }
     }
-
-    // for (int i = 0; i < 10; i++) {
-    //   printf("tb[%d] = %f\n", i, s->tb[i]);
-    // }
-
     // final matmul to get the output of the attention
     float *w_o = w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
     float *b_o = w->b_o + 1ll * l * hidden_dim;
@@ -651,16 +619,8 @@ float *forward(Transformer *transformer, int token, int pos) {
       x[i] += s->tb2[i];
     }
 
-    // for (int i = 0; i < 10; i++) {
-    //   printf("x[%d] = %f\n", i, x[i]);
-    // }
-
     // ffn rmsnorm
     rmsnorm(s->t, x, w->rms_ffn_w + 1ll * l * hidden_dim, hidden_dim);
-
-    // for (int i = 0; i < 10; i++) {
-    //   printf("t[%d] = %f\n", i, s->t[i]);
-    // }
 
     // MoE
     // Compute router_score
@@ -672,20 +632,10 @@ float *forward(Transformer *transformer, int token, int pos) {
     for (int i = 0; i < n_experts; i++) {
       s->router_score[i] += b_router[i];
     }
-
-    // for (int i = 0; i < n_experts; i++) {
-    //   printf("score[%d] = %f\n", i, s->router_score[i]);
-    // }
-
     // Select top-k experts
     topk(s->topk_v, s->topk_i, s->router_score, n_experts, p->experts_per_token);
     // Normalize selected experts using softmax or sigmoid
     softmax(s->topk_v, p->experts_per_token);  // expert
-
-    // for (int i = 0; i < p->experts_per_token; i++) {
-    //   printf("topk_i[%d] = %d\n", i, s->topk_i[i]);
-    //   printf("topk_v[%d] = %f\n", i, s->topk_v[i]);
-    // }
 
     // Route the tokens to their corresponding top-k experts
     memset(s->e_agg, 0, hidden_dim * sizeof(float));
@@ -753,28 +703,16 @@ float *forward(Transformer *transformer, int token, int pos) {
       }
     }
 
-    // for (int i = 0; i < 10; i++) {
-    //   printf("e_agg[%d] = %f\n", i, s->e_agg[i]);
-    // }
-
     // residual connection
     for (int i = 0; i < hidden_dim; i++) {
       x[i] += s->e_agg[i];
     }
   }
-  // for (int i = 0; i < 10; i++) {
-  //   printf("x[%d] = %f\n", i, s->x[i]);
-  // }
-
   // final rmsnorm
   rmsnorm(x, x, w->rms_out_w, hidden_dim);
 
   // classifier into logits
   matmul(s->logits, x, w->out, hidden_dim, p->vocab_size);
-  // for (int i = 0; i < 15; i++) {
-  //   printf("logits[%d] = %f\n", i, s->logits[i]);
-  // }
-
   return s->logits;
 }
 
@@ -785,18 +723,18 @@ float *forward(Transformer *transformer, int token, int pos) {
 // The Sampler, which takes logits and returns a sampled token
 // sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
 
-// typedef struct {
-//   float prob;
-//   int index;
-// } ProbIndex;  // struct used when sorting probabilities during top-p sampling
+typedef struct {
+  float prob;
+  int index;
+} ProbIndex;  // struct used when sorting probabilities during top-p sampling
 
-// typedef struct {
-//   int vocab_size;
-//   ProbIndex *probindex;  // buffer used in top-p sampling
-//   float temperature;
-//   float topp;
-//   unsigned long long rng_state;
-// } Sampler;
+typedef struct {
+  int vocab_size;
+  ProbIndex *probindex;  // buffer used in top-p sampling
+  float temperature;
+  float topp;
+  unsigned long long rng_state;
+} Sampler;
 
 int sample_argmax(float *probabilities, int n) {
   // return the index that has the highest probability

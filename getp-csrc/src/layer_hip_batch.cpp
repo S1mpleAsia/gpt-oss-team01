@@ -1,8 +1,8 @@
 #include "../include/layer_hip_batch.hpp"
 #include <cmath>
 #include <cfloat>
-#include "kernel.cpp"
-// #include "matrix_core.cpp"
+// #include "kernel.cpp"
+#include "matrix_core.cpp"
 
 #define DEFAULT_BLOCK_SIZE 256
 

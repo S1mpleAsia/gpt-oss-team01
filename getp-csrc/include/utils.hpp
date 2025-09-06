@@ -14,21 +14,23 @@ struct GpuTimer {
 
   // Constructor: Records the start event.
   GpuTimer(const char *name, hipStream_t s = 0) : function_name(name), stream(s) {
+#ifdef TIME_GPU
     CHECK_HIP(hipEventCreate(&start_event));
     CHECK_HIP(hipEventCreate(&stop_event));
     CHECK_HIP(hipEventRecord(start_event, s));
+#endif
   }
 
   // Destructor: Records the stop event, synchronizes, and prints the time.
   ~GpuTimer() {
+#ifdef TIME_GPU
     CHECK_HIP(hipEventRecord(stop_event, stream));
     CHECK_HIP(hipEventSynchronize(stop_event));
     float milliseconds = 0;
     CHECK_HIP(hipEventElapsedTime(&milliseconds, start_event, stop_event));
-#ifdef TIME_GPU
     printf("%s: %f ms\n", function_name, milliseconds);
-#endif
     CHECK_HIP(hipEventDestroy(start_event));
     CHECK_HIP(hipEventDestroy(stop_event));
+#endif
   }
 };
