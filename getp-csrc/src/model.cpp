@@ -123,6 +123,79 @@ float *forward_gpu_20b_batched(
 
 #else
 
+void reduce_tb3(
+  OurRunState *rs_now, OurRunState *rs_leader,
+  int tp_rank, int cur_device, pthread_barrier_t *tp_barrier,
+  hipStream_t stream, hipEvent_t tp_ready, hipEvent_t tp_finish
+) {
+  if (tp_rank > 0) {
+    // copy all tp_rank to buffer
+    size_t num_elems = rs_now->tb3->num_elem();
+    size_t num_bytes = num_elems * rs_now->tb3->get_dtype_size();
+    // rs of leader
+    void *dst_buf = (void *)((float *)rs_leader->tb3_buf->d_buf + (tp_rank-1) * num_elems);
+    const void *src_buf = rs_now->tb3->d_buf;
+
+    CHECK_HIP(hipMemcpyPeerAsync(dst_buf, cur_device - tp_rank, src_buf, cur_device, num_bytes, stream));
+    CHECK_HIP(hipEventRecord(tp_ready, stream));
+  }
+
+  #ifdef DEBUG
+    if (flag) rs_now->tb3->printDebug("rs_now->tb3 after copy to leader", tp_rank, 0, stream);
+  #endif
+
+  pthread_barrier_wait(tp_barrier);
+
+  if (tp_rank == 0) {
+    // aggregates here
+    hipEvent_t tp_ready_each;
+    size_t num_elements = rs_now->tb3->num_elem();
+    float *d_buf = (float *)rs_now->tb3->d_buf;
+    float *d_buf_each = (float *)rs_leader->tb3_buf->d_buf;
+
+    const int block_size = 256;
+    const int grid_size = (num_elements + block_size - 1) / block_size;
+
+    for (int i = 1; i < TP; i++) {
+      tp_ready_each = total_events->tp_ready[cur_device + i];
+      CHECK_HIP(hipStreamWaitEvent(stream, tp_ready_each));
+      // add vector kernel here, do later
+      // do on stream
+      
+      add_vector_kernel_batched<<<grid_size, block_size, 0, stream>>>(d_buf, (const float*)d_buf_each, num_elements);
+
+      d_buf_each += num_elements;
+    }
+    CHECK_HIP(hipEventRecord(tp_ready, stream));
+  }
+
+  pthread_barrier_wait(tp_barrier);
+
+  #ifdef DEBUG
+    if (flag) rs_now->tb3->printDebug("rs_now->tb3 after aggregate", tp_rank, 0, stream);
+  #endif
+
+  if (tp_rank > 0) {
+    // copy back
+    hipEvent_t leader_tp_ready = total_events->tp_ready[cur_device - tp_rank];
+    hipStream_t leader_stream = total_streams[cur_device - tp_rank];
+    size_t num_bytes = rs_now->tb3->num_elem() * rs_now->tb3->get_dtype_size();
+    // rs of leader TP
+    void *dst_buf = rs_now->tb3->d_buf;
+    const void *src_buf = rs_leader->tb3->d_buf;
+
+    CHECK_HIP(hipStreamWaitEvent(stream, leader_tp_ready));
+    CHECK_HIP(hipMemcpyPeerAsync(dst_buf, cur_device, src_buf, cur_device - tp_rank, num_bytes, stream));
+    CHECK_HIP(hipEventRecord(tp_finish, stream));
+  } else {
+    hipEvent_t tp_finish_each; 
+    for (int i = 1; i < TP; i++) {
+      tp_finish_each = total_events->tp_finish[cur_device + i];
+      CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_each));
+    }
+  }
+}
+
 // two events are needed
 float *forward_gpu_120b_batched(
   int *tokens, int pos, int cur_batch_size, int flow_id,
@@ -304,72 +377,8 @@ float *forward_gpu_120b_batched(
         if (flag) rs_now->tb3->printDebug("rs_now->tb3", tp_rank, 0, stream);
       #endif
 
-        if (tp_rank > 0) {
-          // copy all tp_rank to buffer
-          size_t num_elems = rs_now->tb3->num_elem();
-          size_t num_bytes = num_elems * rs_now->tb3->get_dtype_size();
-          // rs of leader
-          void *dst_buf = (void *)((float *)rs_leader->tb3_buf->d_buf + (tp_rank-1) * num_elems);
-          const void *src_buf = rs_now->tb3->d_buf;
-
-          CHECK_HIP(hipMemcpyPeerAsync(dst_buf, cur_device - tp_rank, src_buf, cur_device, num_bytes, stream));
-          CHECK_HIP(hipEventRecord(tp_ready, stream));
-        }
-
-      #ifdef DEBUG
-        if (flag) rs_now->tb3->printDebug("rs_now->tb3 after copy to leader", tp_rank, 0, stream);
-      #endif
-
-      pthread_barrier_wait(tp_barrier);
-
-      if (tp_rank == 0) {
-        // aggregates here
-        hipEvent_t tp_ready_each;
-        size_t num_elements = rs_now->tb3->num_elem();
-        float *d_buf = (float *)rs_now->tb3->d_buf;
-        float *d_buf_each = (float *)rs_leader->tb3_buf->d_buf;
-
-        const int block_size = 256;
-        const int grid_size = (num_elements + block_size - 1) / block_size;
-
-        for (int i = 1; i < TP; i++) {
-          tp_ready_each = total_events->tp_ready[cur_device + i];
-          CHECK_HIP(hipStreamWaitEvent(stream, tp_ready_each));
-          // add vector kernel here, do later
-          // do on stream
-          
-          add_vector_kernel_batched<<<grid_size, block_size, 0, stream>>>(d_buf, (const float*)d_buf_each, num_elements);
-
-          d_buf_each += num_elements;
-        }
-        CHECK_HIP(hipEventRecord(tp_ready, stream));
-      }
-
-      pthread_barrier_wait(tp_barrier);
-
-      #ifdef DEBUG
-        if (flag) rs_now->tb3->printDebug("rs_now->tb3 after aggregate", tp_rank, 0, stream);
-      #endif
-
-      if (tp_rank > 0) {
-        // copy back
-        hipEvent_t leader_tp_ready = total_events->tp_ready[cur_device - tp_rank];
-        hipStream_t leader_stream = total_streams[cur_device - tp_rank];
-        size_t num_bytes = rs_now->tb3->num_elem() * rs_now->tb3->get_dtype_size();
-        // rs of leader TP
-        void *dst_buf = rs_now->tb3->d_buf;
-        const void *src_buf = rs_leader->tb3->d_buf;
-
-        CHECK_HIP(hipStreamWaitEvent(stream, leader_tp_ready));
-        CHECK_HIP(hipMemcpyPeerAsync(dst_buf, cur_device, src_buf, cur_device - tp_rank, num_bytes, stream));
-        CHECK_HIP(hipEventRecord(tp_finish, stream));
-      } else {
-        hipEvent_t tp_finish_each; 
-        for (int i = 1; i < TP; i++) {
-          tp_finish_each = total_events->tp_finish[cur_device + i];
-          CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_each));
-        }
-      }
+      reduce_tb3(rs_now, rs_leader, tp_rank, cur_device, tp_barrier, 
+                  stream, tp_ready, tp_finish);
 
       #ifdef DEBUG
         if (flag) rs_now->tb3->printDebug("rs_now->tb3 after", tp_rank, 0, stream);
