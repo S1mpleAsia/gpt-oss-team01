@@ -8,7 +8,7 @@
 #include "flash_attn_hip.hpp"
 
 float *forward_gpu_20b_batched(Config *p, OurTransformerWeights *weights, OurRunState *rs,
-                               int *tokens, int pos, int batch_size);
+                               int *tokens, int pos, int batch_size, int flow_id);
 float *forward_gpu_20b(Config *p, OurTransformerWeights *weights, OurRunState *rs, int token,
                        int pos);
 float *forward_cpu_20b(Config *p, OurTransformerWeights *weights, OurRunState *rs, int token,

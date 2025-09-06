@@ -6,50 +6,31 @@
 
 #define DEFAULT_BLOCK_SIZE 256
 
-// helper funcs:
 __device__ __forceinline__ float warp_reduce_sum_batched(float v) {
-  // This function is unchanged.
   for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
     v += __shfl_down(v, offset);
   }
   return v;
 }
-// bf16 helpers
-__device__ __forceinline__ float bf16_to_f32(bf16 v) {
-  // bf16 -> f32 by left-shift then reinterpret
-  uint32_t u = (uint32_t)v << 16;
-  return __int_as_float((int)u);
-}
-
-__device__ __forceinline__ void bf16x2_to_f32(uint32_t packed, float &f0, float &f1) {
-  // packed = [hi:bf16 | lo:bf16]
-  uint32_t lo = packed & 0xFFFFu;
-  uint32_t hi = (packed >> 16) & 0xFFFFu;
-  f0 = __int_as_float((int)(lo << 16));
-  f1 = __int_as_float((int)(hi << 16));
-}
 
 __device__ __forceinline__ float block_reduce_sum(float v) {
-  // Số warp tối đa cho 1024 threads với WARP_SIZE=32 là 32; với 64 là 16 → 32 là dư an toàn.
   __shared__ float warp_sums[32];
 
   int lane = threadIdx.x & (warpSize - 1);
   int wid = threadIdx.x / warpSize;
   int num_warps = (blockDim.x + warpSize - 1) / warpSize;
 
-  // reduce trong warp
   v = warp_reduce_sum(v);
   if (lane == 0)
     warp_sums[wid] = v;
   __syncthreads();
 
-  // warp 0 cộng các warp_sums
   float sum = 0.0f;
   if (wid == 0) {
     sum = (lane < num_warps) ? warp_sums[lane] : 0.0f;
     sum = warp_reduce_sum(sum);
     if (lane == 0)
-      warp_sums[0] = sum;  // broadcast qua shared
+      warp_sums[0] = sum;
   }
   __syncthreads();
   return warp_sums[0];
@@ -383,7 +364,7 @@ void qkv_gemm_batched_v2(Tensor *x,            // Shape: [batch_size, hidden_dim
     dim3 block_size(blockDim);
     dim3 grid_size((out_features + BN - 1) / BN, ((batch_size + BM - 1) / BM));
 
-    gemm_mfma<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size>>>(
+    gemm_mfma<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
       x_ptr, w_qkv_ptr, qkv_ptr, b_qkv_ptr, batch_size, out_features, in_features);
   }
 
@@ -964,7 +945,7 @@ void attn_out_project_batched_v2(Tensor *tb,         // Shape: [batch_size, n_at
     dim3 block_size(blockDim);
     dim3 grid_size((out_features + BN - 1) / BN, ((batch_size + BM - 1) / BM));
 
-    gemm_mfma<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size>>>(
+    gemm_mfma<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
       tb_ptr, w_o_ptr, y_ptr, b_o_ptr, batch_size, out_features, in_features);
   }
 
@@ -1650,7 +1631,7 @@ void classifier_gemm_batched_v2(const Tensor *W_out,  // Shape: [hidden_dim, voc
     dim3 block_size(blockDim);
     dim3 grid_size((vocab_size + BN - 1) / BN, ((batch_size + BM - 1) / BM));
 
-    gemm_mfma<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size>>>(
+    gemm_mfma<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
       x_ptr, w_out_ptr, logits_buf, nullptr, batch_size, vocab_size, hidden_dim);
   }
 
