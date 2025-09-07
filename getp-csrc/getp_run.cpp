@@ -214,7 +214,7 @@ void *thread_handler(void *arg) {
 #endif
 
         if (next_token == 199999 || next_token == 200002) {
-          // #pragma omp critical
+#pragma omp critical
           {
             if (active[i]) {
               active[i] = false;

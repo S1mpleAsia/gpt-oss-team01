@@ -154,12 +154,13 @@ __global__ void flash_attn_decode_kernel(
 }
 
 void single_query_attn_flash_batched(Tensor *q, Tensor *K_cache, Tensor *V_cache, Tensor *mask,
-                                     Tensor *attn_sinks, Tensor *tb, int head_dim, int n_q,
-                                     int kv_mul, int kv_dim, int seq_len, int sliding_window,
-                                     int pos, long long layer_offset, bool q_to_device,
-                                     bool k_cache_to_device, bool v_cache_to_device,
-                                     bool mask_to_device, bool tb_from_device, hipStream_t stream) {
-  GpuTimer timer("single_query_attn_flash_batched", stream);
+                                     Tensor *attn_sinks, Tensor *tb, int cur_batch_size,
+                                     int head_dim, int n_q, int kv_mul, int kv_dim, int seq_len,
+                                     int sliding_window, int pos, long long layer_offset,
+                                     bool q_to_device, bool k_cache_to_device,
+                                     bool v_cache_to_device, bool mask_to_device,
+                                     bool tb_from_device, hipStream_t stream) {
+  // GpuTimer timer("single_query_attn_flash_batched", stream);
   if (q_to_device)
     q->to_device(stream);
   if (k_cache_to_device)
@@ -167,7 +168,7 @@ void single_query_attn_flash_batched(Tensor *q, Tensor *K_cache, Tensor *V_cache
   if (v_cache_to_device)
     V_cache->to_device(stream);
 
-  const int B = (int)q->shape[0];
+  // const int B = (int)q->shape[0];
   const int n_layers = (int)attn_sinks->shape[0];
 
   const float *K_ptr = (const float *)K_cache->d_buf + 1ll * layer_offset * seq_len * kv_dim;
@@ -179,13 +180,13 @@ void single_query_attn_flash_batched(Tensor *q, Tensor *K_cache, Tensor *V_cache
 
   constexpr int TILE_TOKENS = 128;
   constexpr int THREADS = 128;
-  dim3 grid(n_q, B), block(THREADS);
+  dim3 grid(n_q, cur_batch_size), block(THREADS);
   size_t shmem = (size_t)head_dim * sizeof(float) + (size_t)TILE_TOKENS * sizeof(float) +
                  (size_t)THREADS * sizeof(double);
 
   flash_attn_decode_kernel<TILE_TOKENS, THREADS><<<grid, block, shmem, stream>>>(
     (const float *)q->d_buf, K_ptr, V_ptr, S_ptr, (float *)tb->d_buf, head_dim, n_q, kv_mul, kv_dim,
-    seq_len, pos, sliding_window, B, n_layers, use_window);
+    seq_len, pos, sliding_window, cur_batch_size, n_layers, use_window);
 
   CHECK_HIP(hipGetLastError());
   if (tb_from_device) {

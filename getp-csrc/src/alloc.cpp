@@ -748,14 +748,14 @@ void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunSt
     CHECK_HIP(hipSetDevice(i));
 
 #ifdef RUN_20B
-    CHECK_HIP(hipStreamCreateWithFlags(&total_streams[i], hipStreamNonBlocking));
+    CHECK_HIP(hipStreamCreate(&total_streams[i]));
     CHECK_HIP(hipEventCreate(&(total_events->tp_ready[i])));
     CHECK_HIP(hipEventCreate(&(total_events->tp_finish[i])));
     CHECK_HIP(hipEventCreate(&(total_events->pp_sync[i])));
     our_init_weights(w, p, &weights[i], i, total_streams[i]);
     our_init_run_state(s, p, &rs[i], i, total_streams[i]);
 #else
-    CHECK_HIP(hipStreamCreateWithFlags(&total_streams[i], hipStreamNonBlocking));
+    CHECK_HIP(hipStreamCreate(&total_streams[i]));
     CHECK_HIP(hipEventCreate(&(total_events->tp_ready[i])));
     CHECK_HIP(hipEventCreate(&(total_events->tp_finish[i])));
     CHECK_HIP(hipEventCreate(&(total_events->pp_sync[i])));
