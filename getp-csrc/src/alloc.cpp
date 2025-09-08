@@ -449,12 +449,11 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   {
     printf("Starting alloc b_mlp1\n");
     fflush(stdout);
-    size_t n_layers = layers_per_stage;
-    size_t n_experts = p->n_experts;
     size_t inter_dim = p->intermediate_dim;
     size_t shard_dim = shard_inter_dim;
 
-    weights->b_mlp1 = new Tensor({n_layers, n_experts, 2 * shard_dim}, stream, DType::BF16);
+    weights->b_mlp1 =
+      new Tensor({layers_per_stage, experts_per_gpu, 2 * shard_dim}, stream, DType::BF16);
 
     size_t tmp_elems = 2 * shard_dim;
     bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
@@ -463,14 +462,14 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
     b_mlp1_ptr += 1ll * tp_rank * (2 * shard_dim);  // offset shard_dim;
 
-    size_t l_offset = 1ll * n_experts * 2 * inter_dim;
+    size_t l_offset = 1ll * experts_per_gpu * 2 * inter_dim;
     size_t e_offset = 1ll * 2 * inter_dim;
 
-    size_t l_offset_d = 1ll * n_experts * 2 * shard_dim;
+    size_t l_offset_d = 1ll * experts_per_gpu * 2 * shard_dim;
     size_t e_offset_d = 1ll * 2 * shard_dim;
 
-    for (size_t l = 0; l < n_layers; l++) {
-      for (size_t e = 0; e < n_experts; e++) {
+    for (size_t l = 0; l < layers_per_stage; l++) {
+      for (size_t e = 0; e < experts_per_gpu; e++) {
         size_t base = 1ll * l * l_offset + 1ll * e * e_offset;
 
         for (size_t i = 0; i < 2 * shard_dim; i++) {
@@ -484,7 +483,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
       }
     }
 
-    CHECK_HIP(hipStreamSynchronize(0));
+    CHECK_HIP(hipStreamSynchronize(stream));
     free(tmp);
 
     printf("End alloc b_mlp1\n");
@@ -528,13 +527,12 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   {
     printf("Starting alloc mlp2\n");
     fflush(stdout);
-    size_t n_layers = layers_per_stage;
-    size_t n_experts = p->n_experts;
     size_t hidden_dim = p->hidden_dim;
     size_t inter_dim = p->intermediate_dim;
     size_t shard_dim = shard_inter_dim;
 
-    weights->w_mlp2 = new Tensor({n_layers, n_experts, shard_dim, hidden_dim}, stream, DType::BF16);
+    weights->w_mlp2 =
+      new Tensor({layers_per_stage, experts_per_gpu, shard_dim, hidden_dim}, stream, DType::BF16);
 
     size_t tmp_elems = shard_dim * hidden_dim;
     bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
@@ -543,14 +541,14 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
     w_mlp2_ptr += 1ll * tp_rank * shard_dim;  // offset shard_dim;
 
-    size_t l_offset = 1ll * n_experts * hidden_dim * inter_dim;
+    size_t l_offset = 1ll * experts_per_gpu * hidden_dim * inter_dim;
     size_t e_offset = 1ll * hidden_dim * inter_dim;
 
-    size_t l_offset_d = 1ll * n_experts * shard_dim * hidden_dim;
+    size_t l_offset_d = 1ll * experts_per_gpu * shard_dim * hidden_dim;
     size_t e_offset_d = 1ll * shard_dim * hidden_dim;
 
-    for (size_t l = 0; l < n_layers; l++) {
-      for (size_t e = 0; e < n_experts; e++) {
+    for (size_t l = 0; l < layers_per_stage; l++) {
+      for (size_t e = 0; e < experts_per_gpu; e++) {
         size_t base = 1ll * l * l_offset + 1ll * e * e_offset;
 
         for (size_t i = 0; i < shard_dim; i++) {
@@ -566,7 +564,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
       }
     }
 
-    CHECK_HIP(hipStreamSynchronize(0));
+    CHECK_HIP(hipStreamSynchronize(stream));
     free(tmp);
 
     // weights->w_mlp2->to_device(0);
@@ -668,8 +666,8 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
 
   rs->tb3 = new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
   if (device_id % TP == 0) {
-    rs->tb3_buf =
-      new Tensor({TP, BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
+    rs->tb3_buf = new Tensor(
+      {(TP - 1), BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
   } else {
     rs->tb3_buf = nullptr;
   }

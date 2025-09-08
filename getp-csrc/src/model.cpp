@@ -21,6 +21,10 @@ float *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flo
 
   // forward all the layers
   for (int l = 0; l < p->n_layers; l++) {
+#ifdef DEBUG
+    printf("Layer l=%d running...\n", l);
+    fflush(stdout);
+#endif
     // attention rmsnorm
     rmsnorm_batched(rs_now->x, weights_now->rms_attn_w, rs_now->t, cur_batch_size, 1ll * l, false,
                     false, 1e-5f, stream);
@@ -59,13 +63,25 @@ float *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flo
     residual_rmsnorm_batched(rs_now->tb2, rs_now->x, weights_now->rms_ffn_w, rs_now->t,
                              cur_batch_size, 1ll * l, 1e-5f, stream);
 
+#ifdef DEBUG
+    rs_now->x->printDebug("rs_now->x", 0, 0, stream);
+#endif
+
     // MoE routing
     router_gemm_batched(weights_now->w_router, rs_now->t, weights_now->b_router,
                         rs_now->router_score, cur_batch_size, 1ll * l, false, false, stream);
 
+#ifdef DEBUG
+    rs_now->router_score->printDebug("rs_now->router_score", 0, 0, stream);
+#endif
+
     // Select top-k experts
     topk_softmax_batched(rs_now->router_score, rs_now->topk_v, rs_now->topk_i, cur_batch_size,
                          false, false, false, stream);
+
+#ifdef DEBUG
+    rs_now->topk_v->printDebug("rs_now->topk_v", 0, 0, stream);
+#endif
 
     // Route the tokens to their corresponding top-k experts
     // moe_apply_topk_batched(rs_now->t, weights_now->w_mlp1, weights_now->b_mlp1, weights_now->w_mlp2,
@@ -110,6 +126,11 @@ float *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flo
                               rs_now->expert_offsets, p->hidden_dim, p->experts_per_token,
                               p->n_experts, max_rows, stream);
 
+#ifdef DEBUG
+    rs_now->tb3->printDebug("rs_now->tb3", 0, 0, stream);
+    rs_now->e_agg->printDebug("rs_now->e_agg", 0, 0, stream);
+#endif
+
     // moe_block_matmul_style_hip(rs_now->t, rs_now->topk_i, rs_now->topk_v, weights_now->w_mlp1, weights_now->b_mlp1,
     //                            weights_now->w_mlp2, weights_now->b_mlp2, rs_now->e_agg, rs_now->mlp1_out,
     //                            rs_now->gate_up, rs_now->tb3, rs_now->sorted_pair_ids, rs_now->expert_offsets,
@@ -118,6 +139,10 @@ float *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flo
     // residual connection
     add_vector_batched(rs_now->x, rs_now->e_agg, cur_batch_size, false, false, false,
                        stream);  // equals residual add
+
+#ifdef DEBUG
+    rs_now->x->printDebug("rs_now->x_end", 0, 0, stream);
+#endif
   }
 
   // final rmsnorm
@@ -150,6 +175,7 @@ void reduce_tb3(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cu
   }
 
 #ifdef DEBUG
+  bool flag = true;
   if (flag)
     rs_now->tb3->printDebug("rs_now->tb3 after copy to leader", tp_rank, 0, stream);
 #endif
@@ -207,6 +233,8 @@ void reduce_tb3(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cu
       CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_each));
     }
   }
+
+  pthread_barrier_wait(tp_barrier);
 }
 
 // two events are needed
@@ -365,16 +393,44 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
 
 #ifdef DEBUG
       if (flag)
-        rs_now->sorted_pair_ids->printDebug("rs_now->sorted_pair_ids", tp_rank, 0, stream);
+        rs_now->e_agg->printDebug("rs_now->e_agg", tp_rank, 0, stream);
 #endif
 
-      moe_build_offsets_hip(rs_now->topk_i, rs_now->sorted_pair_ids, rs_now->expert_offsets,
-                            cur_batch_size, p->experts_per_token, p->n_experts, stream);
+      if (tp_rank == 0) {
+        moe_build_offsets_hip(rs_now->topk_i, rs_now->sorted_pair_ids, rs_now->expert_offsets,
+                              cur_batch_size, p->experts_per_token, p->n_experts, stream);
+
+        CHECK_HIP(hipEventRecord(tp_ready, stream));
+      }
+
+      pthread_barrier_wait(tp_barrier);
+
+      if (tp_rank > 0) {
+        hipEvent_t leader_tp_ready = total_events->tp_ready[cur_device - tp_rank];
+        CHECK_HIP(hipStreamWaitEvent(stream, leader_tp_ready));
+
+        void *dst_sorted_ids = rs_now->sorted_pair_ids->d_buf;
+        const void *src_sorted_ids = rs_leader->sorted_pair_ids->d_buf;
+        size_t bytes_sorted_ids = rs_now->sorted_pair_ids->num_elem() * sizeof(int);
+
+        void *dst_offsets = rs_now->expert_offsets->d_buf;
+        const void *src_offsets = rs_leader->expert_offsets->d_buf;
+        size_t bytes_offsets = rs_now->expert_offsets->num_elem() * sizeof(int);
+
+        CHECK_HIP(hipMemcpyPeerAsync(dst_sorted_ids, cur_device, src_sorted_ids,
+                                     cur_device - tp_rank, bytes_sorted_ids, stream));
+        CHECK_HIP(hipMemcpyPeerAsync(dst_offsets, cur_device, src_offsets, cur_device - tp_rank,
+                                     bytes_offsets, stream));
+      }
+
+      pthread_barrier_wait(tp_barrier);
 
 #ifdef DEBUG
-      if (flag)
+      if (flag) {
         rs_now->sorted_pair_ids->printDebug("rs_now->sorted_pair_ids build offset", tp_rank, 0,
                                             stream);
+        rs_now->expert_offsets->printDebug("rs_now->expert_offsets", tp_rank, 0, stream);
+      }
 #endif
 
       moe_pack_inputs_hip(rs_now->t, rs_now->sorted_pair_ids, rs_now->x_packed, cur_batch_size,
@@ -382,19 +438,13 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
 
 #ifdef DEBUG
       if (flag)
-        rs_now->sorted_pair_ids->printDebug("rs_now->sorted_pair_ids pack inputs", tp_rank, 0,
-                                            stream);
+        rs_now->x_packed->printDebug("rs_now->x_packed", tp_rank, 0, stream);
 #endif
 
       int max_rows = moe_get_max_rows_per_expert_hip(rs_now->expert_offsets, p->n_experts, stream);
       moe_mlp1_forward_hip(rs_now->x_packed, weights_now->w_mlp1, weights_now->b_mlp1,
                            rs_now->expert_offsets, rs_now->mlp1_out, 1ll * l, p->n_experts,
                            p->hidden_dim, p->intermediate_dim / TP, max_rows, total_pairs, stream);
-
-#ifdef DEBUG
-      if (flag)
-        rs_now->expert_offsets->printDebug("rs_now->expert_offsets", tp_rank, 0, stream);
-#endif
 
       moe_swiglu_hip(rs_now->mlp1_out, rs_now->gate_up, cur_batch_size, p->experts_per_token,
                      p->intermediate_dim / TP, p->swiglu_limit, stream);

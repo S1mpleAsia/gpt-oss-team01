@@ -53,7 +53,7 @@ size_t Tensor::get_dtype_size() const {
 void Tensor::to_device(hipStream_t stream) {
   size_t N_ = num_elem();
   if (dtype == DType::FP32) {
-    CHECK_HIP(hipMemcpyAsync(d_buf, buf, N_ * sizeof(float), hipMemcpyHostToDevice, stream));
+    CHECK_HIP(hipMemcpy(d_buf, buf, N_ * sizeof(float), hipMemcpyHostToDevice));
     CHECK_HIP(hipStreamSynchronize(stream));
   } else {
     // Convert and copy for BF16
@@ -61,7 +61,7 @@ void Tensor::to_device(hipStream_t stream) {
     for (size_t i = 0; i < N_; i++) {
       temp_bf16[i] = hip_bfloat16(buf[i]);
     }
-    CHECK_HIP(hipMemcpyAsync(d_buf, temp_bf16, N_ * sizeof(bf16), hipMemcpyHostToDevice, stream));
+    CHECK_HIP(hipMemcpy(d_buf, temp_bf16, N_ * sizeof(bf16), hipMemcpyHostToDevice));
     CHECK_HIP(hipStreamSynchronize(stream));
     free(temp_bf16);
   }
@@ -70,12 +70,12 @@ void Tensor::to_device(hipStream_t stream) {
 void Tensor::from_device(hipStream_t stream) {
   size_t N_ = num_elem();
   if (dtype == DType::FP32) {
-    CHECK_HIP(hipMemcpyAsync(buf, d_buf, N_ * sizeof(float), hipMemcpyDeviceToHost, stream));
+    CHECK_HIP(hipMemcpy(buf, d_buf, N_ * sizeof(float), hipMemcpyDeviceToHost));
     CHECK_HIP(hipStreamSynchronize(stream));
   } else {
     // Convert and copy for BF16
     bf16 *temp_bf16 = (bf16 *)malloc(N_ * sizeof(bf16));
-    CHECK_HIP(hipMemcpyAsync(temp_bf16, d_buf, N_ * sizeof(bf16), hipMemcpyDeviceToHost, stream));
+    CHECK_HIP(hipMemcpy(temp_bf16, d_buf, N_ * sizeof(bf16), hipMemcpyDeviceToHost));
     CHECK_HIP(hipStreamSynchronize(stream));
 
     for (size_t i = 0; i < N_; i++) {
@@ -152,12 +152,12 @@ TensorI32::~TensorI32() {
 
 void TensorI32::to_device(hipStream_t stream) {
   size_t N_ = num_elem();
-  CHECK_HIP(hipMemcpyAsync(d_buf, buf, N_ * sizeof(int), hipMemcpyHostToDevice, stream));
+  CHECK_HIP(hipMemcpy(d_buf, buf, N_ * sizeof(int), hipMemcpyHostToDevice));
 }
 
 void TensorI32::from_device(hipStream_t stream) {
   size_t N_ = num_elem();
-  CHECK_HIP(hipMemcpyAsync(buf, d_buf, N_ * sizeof(int), hipMemcpyDeviceToHost, stream));
+  CHECK_HIP(hipMemcpy(buf, d_buf, N_ * sizeof(int), hipMemcpyDeviceToHost));
 }
 
 // Keep the existing num_elem() and reshape() implementations unchanged
@@ -186,7 +186,7 @@ void TensorI32::printDebug(const std::string &descr, int tp_rank, long long offs
       from_device(0);
     CHECK_HIP(hipStreamSynchronize(0));
     printf("Print debug of %s tensor, tp_rank %d: ", descr.c_str(), tp_rank);
-    for (long long id_test = 0; id_test < 5; id_test++) {
+    for (long long id_test = 0; id_test < 10; id_test++) {
       printf("%d ", buf[id_test + offset]);
     }
     printf("\n");

@@ -615,13 +615,12 @@ __global__ void compute_max_rows_from_offsets_kernel(const int *__restrict__ exp
     atomicMax(max_rows, local_max);
 }
 
-__global__ void scale_scatter_add_kernel_sorted_all(
-  const float *__restrict__ z_sorted,      // [total_pairs, hidden_dim]
-  const int *__restrict__ sorted_ids,      // [total_pairs]
-  const float *__restrict__ topk_v,        // [batch_size, experts_per_token]
-  float *__restrict__ e_agg,               // [batch_size, hidden_dim]
-  const int *__restrict__ expert_offsets,  // [n_experts+1]
-  int hidden_dim, int experts_per_token) {
+__global__ void moe_agg_kernel(const float *__restrict__ tb3_ptr,   // [total_pairs, hidden_dim]
+                               const int *__restrict__ sorted_ids,  // [total_pairs]
+                               const float *__restrict__ topk_v,  // [batch_size, experts_per_token]
+                               float *__restrict__ e_agg,         // [batch_size, hidden_dim]
+                               const int *__restrict__ expert_offsets,  // [n_experts+1]
+                               int hidden_dim, int experts_per_token) {
   int expert_id = blockIdx.z;
   int row_local = blockIdx.y * blockDim.y + threadIdx.y;
   int h = blockIdx.x * blockDim.x + threadIdx.x;
@@ -638,7 +637,7 @@ __global__ void scale_scatter_add_kernel_sorted_all(
   int e = pair % experts_per_token;
 
   float w = topk_v[(size_t)b * experts_per_token + e];
-  float val = z_sorted[(size_t)pos * hidden_dim + h] * w;
+  float val = tb3_ptr[(size_t)pos * hidden_dim + h] * w;
 
   atomicAdd(&e_agg[(size_t)b * hidden_dim + h], val);
 }
@@ -647,8 +646,7 @@ static inline void moe_init_buffers(Tensor *e_agg, Tensor *mlp1_out, Tensor *gat
                                     TensorI32 *sorted_pair_ids, TensorI32 *expert_offsets,
                                     Tensor *x_packed, int batch_size, int hidden_dim,
                                     hipStream_t stream) {
-  float *e_agg_ptr = (float *)e_agg->d_buf;
-  CHECK_HIP(hipMemsetAsync(e_agg_ptr, 0, (size_t)batch_size * hidden_dim * sizeof(float), stream));
+  CHECK_HIP(hipMemsetAsync(e_agg->d_buf, 0, e_agg->num_elem() * e_agg->get_dtype_size(), stream));
   CHECK_HIP(
     hipMemsetAsync(mlp1_out->d_buf, 0, mlp1_out->num_elem() * mlp1_out->get_dtype_size(), stream));
   CHECK_HIP(
@@ -823,7 +821,7 @@ static inline void moe_scatter_aggregate(
   dim3 grid_size((hidden_dim + block_size.x - 1) / block_size.x,
                  (max_rows_per_expert + block_size.y - 1) / block_size.y, n_experts);
 
-  scale_scatter_add_kernel_sorted_all<<<grid_size, block_size, 0, stream>>>(
+  moe_agg_kernel<<<grid_size, block_size, 0, stream>>>(
     (const float *)tb3->d_buf, (const int *)sorted_pair_ids->d_buf, topk_v_ptr, e_agg_ptr,
     expert_offsets->d_buf, hidden_dim, experts_per_token);
 }
@@ -947,7 +945,7 @@ void moe_block_matmul_style(
     dim3 block_size(32, 8, 1);
     dim3 grid_size((hidden_dim + block_size.x - 1) / block_size.x,
                    (max_rows_per_expert + block_size.y - 1) / block_size.y, n_experts);
-    scale_scatter_add_kernel_sorted_all<<<grid_size, block_size, 0, stream>>>(
+    moe_agg_kernel<<<grid_size, block_size, 0, stream>>>(
       (const float *)tb3->d_buf, (const int *)sorted_pair_ids->d_buf, topk_v_ptr, e_agg_ptr,
       expert_offsets->d_buf, hidden_dim, experts_per_token);
   }

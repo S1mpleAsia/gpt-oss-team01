@@ -127,7 +127,7 @@ void *thread_handler(void *arg) {
 
     for (int i = 0; i < current_size; i++) {
       const char *input_seq = input_batch[i] ? input_batch[i] : "";
-      int *prompt_tokens_buffer = (int *)malloc(strlen((input_seq) + 3) * sizeof(int));
+      int *prompt_tokens_buffer = (int *)malloc((strlen(input_seq) + 3) * sizeof(int));
       int count = 0;
       encode(public_tokenizer, input_seq, -1, -1, prompt_tokens_buffer, &count,
              public_config->initial_context_length);
