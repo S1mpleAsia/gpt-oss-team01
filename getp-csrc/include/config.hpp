@@ -6,7 +6,7 @@
 
 #include "tensor.hpp"
 
-#define BATCH_SIZE 2
+#define BATCH_SIZE 32
 // #define PRINT_LOGITS
 // #define TIME_GPU
 // #define DEBUG
@@ -18,7 +18,7 @@
   #define TP 1
 #else
   #define DP 1
-  #define PP 2
+  #define PP 1
   #define TP 2
 #endif
 #define TOTAL_GPUS_NEEDED ((DP) * (PP) * (TP))

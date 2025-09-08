@@ -194,6 +194,8 @@ void reduce_tb3(
       CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_each));
     }
   }
+  
+  pthread_barrier_wait(tp_barrier);
 }
 
 // two events are needed
@@ -339,8 +341,34 @@ float *forward_gpu_120b_batched(
         if (flag) rs_now->sorted_pair_ids->printDebug("rs_now->sorted_pair_ids", tp_rank, 0, stream);
       #endif
 
-      moe_build_offsets_hip(rs_now->topk_i, rs_now->sorted_pair_ids, rs_now->expert_offsets, BATCH_SIZE,
-                            p->experts_per_token, p->n_experts, stream);
+      if (tp_rank == 0) {
+        moe_build_offsets_hip(rs_now->topk_i, rs_now->sorted_pair_ids, rs_now->expert_offsets,
+                              cur_batch_size, p->experts_per_token, p->n_experts, stream);
+
+        CHECK_HIP(hipEventRecord(tp_ready, stream));
+      }
+
+      pthread_barrier_wait(tp_barrier);
+
+      if (tp_rank > 0) {
+        hipEvent_t leader_tp_ready = total_events->tp_ready[cur_device - tp_rank];
+        CHECK_HIP(hipStreamWaitEvent(stream, leader_tp_ready));
+
+        void *dst_sorted_ids = rs_now->sorted_pair_ids->d_buf;
+        const void *src_sorted_ids = rs_leader->sorted_pair_ids->d_buf;
+        size_t bytes_sorted_ids = rs_now->sorted_pair_ids->num_elem() * sizeof(int);
+
+        void *dst_offsets = rs_now->expert_offsets->d_buf;
+        const void *src_offsets = rs_leader->expert_offsets->d_buf;
+        size_t bytes_offsets = rs_now->expert_offsets->num_elem() * sizeof(int);
+
+        CHECK_HIP(hipMemcpyPeerAsync(dst_sorted_ids, cur_device, src_sorted_ids,
+                                     cur_device - tp_rank, bytes_sorted_ids, stream));
+        CHECK_HIP(hipMemcpyPeerAsync(dst_offsets, cur_device, src_offsets, cur_device - tp_rank,
+                                     bytes_offsets, stream));
+      }
+
+      pthread_barrier_wait(tp_barrier);
 
       #ifdef DEBUG
         if (flag) rs_now->sorted_pair_ids->printDebug("rs_now->sorted_pair_ids build offset", tp_rank, 0, stream);
