@@ -19,7 +19,7 @@
 #else
   #define DP 1
   #define PP 1
-  #define TP 2
+  #define TP 4
 #endif
 #define TOTAL_GPUS_NEEDED ((DP) * (PP) * (TP))
 #define TOTAL_PIPELINES ((PP) * (TP))
