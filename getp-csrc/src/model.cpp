@@ -160,13 +160,24 @@ float *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flo
 
 void reduce_tb3(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
                 pthread_barrier_t *tp_barrier, hipStream_t stream, hipEvent_t tp_ready,
-                hipEvent_t tp_finish) {
+                hipEvent_t tp_finish, int cur_batch_size) {
+  // Safety checks
+  if (cur_batch_size <= 0 || cur_batch_size > BATCH_SIZE) {
+    fprintf(stderr, "Error: Invalid cur_batch_size %d, must be in range (0, %d]\n", cur_batch_size, BATCH_SIZE);
+    std::abort();
+  }
+  if (tp_rank < 0 || tp_rank >= TP) {
+    fprintf(stderr, "Error: Invalid tp_rank %d, must be in range [0, %d)\n", tp_rank, TP);
+    std::abort();
+  }
+
   if (tp_rank > 0) {
     // copy all tp_rank to buffer
-    size_t num_elems = rs_now->tb3->num_elem();
-    size_t num_bytes = num_elems * rs_now->tb3->get_dtype_size();
+    // Only process active batch elements: cur_batch_size * experts_per_token * hidden_dim
+    size_t active_elems = (size_t)cur_batch_size * rs_now->tb3->shape[1] * rs_now->tb3->shape[2];
+    size_t num_bytes = active_elems * rs_now->tb3->get_dtype_size();
     // rs of leader
-    void *dst_buf = (void *)((float *)rs_leader->tb3_buf->d_buf + (tp_rank - 1) * num_elems);
+    void *dst_buf = (void *)((float *)rs_leader->tb3_buf->d_buf + (tp_rank - 1) * active_elems);
     const void *src_buf = rs_now->tb3->d_buf;
 
     CHECK_HIP(
@@ -185,23 +196,28 @@ void reduce_tb3(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cu
   if (tp_rank == 0) {
     // aggregates here
     hipEvent_t tp_ready_each;
-    size_t num_elements = rs_now->tb3->num_elem();
+    // Only process active batch elements: cur_batch_size * experts_per_token * hidden_dim
+    size_t active_elements = (size_t)cur_batch_size * rs_now->tb3->shape[1] * rs_now->tb3->shape[2];
     float *d_buf = (float *)rs_now->tb3->d_buf;
     float *d_buf_each = (float *)rs_leader->tb3_buf->d_buf;
 
     const int block_size = 256;
-    const int grid_size = (num_elements + block_size - 1) / block_size;
+    const int grid_size = (active_elements + block_size - 1) / block_size;
 
     for (int i = 1; i < TP; i++) {
-      tp_ready_each = total_events->tp_ready[cur_device + i];
+      // Add bounds checking for event array access
+      int event_idx = cur_device + i;
+      if (event_idx >= TOTAL_GPUS_NEEDED) {
+        fprintf(stderr, "Error: event index %d exceeds TOTAL_GPUS_NEEDED %d\n", event_idx, TOTAL_GPUS_NEEDED);
+        std::abort();
+      }
+      tp_ready_each = total_events->tp_ready[event_idx];
       CHECK_HIP(hipStreamWaitEvent(stream, tp_ready_each));
-      // add vector kernel here, do later
-      // do on stream
 
       add_vector_kernel_batched<<<grid_size, block_size, 0, stream>>>(
-        d_buf, (const float *)d_buf_each, num_elements);
+        d_buf, (const float *)d_buf_each, active_elements);
 
-      d_buf_each += num_elements;
+      d_buf_each += active_elements;
     }
     CHECK_HIP(hipEventRecord(tp_ready, stream));
   }
@@ -217,7 +233,9 @@ void reduce_tb3(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cu
     // copy back
     hipEvent_t leader_tp_ready = total_events->tp_ready[cur_device - tp_rank];
     hipStream_t leader_stream = total_streams[cur_device - tp_rank];
-    size_t num_bytes = rs_now->tb3->num_elem() * rs_now->tb3->get_dtype_size();
+    // Only copy back active batch elements
+    size_t active_elems = (size_t)cur_batch_size * rs_now->tb3->shape[1] * rs_now->tb3->shape[2];
+    size_t num_bytes = active_elems * rs_now->tb3->get_dtype_size();
     // rs of leader TP
     void *dst_buf = rs_now->tb3->d_buf;
     const void *src_buf = rs_leader->tb3->d_buf;
@@ -229,7 +247,13 @@ void reduce_tb3(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cu
   } else {
     hipEvent_t tp_finish_each;
     for (int i = 1; i < TP; i++) {
-      tp_finish_each = total_events->tp_finish[cur_device + i];
+      // Add bounds checking for event array access
+      int event_idx = cur_device + i;
+      if (event_idx >= TOTAL_GPUS_NEEDED) {
+        fprintf(stderr, "Error: event index %d exceeds TOTAL_GPUS_NEEDED %d\n", event_idx, TOTAL_GPUS_NEEDED);
+        std::abort();
+      }
+      tp_finish_each = total_events->tp_finish[event_idx];
       CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_each));
     }
   }
@@ -463,7 +487,7 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
         rs_now->tb3->printDebug("rs_now->tb3", tp_rank, 0, stream);
 #endif
 
-      reduce_tb3(rs_now, rs_leader, tp_rank, cur_device, tp_barrier, stream, tp_ready, tp_finish);
+      reduce_tb3(rs_now, rs_leader, tp_rank, cur_device, tp_barrier, stream, tp_ready, tp_finish, cur_batch_size);
 
 #ifdef DEBUG
       if (flag)
