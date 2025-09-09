@@ -319,6 +319,48 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     weights->w_qkv->to_device(stream);
   }
 
+  // {
+  //   size_t hidden_dim = p->hidden_dim;
+  //   size_t shard_qkv_size = qkv_layer_size / TP;
+
+  //   weights->w_qkv =
+  //     new Tensor({layers_per_stage, hidden_dim, shard_qkv_size}, stream, DType::BF16);
+
+  //   float *w_qkv_ptr = w->w_qkv + 1ll * pp_offset * qkv_layer_size * hidden_dim;
+
+  //   for (size_t l = 0; l < layers_per_stage; l++) {
+  //     float *src_ptr =
+  //       w_qkv_ptr + l * hidden_dim * qkv_layer_size + 1ll * tp_rank * shard_qkv_size * hidden_dim;
+  //     float *dst_ptr = weights->w_qkv->buf + l * hidden_dim * shard_qkv_size;
+
+  //     for (size_t i = 0; i < shard_qkv_size; i++) {
+  //       for (size_t j = 0; j < hidden_dim; j++) {
+  //         float value = src_ptr[i * hidden_dim + j];
+  //         dst_ptr[j * shard_qkv_size + i] = bf16(value);
+  //       }
+  //     }
+  //   }
+
+  //   weights->w_qkv->to_device(stream);
+  // }
+
+  // {
+  //   size_t shard_qkv_size = qkv_layer_size / TP;
+  //   weights->b_qkv = new Tensor({layers_per_stage, shard_qkv_size}, stream, DType::BF16);
+
+  //   float *b_qkv_ptr = w->b_qkv + 1ll * pp_offset * qkv_layer_size;
+
+  //   for (size_t l = 0; l < layers_per_stage; l++) {
+  //     float *src_ptr = b_qkv_ptr + l * qkv_layer_size + tp_rank * shard_qkv_size;
+  //     bf16 *dst_ptr = (bf16 *)weights->b_qkv->buf + l * shard_qkv_size;
+
+  //     for (size_t i = 0; i < shard_qkv_size; i++) {
+  //       dst_ptr[i] = bf16(src_ptr[i]);
+  //     }
+  //   }
+
+  //   weights->b_qkv->to_device(stream);
+  // }
   weights->b_qkv = new Tensor({layers_per_stage, qkv_layer_size},
                               w->b_qkv + 1ll * pp_offset * qkv_layer_size, stream, DType::BF16);
 
@@ -348,6 +390,30 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     weights->w_o->to_device(stream);
   }
 
+  // {
+  //   size_t hidden_dim = p->hidden_dim;
+  //   size_t n_attn_heads = p->n_attn_heads;
+  //   size_t head_dim = p->head_dim;
+  //   size_t head_size = n_attn_heads * head_dim;
+  //   size_t shard_head_size = head_size / TP;
+
+  //   weights->w_o = new Tensor({layers_per_stage, shard_head_size, hidden_dim}, stream, DType::BF16);
+  //   float *w_o_ptr = w->w_o + 1ll * pp_offset * hidden_dim * head_size;
+
+  //   for (size_t l = 0; l < layers_per_stage; l++) {
+  //     float *src_ptr = w_o_ptr + 1ll * l * hidden_dim * head_size + tp_rank * shard_head_size;
+  //     bf16 *dst_ptr = (bf16 *)weights->w_o->buf + l * shard_head_size * hidden_dim;
+
+  //     for (size_t i = 0; i < shard_head_size; i++) {
+  //       for (size_t h = 0; h < hidden_dim; h++) {
+  //         dst_ptr[i * hidden_dim + h] = bf16(src_ptr[h * head_size + i]);
+  //       }
+  //     }
+  //   }
+
+  //   weights->w_o->to_device(stream);
+  // }
+
   weights->b_o = new Tensor({layers_per_stage, (size_t)p->hidden_dim},
                             w->b_o + 1ll * pp_offset * (size_t)p->hidden_dim, stream, DType::BF16);
 
@@ -355,6 +421,23 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   weights->attn_sinks =
     new Tensor({layers_per_stage, (size_t)p->n_attn_heads},
                w->attn_sinks + 1ll * pp_offset * (size_t)p->n_attn_heads, stream);
+
+  // {
+  //   size_t n_attn_heads = p->n_attn_heads;
+  //   size_t shard_attn_heads = n_attn_heads / TP;
+
+  //   weights->attn_sinks = new Tensor({layers_per_stage, (size_t)shard_attn_heads}, stream);
+  //   float *attn_sinks_ptr = w->attn_sinks + 1ll * pp_offset * n_attn_heads;
+
+  //   for (size_t l = 0; l < layers_per_stage; l++) {
+  //     float *src_ptr = attn_sinks_ptr + l * n_attn_heads + tp_rank * shard_attn_heads;
+  //     float *dst_ptr = weights->attn_sinks->buf + l * shard_attn_heads;
+
+  //     memcpy(dst_ptr, src_ptr, shard_attn_heads * sizeof(float));
+  //   }
+
+  //   weights->attn_sinks->to_device(stream);
+  // }
 
   weights->w_router = new Tensor(
     {layers_per_stage, (size_t)p->n_experts, (size_t)p->hidden_dim},
@@ -637,22 +720,43 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     {
       size_t vocab_size = p->vocab_size;
       size_t hidden_dim = p->hidden_dim;
+      size_t shard_vocab_size = vocab_size / TP;
 
-      weights->out = new Tensor({hidden_dim, vocab_size}, stream, DType::BF16);
+      weights->out_buffer = new Tensor({hidden_dim, shard_vocab_size}, stream, DType::BF16);
+      float *w_out_ptr = w->out + 1ll * tp_rank * shard_vocab_size * hidden_dim;
 
-      for (size_t i = 0; i < vocab_size; i++) {
+      for (size_t i = 0; i < shard_vocab_size; i++) {
         for (size_t j = 0; j < hidden_dim; j++) {
-          weights->out->buf[j * vocab_size + i] = w->out[i * hidden_dim + j];
+          float value = w_out_ptr[i * hidden_dim + j];
+          weights->out_buffer->buf[j * shard_vocab_size + i] = bf16(value);
         }
       }
 
-      weights->out->to_device(stream);
+      weights->out_buffer->to_device(stream);
     }
+
+    // {
+    //   size_t vocab_size = p->vocab_size;
+    //   size_t hidden_dim = p->hidden_dim;
+
+    //   weights->out = new Tensor({hidden_dim, vocab_size}, stream, DType::BF16);
+
+    //   for (size_t i = 0; i < vocab_size; i++) {
+    //     for (size_t j = 0; j < hidden_dim; j++) {
+    //       weights->out->buf[j * vocab_size + i] = w->out[i * hidden_dim + j];
+    //     }
+    //   }
+
+    //   weights->out->to_device(stream);
+    // }
   } else {
     weights->rms_out_w = nullptr;
-    weights->out = nullptr;
+    // weights->out = nullptr;
+    weights->out_buffer = nullptr;
   }
 }
+
+#define TMP_TP 1
 
 void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
                         hipStream_t stream) {
@@ -661,8 +765,13 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->x = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
 
   rs->t = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
-  rs->tb = new Tensor({BATCH_SIZE, (size_t)p->head_dim * p->n_attn_heads}, stream);
+  rs->tb = new Tensor({BATCH_SIZE, (size_t)p->head_dim * p->n_attn_heads / TMP_TP}, stream);
   rs->tb2 = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
+  if (device_id % TP == 0) {
+    rs->tb2_buf = new Tensor({(TP - 1), BATCH_SIZE, (size_t)p->hidden_dim}, stream);
+  } else {
+    rs->tb2_buf = nullptr;
+  }
 
   rs->tb3 = new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
   if (device_id % TP == 0) {
@@ -696,18 +805,20 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   }
 
   rs->qkv = new Tensor(
-    {BATCH_SIZE, ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim}, stream);
-  rs->q = new Tensor({BATCH_SIZE, (size_t)p->n_attn_heads * p->head_dim}, stream);
-  rs->k = new Tensor({BATCH_SIZE, (size_t)p->n_kv_heads * p->head_dim}, stream);
-  rs->v = new Tensor({BATCH_SIZE, (size_t)p->n_kv_heads * p->head_dim}, stream);
+    {BATCH_SIZE, ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim / TMP_TP},
+    stream);
+  rs->q = new Tensor({BATCH_SIZE, (size_t)p->n_attn_heads * p->head_dim / TMP_TP}, stream);
+  rs->k = new Tensor({BATCH_SIZE, (size_t)p->n_kv_heads * p->head_dim / TMP_TP}, stream);
+  rs->v = new Tensor({BATCH_SIZE, (size_t)p->n_kv_heads * p->head_dim / TMP_TP}, stream);
   rs->att = new Tensor({BATCH_SIZE, (size_t)p->n_attn_heads, (size_t)p->seq_len}, stream);
   rs->logits = new Tensor({BATCH_SIZE, (size_t)p->vocab_size}, stream);
+  rs->tmp_logits = new Tensor({BATCH_SIZE, (size_t)p->vocab_size / TP}, stream);
 
   rs->key_cache = new Tensor({BATCH_SIZE, ((size_t)p->n_layers / PP), (size_t)p->seq_len,
-                              (size_t)p->n_kv_heads * p->head_dim},
+                              (size_t)p->n_kv_heads * p->head_dim / TMP_TP},
                              stream);
   rs->value_cache = new Tensor({BATCH_SIZE, ((size_t)p->n_layers / PP), (size_t)p->seq_len,
-                                (size_t)p->n_kv_heads * p->head_dim},
+                                (size_t)p->n_kv_heads * p->head_dim / TMP_TP},
                                stream);
 
   // mask needs to be batch because they are not zero_allocated

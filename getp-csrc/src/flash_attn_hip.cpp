@@ -160,7 +160,7 @@ void single_query_attn_flash_batched(Tensor *q, Tensor *K_cache, Tensor *V_cache
                                      bool q_to_device, bool k_cache_to_device,
                                      bool v_cache_to_device, bool mask_to_device,
                                      bool tb_from_device, hipStream_t stream) {
-  // GpuTimer timer("single_query_attn_flash_batched", stream);
+  // GpuTimer timer("flash_attention", stream);
   if (q_to_device)
     q->to_device(stream);
   if (k_cache_to_device)

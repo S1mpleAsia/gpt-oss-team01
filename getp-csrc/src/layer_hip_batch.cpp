@@ -914,8 +914,8 @@ void attn_out_project_batched_v2(Tensor *tb,         // Shape: [batch_size, n_at
                                  const Tensor *W_o,  // Shape: [n_attn_heads * head_dim, hidden_dim]
                                  const Tensor *b_o,  // Shape: [hidden_dim]
                                  Tensor *y,          // Shape: [batch_size, hidden_dim]
-                                 int cur_batch_size, long long layer_offset, bool tb_to_device,
-                                 bool y_from_device, hipStream_t stream) {
+                                 bool has_bias, int cur_batch_size, long long layer_offset,
+                                 bool tb_to_device, bool y_from_device, hipStream_t stream) {
   // GpuTimer timer("attn_out_project_v2", stream);
   if (tb_to_device) {
     tb->to_device(stream);
@@ -926,7 +926,8 @@ void attn_out_project_batched_v2(Tensor *tb,         // Shape: [batch_size, n_at
   const int out_features = y->shape[1];  // hidden_dim
 
   const bf16 *w_o_ptr = (const bf16 *)W_o->d_buf + 1ll * layer_offset * out_features * in_features;
-  const bf16 *b_o_ptr = (const bf16 *)b_o->d_buf + 1ll * layer_offset * out_features;
+  const bf16 *b_o_ptr =
+    has_bias ? (const bf16 *)b_o->d_buf + 1ll * layer_offset * out_features : nullptr;
 
   const float *tb_ptr = (float *)tb->d_buf;
   float *y_ptr = (float *)y->d_buf;
@@ -1655,6 +1656,5 @@ void classifier_gemm_batched_v2(const Tensor *W_out,  // Shape: [hidden_dim, voc
 
   if (logits_from_device) {
     logits->from_device(stream);
-    CHECK_HIP(hipStreamSynchronize(stream));
   }
 }

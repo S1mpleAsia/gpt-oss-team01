@@ -237,6 +237,104 @@ void reduce_tb3(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cu
   pthread_barrier_wait(tp_barrier);
 }
 
+void reduce_tb2(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
+                pthread_barrier_t *tp_barrier, hipStream_t stream, hipEvent_t tp_ready,
+                hipEvent_t tp_finish) {
+  if (tp_rank > 0) {
+    size_t num_elems = rs_now->tb2->num_elem();
+    size_t num_bytes = num_elems * rs_now->tb2->get_dtype_size();
+
+    void *dst_buf = (void *)((float *)rs_leader->tb2_buf->d_buf + (tp_rank - 1) * num_elems);
+    const void *src_buf = rs_now->tb2->d_buf;
+
+    CHECK_HIP(
+      hipMemcpyPeerAsync(dst_buf, cur_device - tp_rank, src_buf, cur_device, num_bytes, stream));
+    CHECK_HIP(hipEventRecord(tp_ready, stream));
+  }
+
+  pthread_barrier_wait(tp_barrier);
+
+  if (tp_rank == 0) {
+    hipEvent_t tp_ready_each;
+    size_t num_elements = rs_now->tb2->num_elem();
+    float *d_buf = (float *)rs_now->tb2->d_buf;
+    float *d_buf_each = (float *)rs_leader->tb2_buf->d_buf;
+
+    const int block_size = 256;
+    const int grid_size = (num_elements + block_size - 1) / block_size;
+
+    for (int i = 1; i < TP; i++) {
+      tp_ready_each = total_events->tp_ready[cur_device + i];
+      CHECK_HIP(hipStreamWaitEvent(stream, tp_ready_each));
+
+      add_vector_kernel_batched<<<grid_size, block_size, 0, stream>>>(
+        d_buf, (const float *)d_buf_each, num_elements);
+
+      d_buf_each += num_elements;
+    }
+    CHECK_HIP(hipEventRecord(tp_ready, stream));
+  }
+
+  pthread_barrier_wait(tp_barrier);
+
+  if (tp_rank > 0) {
+    hipEvent_t leader_tp_ready = total_events->tp_ready[cur_device - tp_rank];
+    size_t num_bytes = rs_now->tb2->num_elem() * rs_now->tb2->get_dtype_size();
+    void *dst_buf = rs_now->tb2->d_buf;
+
+    const void *src_buf = rs_leader->tb2->d_buf;
+
+    CHECK_HIP(hipStreamWaitEvent(stream, leader_tp_ready));
+    CHECK_HIP(
+      hipMemcpyPeerAsync(dst_buf, cur_device, src_buf, cur_device - tp_rank, num_bytes, stream));
+    CHECK_HIP(hipEventRecord(tp_finish, stream));
+  } else {
+    hipEvent_t tp_finish_each;
+    for (int i = 1; i < TP; i++) {
+      tp_finish_each = total_events->tp_finish[cur_device + i];
+      CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_each));
+    }
+  }
+
+  pthread_barrier_wait(tp_barrier);
+}
+
+void all_gather_classifier_v2(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank,
+                              int cur_device, int cur_batch_size, pthread_barrier_t *tp_barrier,
+                              hipStream_t stream, hipEvent_t tp_ready, hipEvent_t tp_finish) {
+  size_t shard_vocab_size = rs_now->tmp_logits->shape[1];
+  size_t vocab_size = shard_vocab_size * TP;
+
+  size_t width_bytes = shard_vocab_size * sizeof(float);
+  size_t height = cur_batch_size;
+
+  const void *src_buf = rs_now->tmp_logits->d_buf;
+  size_t src_pitch = width_bytes;
+
+  float *dst_base_buf = (float *)rs_leader->logits->d_buf;
+  size_t dst_pitch = vocab_size * sizeof(float);
+
+  void *dst_buf = (void *)(dst_base_buf + tp_rank * shard_vocab_size);
+
+  CHECK_HIP(hipMemcpy2DAsync(dst_buf, dst_pitch, src_buf, src_pitch, width_bytes, height,
+                             hipMemcpyDeviceToDevice, stream));
+
+  if (tp_rank > 0) {
+    CHECK_HIP(hipEventRecord(tp_ready, stream));
+  }
+
+  pthread_barrier_wait(tp_barrier);
+
+  if (tp_rank == 0) {
+    for (int i = 1; i < TP; i++) {
+      hipEvent_t worker_event = total_events->tp_ready[cur_device + i];
+      CHECK_HIP(hipStreamWaitEvent(stream, worker_event, 0));
+    }
+  }
+
+  pthread_barrier_wait(tp_barrier);
+}
+
 // two events are needed
 float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow_id, int tp_rank,
                                 int pp_rank, pthread_barrier_t *tp_barrier) {
@@ -326,7 +424,7 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
       // // Separate q, k, v + RoPE + Store k, v in cache
       qkv_split_rope_fused(rs_now->qkv, rs_now->q, rs_now->key_cache, rs_now->value_cache,
                            rs_now->cos_tensor, rs_now->sin_tensor, cur_batch_size, p->head_dim,
-                           p->n_attn_heads, p->n_kv_heads, pos, l, stream);
+                           p->n_attn_heads / 1, p->n_kv_heads / 1, pos, l, stream);
 
 #ifdef DEBUG
       if (flag) {
@@ -342,8 +440,8 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
       // FIX single_query_attn_batched later
       single_query_attn_flash_batched(
         rs_now->q, rs_now->key_cache, rs_now->value_cache, rs_now->mask, weights_now->attn_sinks,
-        rs_now->tb, cur_batch_size, p->head_dim, p->n_attn_heads, kv_mul, kv_dim, p->seq_len,
-        p->sliding_window, pos, 1ll * l, false, false, false, false, false, stream);
+        rs_now->tb, cur_batch_size, p->head_dim, p->n_attn_heads / 1, kv_mul, kv_dim / 1,
+        p->seq_len, p->sliding_window, pos, 1ll * l, false, false, false, false, false, stream);
 
 #ifdef DEBUG
       if (flag)
@@ -351,8 +449,10 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
 #endif
 
       // final matmul to get the output of the attention
-      attn_out_project_batched_v2(rs_now->tb, weights_now->w_o, weights_now->b_o, rs_now->tb2,
+      attn_out_project_batched_v2(rs_now->tb, weights_now->w_o, weights_now->b_o, rs_now->tb2, true,
                                   cur_batch_size, 1ll * l, false, false, stream);
+
+      // reduce_tb2(rs_now, rs_leader, tp_rank, cur_device, tp_barrier, stream, tp_ready, tp_finish);
 
 #ifdef DEBUG
       if (flag)
@@ -497,8 +597,20 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
                   1e-5f, stream);
 
   // classifier into logits
-  classifier_gemm_batched_v2(weights_now->out, rs_now->x, rs_now->logits, cur_batch_size, false,
-                             true, stream);
+  classifier_gemm_batched_v2(weights_now->out_buffer, rs_now->x, rs_now->tmp_logits, cur_batch_size,
+                             false, false, stream);
+
+  {
+    // GpuTimer timer("gather_classifier");
+    all_gather_classifier_v2(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier,
+                             stream, tp_ready, tp_finish);
+  }
+
+  if (tp_rank == 0) {
+    CHECK_HIP(hipSetDevice(cur_device));
+    rs_now->logits->from_device(stream);
+    return rs_now->logits->buf;
+  }
 
 #ifdef DEBUG
   if (flag) {

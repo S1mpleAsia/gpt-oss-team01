@@ -90,8 +90,8 @@ void attn_out_project_batched_v2(Tensor *tb,         // Shape: [batch_size, n_at
                                  const Tensor *W_o,  // Shape: [n_attn_heads * head_dim, hidden_dim]
                                  const Tensor *b_o,  // Shape: [hidden_dim]
                                  Tensor *y,          // Shape: [batch_size, hidden_dim]
-                                 int cur_batch_size, long long layer_offset, bool tb_to_device,
-                                 bool y_from_device, hipStream_t stream = 0);
+                                 bool has_bias, int cur_batch_size, long long layer_offset,
+                                 bool tb_to_device, bool y_from_device, hipStream_t stream = 0);
 
 // ---------- Router GEMM ----------
 void router_gemm_batched(const Tensor *w_router,  // Shape: [n_experts, hidden_dim]

@@ -7,7 +7,7 @@
 #include "tensor.hpp"
 // #include "config_run.hpp"
 
-#define BATCH_SIZE 16
+#define BATCH_SIZE 32
 // #define PRINT_LOGITS
 // #define TIME_GPU
 // #define DEBUG
@@ -58,7 +58,8 @@ typedef struct {
   // final norm [norm.scale]
   Tensor *rms_out_w;  // (hidden_dim, )
   // classifier weights for the logits [unembedding.weight]
-  Tensor *out;  // (vocab_size, hidden_dim) (out, in)
+  Tensor *out;         // (vocab_size, hidden_dim) (out, in)
+  Tensor *out_buffer;  // (hidden_dim, shard_vocab_size)
 } OurTransformerWeights;
 
 typedef struct {
@@ -70,6 +71,7 @@ typedef struct {
   Tensor *t;    // same, but inside a residual branch (hidden_dim, )
   Tensor *tb;   // (head_dim * n_attn_heads, )
   Tensor *tb2;  // (hidden_dim, )
+  Tensor *tb2_buf;
   Tensor *tb3;  // (n_experts, hidden_dim)
   Tensor *tb3_buf;
   Tensor *router_score;  // router score (n_experts, )
@@ -81,13 +83,14 @@ typedef struct {
   Tensor *gate_up;  // [batch_size * experts_per_toeken, inter_dim]
   Tensor *e_agg;    // [batch_size, hidden_dim]
   Tensor *e_agg_buf;
-  Tensor *qkv;     // an additional buffer just for convenience (head_dim *
-                   // (n_attn_heads + 2 * n_kv_heads), )
-  Tensor *q;       // query (n_attn_heads * head_dim,)
-  Tensor *k;       // key (n_kv_heads * head_dim,)
-  Tensor *v;       // value (n_kv_heads * head_dim,)
-  Tensor *att;     // buffer for scores/attention values (n_heads, seq_len)
-  Tensor *logits;  // output logits
+  Tensor *qkv;         // an additional buffer just for convenience (head_dim *
+                       // (n_attn_heads + 2 * n_kv_heads), )
+  Tensor *q;           // query (n_attn_heads * head_dim,)
+  Tensor *k;           // key (n_kv_heads * head_dim,)
+  Tensor *v;           // value (n_kv_heads * head_dim,)
+  Tensor *att;         // buffer for scores/attention values (n_heads, seq_len)
+  Tensor *logits;      // output logits
+  Tensor *tmp_logits;  // (batch_size, shard_vocab)
   // kv cache
   Tensor *key_cache;    // (layer, seq_len, kv_dim)
   Tensor *value_cache;  // (layer, seq_len, kv_dim)
