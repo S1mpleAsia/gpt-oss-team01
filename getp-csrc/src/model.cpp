@@ -398,21 +398,19 @@ void all_gather_tb(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int
                    int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream,
                    hipEvent_t tp_ready, hipEvent_t tp_finish) {
   /************************* PHASE 1: GATHER TO LEADER *************************/
-  size_t dtype_size = rs_now->tb_buf->get_dtype_size();
-  size_t shard_size = rs_now->tb_buf->shape[1];
-  size_t full_size = rs_leader->tb->shape[1];
+  size_t shard_tb_size = rs_now->tb_buf->shape[1];
+  size_t full_tb_size = shard_tb_size * TP;
 
-  size_t width_bytes = shard_size * dtype_size;
+  size_t width_bytes = shard_tb_size * sizeof(float);
   size_t height = cur_batch_size;
 
   const void *src_buf = rs_now->tb_buf->d_buf;
   size_t src_pitch = width_bytes;
 
-  void *dst_base_buf = rs_leader->tb->d_buf;
-  size_t dst_pitch = full_size * dtype_size;
+  float *dst_base_buf = (float *)rs_leader->tb->d_buf;
+  size_t dst_pitch = full_tb_size * sizeof(float);
 
-  size_t offset_bytes = tp_rank * width_bytes;
-  void *dst_buf = (char *)dst_base_buf + offset_bytes;
+  void *dst_buf = (void *)(dst_base_buf + tp_rank * shard_tb_size);
 
   CHECK_HIP(hipMemcpy2DAsync(dst_buf, dst_pitch, src_buf, src_pitch, width_bytes, height,
                              hipMemcpyDeviceToDevice, stream));
@@ -420,28 +418,44 @@ void all_gather_tb(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int
   if (tp_rank > 0) {
     CHECK_HIP(hipEventRecord(tp_ready, stream));
   }
+
+#ifdef DEBUG
+  bool flag = true;
+  if (flag)
+    rs_now->tb_buf->printDebug("rs_now->tb_buf after copy to leader", tp_rank, 0, stream);
+#endif
   pthread_barrier_wait(tp_barrier);
 
   if (tp_rank == 0) {
     for (int i = 1; i < TP; i++) {
-      CHECK_HIP(hipStreamWaitEvent(stream, total_events->tp_ready[cur_device + i], 0));
+      hipEvent_t worker_event = total_events->tp_ready[cur_device + i];
+      CHECK_HIP(hipStreamWaitEvent(stream, worker_event, 0));
     }
+
     CHECK_HIP(hipEventRecord(tp_ready, stream));
   }
   pthread_barrier_wait(tp_barrier);
 
-  /************************* PHASE 2: BROADCAST FROM LEADER *************************/
+#ifdef DEBUG
+  if (flag)
+    rs_now->tb->printDebug("rs_now->tb after aggregate", tp_rank, 0, stream);
+#endif
+
   if (tp_rank > 0) {
     hipEvent_t leader_tp_ready = total_events->tp_ready[cur_device - tp_rank];
     CHECK_HIP(hipStreamWaitEvent(stream, leader_tp_ready));
 
-    size_t full_tb_bytes = rs_leader->tb->num_elem() * dtype_size;
-    CHECK_HIP(hipMemcpyPeerAsync(rs_now->tb->d_buf, cur_device, rs_leader->tb->d_buf,
-                                 cur_device - tp_rank, full_tb_bytes, stream));
+    size_t tb_bytes = rs_now->tb->num_elem() * rs_now->tb->get_dtype_size();
+    void *dst_buf = rs_now->tb->d_buf;
+    const void *src_buf = rs_leader->tb->d_buf;
+
+    CHECK_HIP(
+      hipMemcpyPeerAsync(dst_buf, cur_device, src_buf, cur_device - tp_rank, tb_bytes, stream));
     CHECK_HIP(hipEventRecord(tp_finish, stream));
   } else {
     for (int i = 1; i < TP; i++) {
-      CHECK_HIP(hipStreamWaitEvent(stream, total_events->tp_finish[cur_device + i], 0));
+      hipEvent_t worker_finish = total_events->tp_finish[cur_device + i];
+      CHECK_HIP(hipStreamWaitEvent(stream, worker_finish, 0));
     }
   }
   pthread_barrier_wait(tp_barrier);
@@ -524,12 +538,12 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
       long long loff = 1ll * l * loff_one;  // kv cache layer offset
 
       // QKV projection
-      qkv_gemm_batched_v2(rs_now->t, weights_now->w_qkv, weights_now->b_qkv, rs_now->tmp_qkv,
+      qkv_gemm_batched_v2(rs_now->t, weights_now->w_qkv, weights_now->b_qkv, rs_now->qkv,
                           cur_batch_size, 1ll * l, false, false,
                           stream);  // This kernel diverges the most
 
-      all_gather_qkv_v2(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream,
-                        tp_ready, tp_finish);
+      // all_gather_qkv_v2(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream,
+      //                   tp_ready, tp_finish);
 
 #ifdef DEBUG
       if (flag)
@@ -539,7 +553,7 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
       // // Separate q, k, v + RoPE + Store k, v in cache
       qkv_split_rope_fused(rs_now->qkv, rs_now->q, rs_now->key_cache, rs_now->value_cache,
                            rs_now->cos_tensor, rs_now->sin_tensor, cur_batch_size, p->head_dim,
-                           p->n_attn_heads / 1, p->n_kv_heads / 1, pos, l, stream);
+                           p->n_attn_heads / TP, p->n_kv_heads / TP, pos, l, stream);
 
 #ifdef DEBUG
       if (flag) {
@@ -555,7 +569,7 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
       // FIX single_query_attn_batched later
       single_query_attn_flash_batched(
         rs_now->q, rs_now->key_cache, rs_now->value_cache, rs_now->mask, weights_now->attn_sinks,
-        rs_now->tb, cur_batch_size, p->head_dim, p->n_attn_heads / 1, kv_mul, kv_dim / 1,
+        rs_now->tb, cur_batch_size, p->head_dim, p->n_attn_heads / TP, kv_mul, kv_dim / TP,
         p->seq_len, p->sliding_window, pos, 1ll * l, false, false, false, false, false, stream);
 
       // all_gather_tb(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream,
@@ -567,10 +581,10 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
 #endif
 
       // final matmul to get the output of the attention
-      attn_out_project_batched_v2(rs_now->tb, weights_now->w_o, weights_now->b_o, rs_now->tb2, true,
-                                  cur_batch_size, 1ll * l, false, false, stream);
+      attn_out_project_batched_v2(rs_now->tb, weights_now->w_o, weights_now->b_o, rs_now->tb2,
+                                  tp_rank == 0, cur_batch_size, 1ll * l, false, false, stream);
 
-      // reduce_tb2(rs_now, rs_leader, tp_rank, cur_device, tp_barrier, stream, tp_ready, tp_finish);
+      reduce_tb2(rs_now, rs_leader, tp_rank, cur_device, tp_barrier, stream, tp_ready, tp_finish);
 
 #ifdef DEBUG
       if (flag)

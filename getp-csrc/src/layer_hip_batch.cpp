@@ -604,12 +604,12 @@ __global__ void qkv_split_rope_store_kernel(
   }
 }
 
-void qkv_split_rope_fused(Tensor *qkv_out,  // Shape: [batch_size, (n_q + 2*n_kv)*hd]
-                          Tensor *q_out,    // Shape: [batch_size, n_q*hd]
+void qkv_split_rope_fused(Tensor *qkv_out,  // Shape: [batch_size, (n_q + 2*n_kv) * head_dim]
+                          Tensor *q_out,    // Shape: [batch_size, n_q * head_dim]
                           Tensor *K_cache,  // Shape: [batch_size, n_layers, seq_len, kv_dim]
                           Tensor *V_cache,  // Shape: [batch_size, n_layers, seq_len, kv_dim]
-                          const Tensor *rope_cos_pos,  // Shape: [seq_len, hd/2]
-                          const Tensor *rope_sin_pos,  // Shape: [seq_len, hd/2]
+                          const Tensor *rope_cos_pos,  // Shape: [seq_len, head_dim / 2]
+                          const Tensor *rope_sin_pos,  // Shape: [seq_len, head_dim / 2]
                           int cur_batch_size, int head_dim, int n_q, int n_kv, int pos,
                           long long layer_offset, hipStream_t stream) {
   // GpuTimer timer("qkv_split_fused", stream);
