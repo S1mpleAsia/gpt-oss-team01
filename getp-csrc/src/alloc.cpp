@@ -377,53 +377,56 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
       {layers_each, experts_each, 2 * (size_t)p->intermediate_dim, (size_t)p->hidden_dim}, w_mlp1_ptr, device_id, DType::BF16
     );
   */
-  {
-    printf("Starting alloc mlp1\n");
-    fflush(stdout);
-    size_t n_layers = layers_each;
-    size_t n_experts = p->n_experts;
-    size_t hidden_dim = p->hidden_dim;
-    size_t inter_dim = p->intermediate_dim;
-    size_t shard_dim = shard_dim_each;
+  alloc_w_mlp1_new(weights->w_mlp1, w_mlp1_ptr, p, device_id);
+  /*
+    {
+      printf("Starting alloc mlp1\n");
+      fflush(stdout);
+      size_t n_layers = layers_each;
+      size_t n_experts = p->n_experts;
+      size_t hidden_dim = p->hidden_dim;
+      size_t inter_dim = p->intermediate_dim;
+      size_t shard_dim = shard_dim_each;
 
-    w_mlp1_ptr += tp_rank * (2 * shard_dim) * hidden_dim; // offset shard_dim;
+      w_mlp1_ptr += tp_rank * (2 * shard_dim) * hidden_dim; // offset shard_dim;
 
-    weights->w_mlp1 = new Tensor({n_layers, n_experts, hidden_dim, 2 * shard_dim}, w_mlp1_ptr, device_id, false, DType::BF16);
+      weights->w_mlp1 = new Tensor({n_layers, n_experts, hidden_dim, 2 * shard_dim}, w_mlp1_ptr, device_id, false, DType::BF16);
 
-    size_t tmp_elems = hidden_dim * 2 * shard_dim;
-    bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
+      size_t tmp_elems = hidden_dim * 2 * shard_dim;
+      bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
 
-    bf16 *d_buf = (bf16 *)(weights->w_mlp1->d_buf);
+      bf16 *d_buf = (bf16 *)(weights->w_mlp1->d_buf);
 
-    size_t l_offset = 1ll * n_experts * (2 * inter_dim) * hidden_dim;
-    size_t e_offset = 1ll * (2 * inter_dim) * hidden_dim;
+      size_t l_offset = 1ll * n_experts * (2 * inter_dim) * hidden_dim;
+      size_t e_offset = 1ll * (2 * inter_dim) * hidden_dim;
 
-    size_t l_offset_d = 1ll * n_experts * hidden_dim * (2 * shard_dim);
-    size_t e_offset_d = 1ll * hidden_dim * (2 * shard_dim);
+      size_t l_offset_d = 1ll * n_experts * hidden_dim * (2 * shard_dim);
+      size_t e_offset_d = 1ll * hidden_dim * (2 * shard_dim);
 
-    for (size_t l = 0; l < n_layers; l++) {
-      for (size_t e = 0; e < n_experts; e++) {
-        size_t base = 1ll * l * l_offset + 1ll * e * e_offset;
+      for (size_t l = 0; l < n_layers; l++) {
+        for (size_t e = 0; e < n_experts; e++) {
+          size_t base = 1ll * l * l_offset + 1ll * e * e_offset;
 
-        for (size_t h = 0; h < hidden_dim; h++) {
-          for (size_t i = 0; i < 2 * shard_dim; i++) {
-            float value = w_mlp1_ptr[base + i * hidden_dim + h];
-            tmp[h * 2 * shard_dim + i] = bf16(value);
+          for (size_t h = 0; h < hidden_dim; h++) {
+            for (size_t i = 0; i < 2 * shard_dim; i++) {
+              float value = w_mlp1_ptr[base + i * hidden_dim + h];
+              tmp[h * 2 * shard_dim + i] = bf16(value);
+            }
           }
+
+          size_t d_offset = 1ll * l * l_offset_d + 1ll * e * e_offset_d;
+          CHECK_HIP(hipMemcpyAsync(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16),
+                                  hipMemcpyHostToDevice, 0));
         }
-
-        size_t d_offset = 1ll * l * l_offset_d + 1ll * e * e_offset_d;
-        CHECK_HIP(hipMemcpyAsync(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16),
-                                 hipMemcpyHostToDevice, 0));
       }
+
+      CHECK_HIP(hipStreamSynchronize(0));
+      free(tmp);
+
+      printf("End alloc mlp1\n");
+      fflush(stdout);
     }
-
-    CHECK_HIP(hipStreamSynchronize(0));
-    free(tmp);
-
-    printf("End alloc mlp1\n");
-    fflush(stdout);
-  }
+  */
   /** w_mlp1 EXPERT PARALLELISM
     w_mlp1_ptr += 1ll * tp_offset * 2 * (size_t)p->intermediate_dim * (size_t)p->hidden_dim;
     bf16 *w_mlp1_d_buf = (bf16 *)weights->w_mlp1->d_buf;
@@ -531,55 +534,58 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
       {layers_each, experts_each, (size_t)p->hidden_dim, (size_t)p->intermediate_dim}, w_mlp2_ptr, device_id, DType::BF16
     );
   */
-  {
-    printf("Starting alloc mlp2\n");
-    fflush(stdout);
-    size_t n_layers = layers_each;
-    size_t n_experts = p->n_experts;
-    size_t hidden_dim = p->hidden_dim;
-    size_t inter_dim = p->intermediate_dim;
-    size_t shard_dim = shard_dim_each;
+  alloc_w_mlp2_new(weights->w_mlp2, w_mlp2_ptr, p, device_id);
+  /*
+    {
+      printf("Starting alloc mlp2\n");
+      fflush(stdout);
+      size_t n_layers = layers_each;
+      size_t n_experts = p->n_experts;
+      size_t hidden_dim = p->hidden_dim;
+      size_t inter_dim = p->intermediate_dim;
+      size_t shard_dim = shard_dim_each;
 
-    w_mlp2_ptr += 1ll * tp_rank * shard_dim; // offset shard_dim;
+      w_mlp2_ptr += 1ll * tp_rank * shard_dim; // offset shard_dim;
 
-    weights->w_mlp2 = new Tensor({n_layers, n_experts, shard_dim, hidden_dim}, w_mlp2_ptr, device_id, false, DType::BF16);
+      weights->w_mlp2 = new Tensor({n_layers, n_experts, shard_dim, hidden_dim}, w_mlp2_ptr, device_id, false, DType::BF16);
 
-    size_t tmp_elems = shard_dim * hidden_dim;
-    bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
+      size_t tmp_elems = shard_dim * hidden_dim;
+      bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
 
-    bf16 *d_buf = (bf16 *)(weights->w_mlp2->d_buf);
+      bf16 *d_buf = (bf16 *)(weights->w_mlp2->d_buf);
 
-    size_t l_offset = 1ll * n_experts * hidden_dim * inter_dim;
-    size_t e_offset = 1ll * hidden_dim * inter_dim;
+      size_t l_offset = 1ll * n_experts * hidden_dim * inter_dim;
+      size_t e_offset = 1ll * hidden_dim * inter_dim;
 
-    size_t l_offset_d = 1ll * n_experts * shard_dim * hidden_dim;
-    size_t e_offset_d = 1ll * shard_dim * hidden_dim;
+      size_t l_offset_d = 1ll * n_experts * shard_dim * hidden_dim;
+      size_t e_offset_d = 1ll * shard_dim * hidden_dim;
 
-    
-    for (size_t l = 0; l < n_layers; l++) {
-      for (size_t e = 0; e < n_experts; e++) {
-        size_t base = 1ll * l * l_offset + 1ll * e * e_offset;
+      
+      for (size_t l = 0; l < n_layers; l++) {
+        for (size_t e = 0; e < n_experts; e++) {
+          size_t base = 1ll * l * l_offset + 1ll * e * e_offset;
 
-        for (size_t i = 0; i < shard_dim; i++) {
-          for (size_t h = 0; h < hidden_dim; h++) {
-            float value = w_mlp2_ptr[base + h * inter_dim + i];
-            tmp[i * hidden_dim + h] = bf16(value);
+          for (size_t i = 0; i < shard_dim; i++) {
+            for (size_t h = 0; h < hidden_dim; h++) {
+              float value = w_mlp2_ptr[base + h * inter_dim + i];
+              tmp[i * hidden_dim + h] = bf16(value);
+            }
           }
+
+          size_t d_offset = 1ll * l * l_offset_d + 1ll * e * e_offset_d;
+          CHECK_HIP(hipMemcpyAsync(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16),
+                                  hipMemcpyHostToDevice, 0));
         }
-
-        size_t d_offset = 1ll * l * l_offset_d + 1ll * e * e_offset_d;
-        CHECK_HIP(hipMemcpyAsync(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16),
-                                 hipMemcpyHostToDevice, 0));
       }
+
+      CHECK_HIP(hipStreamSynchronize(0));
+      free(tmp);
+
+      // weights->w_mlp2->to_device(0);
+      printf("End alloc mlp2\n");
+      fflush(stdout);
     }
-
-    CHECK_HIP(hipStreamSynchronize(0));
-    free(tmp);
-
-    // weights->w_mlp2->to_device(0);
-    printf("End alloc mlp2\n");
-    fflush(stdout);
-  }
+  */
 
   /** w_mlp2 EXPERT PARALLELISM
     // Apply tensor parallelism (tp) offset for the expert dimension
@@ -751,7 +757,7 @@ void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunSt
   total_events->tp_finish = new hipEvent_t[TOTAL_GPUS_NEEDED];
   total_events->pp_sync = new hipEvent_t[TOTAL_GPUS_NEEDED];
 
-  // #pragma omp parallel for num_threads(TOTAL_GPUS_NEEDED)
+  #pragma omp parallel for num_threads(TOTAL_GPUS_NEEDED)
   for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
     CHECK_HIP(hipSetDevice(i));
     

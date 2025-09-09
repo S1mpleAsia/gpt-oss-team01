@@ -7,6 +7,7 @@
 #include "src/layer_hip_batch.cpp"
 #include "src/model.cpp"
 #include "src/alloc.cpp"
+#include "src/alloc_utils.cpp"
 #include "src/utils.cpp"
 #include "src/kernel.cpp"
 
