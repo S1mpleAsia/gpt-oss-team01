@@ -123,7 +123,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
   weights->b_mlp1 =
     new Tensor({(size_t)p->n_layers, (size_t)p->n_experts, 2 * (size_t)p->intermediate_dim},
-               w->b_mlp1, device_id, DType::BF16);
+               w->b_mlp1, device_id, true, DType::BF16);
 
   // weights->w_mlp2 = new Tensor(
   //   {(size_t)p->n_layers, (size_t)p->n_experts, (size_t)p->hidden_dim, (size_t)p->intermediate_dim},
@@ -174,7 +174,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   }
 
   weights->b_mlp2 = new Tensor({(size_t)p->n_layers, (size_t)p->n_experts, (size_t)p->hidden_dim},
-                               w->b_mlp2, device_id, DType::BF16);
+                               w->b_mlp2, device_id, true, DType::BF16);
 
   weights->rms_out_w = new Tensor({(size_t)p->hidden_dim}, w->rms_out_w, device_id);
   // weights->out = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->out, device_id);
@@ -388,7 +388,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
     w_mlp1_ptr += tp_rank * (2 * shard_dim) * hidden_dim; // offset shard_dim;
 
-    weights->w_mlp1 = new Tensor({n_layers, n_experts, hidden_dim, 2 * shard_dim}, w_mlp1_ptr, device_id, DType::BF16);
+    weights->w_mlp1 = new Tensor({n_layers, n_experts, hidden_dim, 2 * shard_dim}, w_mlp1_ptr, device_id, false, DType::BF16);
 
     size_t tmp_elems = hidden_dim * 2 * shard_dim;
     bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
@@ -413,8 +413,8 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
         }
 
         size_t d_offset = 1ll * l * l_offset_d + 1ll * e * e_offset_d;
-        CHECK_HIP(hipMemcpy(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16),
-                                 hipMemcpyHostToDevice));
+        CHECK_HIP(hipMemcpyAsync(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16),
+                                 hipMemcpyHostToDevice, 0));
       }
     }
 
@@ -462,7 +462,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
     b_mlp1_ptr += 1ll * tp_rank * (2 * shard_dim); // offset shard_dim;
 
-    weights->b_mlp1 = new Tensor({n_layers, n_experts, 2 * shard_dim}, b_mlp1_ptr, device_id, DType::BF16);
+    weights->b_mlp1 = new Tensor({n_layers, n_experts, 2 * shard_dim}, b_mlp1_ptr, device_id, false, DType::BF16);
 
     bf16 *d_buf = (bf16 *)(weights->b_mlp1->d_buf);
 
@@ -474,7 +474,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
     size_t l_offset_d = 1ll * n_experts * 2 * shard_dim;
     size_t e_offset_d = 1ll * 2 * shard_dim;
-
+    
     for (size_t l = 0; l < n_layers; l++) {
       for (size_t e = 0; e < n_experts; e++) {
         size_t base = 1ll * l * l_offset + 1ll * e * e_offset;
@@ -542,7 +542,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
     w_mlp2_ptr += 1ll * tp_rank * shard_dim; // offset shard_dim;
 
-    weights->w_mlp2 = new Tensor({n_layers, n_experts, shard_dim, hidden_dim}, w_mlp2_ptr, device_id, DType::BF16);
+    weights->w_mlp2 = new Tensor({n_layers, n_experts, shard_dim, hidden_dim}, w_mlp2_ptr, device_id, false, DType::BF16);
 
     size_t tmp_elems = shard_dim * hidden_dim;
     bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
@@ -555,6 +555,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     size_t l_offset_d = 1ll * n_experts * shard_dim * hidden_dim;
     size_t e_offset_d = 1ll * shard_dim * hidden_dim;
 
+    
     for (size_t l = 0; l < n_layers; l++) {
       for (size_t e = 0; e < n_experts; e++) {
         size_t base = 1ll * l * l_offset + 1ll * e * e_offset;
@@ -567,8 +568,8 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
         }
 
         size_t d_offset = 1ll * l * l_offset_d + 1ll * e * e_offset_d;
-        CHECK_HIP(hipMemcpy(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16),
-                                 hipMemcpyHostToDevice));
+        CHECK_HIP(hipMemcpyAsync(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16),
+                                 hipMemcpyHostToDevice, 0));
       }
     }
 
@@ -610,7 +611,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   float *b_mlp2_ptr = w->b_mlp2 + 1ll * pp_offset * (size_t)p->n_experts * (size_t)p->hidden_dim;
   weights->b_mlp2 = new Tensor(
     {layers_each, experts_each, (size_t)p->hidden_dim},
-    b_mlp2_ptr, device_id, DType::BF16
+    b_mlp2_ptr, device_id, true, DType::BF16
   );
 
   /** b_mlp2 EXPERT PARALLELISM
@@ -654,7 +655,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
       bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
 
-      weights->out = new Tensor({hidden_dim, vocab_size}, w->out, device_id, DType::BF16);
+      weights->out = new Tensor({hidden_dim, vocab_size}, w->out, device_id, false, DType::BF16);
 
       bf16 *d_buf = (bf16 *)weights->out->d_buf;
 
@@ -750,7 +751,7 @@ void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunSt
   total_events->tp_finish = new hipEvent_t[TOTAL_GPUS_NEEDED];
   total_events->pp_sync = new hipEvent_t[TOTAL_GPUS_NEEDED];
 
-  #pragma omp parallel for num_threads(TOTAL_GPUS_NEEDED)
+  // #pragma omp parallel for num_threads(TOTAL_GPUS_NEEDED)
   for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
     CHECK_HIP(hipSetDevice(i));
     

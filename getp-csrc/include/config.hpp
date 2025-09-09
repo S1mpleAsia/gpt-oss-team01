@@ -13,7 +13,7 @@
 // #define RUN_20B
 
 #ifdef RUN_20B
-  #define DP 2
+  #define DP 8
   #define PP 1
   #define TP 1
 #else

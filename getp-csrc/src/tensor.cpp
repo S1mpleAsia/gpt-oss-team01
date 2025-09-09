@@ -18,7 +18,7 @@ Tensor::Tensor(
 }
 
 Tensor::Tensor(
-  const vector<size_t> &shape_, float *buf_, int gpu_id, DType::Type dtype
+  const vector<size_t> &shape_, float *buf_, int gpu_id, bool to_device_init, DType::Type dtype
 ) : shape(shape_), buf(buf_), dtype(dtype), owns_host_buf(false), gpu_id(gpu_id) {
   CHECK_HIP(hipSetDevice(gpu_id));  // Set device before any operations
   
@@ -28,7 +28,7 @@ Tensor::Tensor(
   size_t d_size = (dtype == DType::FP32) ? N_ * sizeof(float) : N_ * sizeof(bf16);
   CHECK_HIP(hipMalloc(&d_buf, d_size));
 
-  to_device(0);
+  if (to_device_init) to_device(0);
 }
 
 /**
