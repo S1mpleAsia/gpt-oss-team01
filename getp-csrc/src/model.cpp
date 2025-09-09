@@ -51,7 +51,7 @@ float *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flo
       p->sliding_window, pos, 1ll * l, false, false, false, false, false, stream);
 
     // final matmul to get the output of the attention
-    attn_out_project_batched_v2(rs_now->tb, weights_now->w_o, weights_now->b_o, rs_now->tb2,
+    attn_out_project_batched_v2(rs_now->tb, weights_now->w_o, weights_now->b_o, rs_now->tb2, true,
                                 cur_batch_size, 1ll * l, false, false, stream);
 
     // residual connection back into x

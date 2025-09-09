@@ -11,7 +11,7 @@
 // #define PRINT_LOGITS
 // #define TIME_GPU
 // #define DEBUG
-// #define RUN_20B
+#define RUN_20B
 
 #ifdef RUN_20B
 #define DP 1
