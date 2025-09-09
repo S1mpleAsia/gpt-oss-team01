@@ -67,9 +67,10 @@ typedef struct {
   Tensor *sin_tensor;
 
   // current wave of activations
-  Tensor *x;    // activation at current time stamp (hidden_dim, )
-  Tensor *t;    // same, but inside a residual branch (hidden_dim, )
-  Tensor *tb;   // (head_dim * n_attn_heads, )
+  Tensor *x;   // activation at current time stamp (hidden_dim, )
+  Tensor *t;   // same, but inside a residual branch (hidden_dim, )
+  Tensor *tb;  // (head_dim * n_attn_heads, )
+  Tensor *tb_buf;
   Tensor *tb2;  // (hidden_dim, )
   Tensor *tb2_buf;
   Tensor *tb3;  // (n_experts, hidden_dim)
@@ -83,8 +84,9 @@ typedef struct {
   Tensor *gate_up;  // [batch_size * experts_per_toeken, inter_dim]
   Tensor *e_agg;    // [batch_size, hidden_dim]
   Tensor *e_agg_buf;
-  Tensor *qkv;         // an additional buffer just for convenience (head_dim *
-                       // (n_attn_heads + 2 * n_kv_heads), )
+  Tensor *qkv;  // an additional buffer just for convenience (head_dim *
+                // (n_attn_heads + 2 * n_kv_heads), )
+  Tensor *tmp_qkv;
   Tensor *q;           // query (n_attn_heads * head_dim,)
   Tensor *k;           // key (n_kv_heads * head_dim,)
   Tensor *v;           // value (n_kv_heads * head_dim,)
