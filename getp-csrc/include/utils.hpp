@@ -33,3 +33,7 @@ struct GpuTimer {
     CHECK_HIP(hipEventDestroy(stop_event));
   }
 };
+
+struct Timer {
+  
+};

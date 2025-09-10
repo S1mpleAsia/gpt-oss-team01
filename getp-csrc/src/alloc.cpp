@@ -357,7 +357,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     CHECK_HIP(hipStreamSynchronize(0));
     free(tmp);
 
-    printf("End alloc w_qkv\n");
+    printf("End alloc w_o\n");
     fflush(stdout);
   }
 
@@ -651,34 +651,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     /** w->out
       weights->out = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->out, device_id);
     */
-    {
-      printf("Starting alloc out...\n");
-      fflush(stdout);
-      size_t vocab_size = p->vocab_size;
-      size_t hidden_dim = p->hidden_dim;
-
-      size_t tmp_elems = 1ll * hidden_dim * vocab_size;
-
-      bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
-
-      weights->out = new Tensor({hidden_dim, vocab_size}, w->out, device_id, false, DType::BF16);
-
-      bf16 *d_buf = (bf16 *)weights->out->d_buf;
-
-      for (size_t i = 0; i < vocab_size; i++) {
-        for (size_t j = 0; j < hidden_dim; j++) {
-          tmp[j * vocab_size + i] = bf16(w->out[i * hidden_dim + j]);
-        }
-      }
-
-      CHECK_HIP(hipMemcpy(d_buf, tmp, tmp_elems * sizeof(bf16),
-                                hipMemcpyHostToDevice));
-      CHECK_HIP(hipStreamSynchronize(0));
-      free(tmp);
-      
-      printf("End alloc out\n");
-      fflush(stdout);
-    }
+    alloc_out(weights->out, w->out, p, device_id);
   } else {
     weights->rms_out_w = nullptr;
     weights->out = nullptr;

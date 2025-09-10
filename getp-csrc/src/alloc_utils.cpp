@@ -358,3 +358,65 @@ void alloc_w_mlp2(
     printf("End alloc mlp2\n");
     fflush(stdout);
 }
+
+void alloc_out_new(
+    Tensor* &out, float *w_out, Config *p, int device_id
+) {
+    printf("Starting alloc out...\n");
+    fflush(stdout);
+    size_t vocab_size = p->vocab_size;
+    size_t hidden_dim = p->hidden_dim;
+
+    size_t tmp_elems = 1ll * hidden_dim * vocab_size;
+
+    bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
+
+    out = new Tensor({hidden_dim, vocab_size}, w_out, device_id, false, DType::BF16);
+
+    bf16 *d_buf = (bf16 *)out->d_buf;
+
+    for (size_t i = 0; i < vocab_size; i++) {
+        for (size_t j = 0; j < hidden_dim; j++) {
+            tmp[j * vocab_size + i] = bf16(w_out[i * hidden_dim + j]);
+        }
+    }
+
+    CHECK_HIP(hipMemcpy(d_buf, tmp, tmp_elems * sizeof(bf16),
+                            hipMemcpyHostToDevice));
+    CHECK_HIP(hipStreamSynchronize(0));
+    free(tmp);
+    
+    printf("End alloc out\n");
+    fflush(stdout);
+}
+
+void alloc_out(
+    Tensor* &out, float *w_out, Config *p, int device_id
+) {
+    printf("Starting alloc out...\n");
+    fflush(stdout);
+    size_t vocab_size = p->vocab_size;
+    size_t hidden_dim = p->hidden_dim;
+
+    size_t tmp_elems = 1ll * hidden_dim * vocab_size;
+
+    bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
+
+    out = new Tensor({hidden_dim, vocab_size}, w_out, device_id, false, DType::BF16);
+
+    bf16 *d_buf = (bf16 *)out->d_buf;
+
+    for (size_t i = 0; i < vocab_size; i++) {
+        for (size_t j = 0; j < hidden_dim; j++) {
+            tmp[j * vocab_size + i] = bf16(w_out[i * hidden_dim + j]);
+        }
+    }
+
+    CHECK_HIP(hipMemcpy(d_buf, tmp, tmp_elems * sizeof(bf16),
+                            hipMemcpyHostToDevice));
+    CHECK_HIP(hipStreamSynchronize(0));
+    free(tmp);
+    
+    printf("End alloc out\n");
+    fflush(stdout);
+}
