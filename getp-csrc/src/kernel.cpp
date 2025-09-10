@@ -744,6 +744,7 @@ static inline void moe_mlp1_forward(Tensor *x_packed,  // [total_pairs, hidden_d
     dim3 block_size(blockDim);
     dim3 grid_size((2 * inter_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
 
+    //printf("moe mlp1 : M = %d, N = %d, K = %d\n", total_pairs, 2 * inter_dim, hidden_dim);
     gemm_mfma_moe<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
       (const float *)x_packed->d_buf, w1_ptr, (float *)mlp1_out->d_buf, b1_ptr,
       expert_offsets->d_buf, total_pairs, 2 * inter_dim, hidden_dim);
@@ -799,6 +800,7 @@ static inline void moe_mlp2_forward(Tensor *gate_up,  // [total_pairs, inter_dim
     dim3 block_size(blockDim);
     dim3 grid_size((hidden_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
 
+    //printf("moe mlp2: M=%d N=%d K=%d\n", total_pairs, hidden_dim, inter_dim);
     gemm_mfma_moe<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
       (const float *)gate_up->d_buf, w2_ptr, (float *)tb3->d_buf, b2_ptr, expert_offsets->d_buf,
       total_pairs, hidden_dim, inter_dim);

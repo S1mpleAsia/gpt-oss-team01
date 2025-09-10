@@ -162,6 +162,7 @@ void reduce_tb3(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cu
                 pthread_barrier_t *tp_barrier, hipStream_t stream, hipEvent_t tp_ready,
                 hipEvent_t tp_finish, int cur_batch_size) {
   // Safety checks
+  //printf("ngu si dan don\n");
   if (cur_batch_size <= 0 || cur_batch_size > BATCH_SIZE) {
     fprintf(stderr, "Error: Invalid cur_batch_size %d, must be in range (0, %d]\n", cur_batch_size, BATCH_SIZE);
     std::abort();

@@ -98,7 +98,7 @@ void residual_rmsnorm_batched(Tensor *x,         // Shape: [batch_size, hidden_d
                               Tensor *out,       // Shape: [batch_size, hidden_dim]
                               int cur_batch_size, long long layer_offset, float epsilon,
                               hipStream_t stream) {
-  // GpuTimer timer("residual_rmsnorm", stream);
+   //GpuTimer timer("residual_rmsnorm", stream);
   const int hidden_dim = (int)residual->shape[1];
 
   const float *x_ptr = (const float *)x->d_buf;
@@ -113,36 +113,103 @@ void residual_rmsnorm_batched(Tensor *x,         // Shape: [batch_size, hidden_d
     x_ptr, residual_ptr, w_ptr, out_ptr, hidden_dim, epsilon);
 }
 
+__global__ void convert_bf16_to_f32_vector(const bf16* __restrict__ src, float* __restrict__ dst, int n) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        dst[i] = (float)(src[i]);
+    }
+}
+
 void embedding_lookup_batched(Tensor *embedding,  // Shape: [vocab_size, hidden_dim]
                               int *tokens,        // Shape: [batch_size]
                               Tensor *x,          // Shape: [batch_size, hidden_dim]
                               int cur_batch_size, bool x_from_device, hipStream_t stream) {
-  // GpuTimer timer("embedding_lookup", stream);
+   // timer("embedding_lookup", stream);
 
-  // const int batch_size = x->shape[0];
-  const size_t hidden_dim = x->shape[1];
+    const size_t hidden_dim = x->shape[1];
+    assert(embedding->dtype == DType::BF16 && "Embedding table must be BF16");
+    assert(x->dtype == DType::FP32 && "Output tensor x must be FP32");
+    const bf16* embedding_ptr = (const bf16*)embedding->d_buf;
+    float* x_ptr = (float*)x->d_buf;
 
-  for (int i = 0; i < cur_batch_size; i++) {
-    if (x->dtype == DType::BF16) {
-      bf16 *src = (bf16 *)embedding->d_buf + (size_t)tokens[i] * hidden_dim;
-      bf16 *dst = (bf16 *)x->d_buf + 1ll * i * hidden_dim;
-      CHECK_HIP(
-        hipMemcpyAsync(dst, src, hidden_dim * sizeof(bf16), hipMemcpyDeviceToDevice, stream));
-    } else {
-      float *src = (float *)embedding->d_buf + (size_t)tokens[i] * hidden_dim;
-      float *dst = (float *)x->d_buf + 1ll * i * hidden_dim;
-      CHECK_HIP(
-        hipMemcpyAsync(dst, src, hidden_dim * sizeof(float), hipMemcpyDeviceToDevice, stream));
+    for (int i = 0; i < cur_batch_size; i++) {
+        const bf16* src = embedding_ptr + (size_t)tokens[i] * hidden_dim;
+        float* dst = x_ptr + 1ll * i * hidden_dim;
+        
+        dim3 block_dim(256);
+        dim3 grid_dim(1);  
+        
+        convert_bf16_to_f32_vector<<<grid_dim, block_dim, 0, stream>>>(src, dst, (int)hidden_dim);
     }
-  }
+    CHECK_HIP(hipGetLastError());
 
-  if (x_from_device) {
-    x->from_device(stream);
-    CHECK_HIP(hipStreamSynchronize(stream));
-  }
+    if (x_from_device) {
+        x->from_device(stream);
+        CHECK_HIP(hipStreamSynchronize(stream));
+    }
+  // const int batch_size = x->shape[0];
+//   const size_t hidden_dim = x->shape[1];
+
+//   for (int i = 0; i < cur_batch_size; i++) {
+//     if (x->dtype == DType::BF16) {
+//       bf16 *src = (bf16 *)embedding->d_buf + (size_t)tokens[i] * hidden_dim;
+//       bf16 *dst = (bf16 *)x->d_buf + 1ll * i * hidden_dim;
+//       CHECK_HIP(
+//         hipMemcpyAsync(dst, src, hidden_dim * sizeof(bf16), hipMemcpyDeviceToDevice, stream));
+//     } else {
+//       float *src = (float *)embedding->d_buf + (size_t)tokens[i] * hidden_dim;
+//       float *dst = (float *)x->d_buf + 1ll * i * hidden_dim;
+//       CHECK_HIP(
+//         hipMemcpyAsync(dst, src, hidden_dim * sizeof(float)/2, hipMemcpyDeviceToDevice, stream));
+//     }
+//   }
+
+//   if (x_from_device) {
+//     x->from_device(stream);
+//     CHECK_HIP(hipStreamSynchronize(stream));
+//   }
 }
 
-__global__ void rmsnorm_kernel(const float *x, const float *w, float *out, int hidden_dim,
+// FP32 W
+// __global__ void rmsnorm_kernel(const float *x, const float *w, float *out, int hidden_dim,
+//                                float eps) {
+//   const int batch_idx = blockIdx.x;
+//   const int tid = threadIdx.x;
+//   const int block_size = blockDim.x;
+
+//   const float *x_row = x + batch_idx * hidden_dim;
+//   float *o_row = out + batch_idx * hidden_dim;
+
+//   double acc = 0.0;
+//   for (int j = tid; j < hidden_dim; j += block_size) {
+//     float v = x_row[j];
+//     acc += v * v;
+//   }
+
+//   extern __shared__ double s_partials[];
+//   s_partials[tid] = acc;
+//   __syncthreads();
+
+//   for (int s = block_size / 2; s > 0; s >>= 1) {
+//     if (tid < s) {
+//       s_partials[tid] += s_partials[tid + s];
+//     }
+//     __syncthreads();
+//   }
+
+//   __shared__ double final_inv_rms;
+//   if (tid == 0) {
+//     double block_sum = s_partials[0];
+//     double mean = block_sum / hidden_dim;
+//     final_inv_rms = 1.0f / sqrtf(mean + eps);
+//   }
+//   __syncthreads();
+
+//   for (int j = tid; j < hidden_dim; j += block_size) {
+//     o_row[j] = w[j] * (final_inv_rms * x_row[j]);
+//   }
+// }
+// BF16 W
+__global__ void rmsnorm_kernel(const float *x, const bf16 *w, float *out, int hidden_dim,
                                float eps) {
   const int batch_idx = blockIdx.x;
   const int tid = threadIdx.x;
@@ -177,7 +244,7 @@ __global__ void rmsnorm_kernel(const float *x, const float *w, float *out, int h
   __syncthreads();
 
   for (int j = tid; j < hidden_dim; j += block_size) {
-    o_row[j] = w[j] * (final_inv_rms * x_row[j]);
+    o_row[j] = (float)w[j] * (final_inv_rms * x_row[j]);
   }
 }
 
@@ -199,7 +266,7 @@ void rmsnorm_batched(Tensor *x,    // Shape: [batch_size, hidden_dim]
   size_t shared_mem_size = block_dim.x * sizeof(double);
 
   const float *x_ptr = (float *)x->d_buf;
-  const float *w_ptr = (float *)w->d_buf + 1ll * layer_offset * hidden_dim;
+  const bf16 *w_ptr = (bf16 *)w->d_buf + 1ll * layer_offset * hidden_dim;
   float *out_ptr = (float *)out->d_buf;
 
   rmsnorm_kernel<<<grid_dim, block_dim, shared_mem_size, stream>>>(x_ptr, w_ptr, out_ptr,
@@ -339,7 +406,7 @@ void qkv_gemm_batched_v2(Tensor *x,            // Shape: [batch_size, hidden_dim
                          Tensor *qkv,          // Shape: [batch_size, out_features]
                          int cur_batch_size, long long layer_offset, bool x_to_device,
                          bool qkv_from_device, hipStream_t stream) {
-  // GpuTimer timer("qkv_gemm_v2", stream);
+   //GpuTimer timer("qkv_gemm_v2", stream);
   if (x_to_device) {
     x->to_device(stream);
   }
@@ -612,7 +679,7 @@ void qkv_split_rope_fused(Tensor *qkv_out,  // Shape: [batch_size, (n_q + 2*n_kv
                           const Tensor *rope_sin_pos,  // Shape: [seq_len, hd/2]
                           int cur_batch_size, int head_dim, int n_q, int n_kv, int pos,
                           long long layer_offset, hipStream_t stream) {
-  // GpuTimer timer("qkv_split_fused", stream);
+   //GpuTimer timer("qkv_split_fused", stream);
   // const int batch_size = (int)qkv_out->shape[0];
   const int kv_dim = n_kv * head_dim;
 
@@ -655,7 +722,7 @@ void add_vector_batched(Tensor *y,  // Shape: [batch_size, hidden_dim]
                         Tensor *b,  // Shape: [batch_size, hidden_dim]
                         int cur_batch_size, bool y_to_device, bool b_to_device, bool y_from_device,
                         hipStream_t stream) {
-  // GpuTimer timer("add_vector", stream);
+   // timer("add_vector", stream);
   if (y_to_device)
     y->to_device(stream);
   if (b_to_device)
@@ -1372,7 +1439,7 @@ static inline void moe_build_offsets_hip(
   TensorI32 *sorted_pair_ids,  // [batch_size * experts_per_token]
   TensorI32 *expert_offsets,   // [n_experts + 1]
   int batch_size, int experts_per_token, int n_experts, hipStream_t stream) {
-  // GpuTimer timer("moe_offsets", stream);
+//  GpuTimer timer("moe_offsets", stream);
 
   moe_build_offsets(topk_idx, sorted_pair_ids, expert_offsets, batch_size, experts_per_token,
                     n_experts, stream);
@@ -1401,7 +1468,7 @@ static inline void moe_mlp1_forward_hip(Tensor *x_packed,  // [total_pairs, hidd
                                         long long layer_offset, int n_experts, int hidden_dim,
                                         int inter_dim, int max_rows_per_expert, int total_pairs,
                                         hipStream_t stream) {
-  // GpuTimer timer("moe_mlp1", stream);
+   //GpuTimer timer("moe_mlp1", stream);
   moe_mlp1_forward(x_packed, w_mlp1, b_mlp1, expert_offsets, mlp1_out, layer_offset, n_experts,
                    hidden_dim, inter_dim, max_rows_per_expert, total_pairs, stream);
 }
@@ -1410,7 +1477,7 @@ static inline void moe_swiglu_hip(Tensor *mlp1_out,  // [total_pairs, 2*inter_di
                                   Tensor *gate_up,   // [total_pairs, inter_dim]
                                   int batch_size, int experts_per_token, int inter_dim,
                                   float clamp_limit, hipStream_t stream) {
-  // GpuTimer timer("moe_swiglu", stream);
+//   GpuTimer timer("moe_swiglu", stream);
   moe_swiglu(mlp1_out, gate_up, batch_size, experts_per_token, inter_dim, clamp_limit, stream);
 }
 
@@ -1421,7 +1488,7 @@ static inline void moe_mlp2_forward_hip(Tensor *gate_up,  // [total_pairs, inter
                                         bool has_bias, long long layer_offset, int n_experts,
                                         int inter_dim, int hidden_dim, int max_rows_per_expert,
                                         int total_pairs, hipStream_t stream) {
-  // GpuTimer timer("moe_mlp2", stream);
+   //GpuTimer timer("moe_mlp2", stream);
   moe_mlp2_forward(gate_up, w_mlp2, b_mlp2, expert_offsets, tb3, has_bias, layer_offset, n_experts,
                    inter_dim, hidden_dim, max_rows_per_expert, total_pairs, stream);
 }
@@ -1434,7 +1501,7 @@ static inline void moe_scatter_aggregate_hip(
   TensorI32 *expert_offsets,   // [n_experts+1]
   int hidden_dim, int experts_per_token, int n_experts, int max_rows_per_expert,
   hipStream_t stream) {
-  // GpuTimer timer("moe_agg", stream);
+//  GpuTimer timer("moe_agg", stream);
   moe_scatter_aggregate(tb3, sorted_pair_ids, topk_v, e_agg, expert_offsets, hidden_dim,
                         experts_per_token, n_experts, max_rows_per_expert, stream);
 }
@@ -1608,7 +1675,7 @@ void classifier_gemm_batched_v2(const Tensor *W_out,  // Shape: [hidden_dim, voc
                                 Tensor *logits,       // Shape: [batch_size, vocab_size]
                                 int cur_batch_size, bool x_to_device, bool logits_from_device,
                                 hipStream_t stream) {
-  // GpuTimer timer("classifier_v2", stream);
+//  GpuTimer timer("classifier_v2", stream);
   if (x_to_device) {
     x->to_device(stream);
   }

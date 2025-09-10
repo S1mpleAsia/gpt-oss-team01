@@ -8,10 +8,14 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   CHECK_HIP(hipSetDevice(device_id));
   // Create Tensor wrappers for weight matrices
   weights->token_embedding_table =
-    new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->token_embedding_table, stream);
+    new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->token_embedding_table, stream, DType::BF16);
 
-  weights->rms_attn_w = new Tensor({(size_t)p->n_layers * p->hidden_dim}, w->rms_attn_w, stream);
-  weights->rms_ffn_w = new Tensor({(size_t)p->n_layers * p->hidden_dim}, w->rms_ffn_w, stream);
+    //   weights->token_embedding_table =
+    // new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->token_embedding_table, stream);
+  weights->rms_attn_w = new Tensor({(size_t)p->n_layers * p->hidden_dim}, w->rms_attn_w, stream, DType::BF16);
+  //weights->rms_ffn_w = new Tensor({(size_t)p->n_layers * p->hidden_dim}, w->rms_ffn_w, stream, DType::BF16);
+//     weights->rms_attn_w = new Tensor({(size_t)p->n_layers * p->hidden_dim}, w->rms_attn_w, stream);
+   weights->rms_ffn_w = new Tensor({(size_t)p->n_layers * p->hidden_dim}, w->rms_ffn_w, stream);
 
   // weights->w_qkv =
   //   new Tensor({(size_t)p->n_layers,
@@ -179,7 +183,8 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   weights->b_mlp2 = new Tensor({(size_t)p->n_layers, (size_t)p->n_experts, (size_t)p->hidden_dim},
                                w->b_mlp2, stream, DType::BF16);
 
-  weights->rms_out_w = new Tensor({(size_t)p->hidden_dim}, w->rms_out_w, stream);
+  //weights->rms_out_w = new Tensor({(size_t)p->hidden_dim}, w->rms_out_w, stream);
+    weights->rms_out_w = new Tensor({(size_t)p->hidden_dim}, w->rms_out_w, stream, DType::BF16);
   // weights->out = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->out, device_id);
 
   {
@@ -217,10 +222,10 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->mlp1_out =
     new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, 2 * (size_t)p->intermediate_dim}, stream);
 
-  rs->gate =
-    new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
-  rs->up =
-    new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
+//   rs->gate =
+//     new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
+//   rs->up =
+//     new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
 
   // rs->gate_up = new Tensor({(size_t)p->intermediate_dim}, s->gate_up);
   rs->gate_up =
@@ -232,9 +237,9 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->qkv = new Tensor(
     {BATCH_SIZE, ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim}, stream);
   rs->q = new Tensor({BATCH_SIZE, (size_t)p->n_attn_heads * p->head_dim}, stream);
-  rs->k = new Tensor({BATCH_SIZE, (size_t)p->n_kv_heads * p->head_dim}, stream);
-  rs->v = new Tensor({BATCH_SIZE, (size_t)p->n_kv_heads * p->head_dim}, stream);
-  rs->att = new Tensor({BATCH_SIZE, (size_t)p->n_attn_heads, (size_t)p->seq_len}, stream);
+//   rs->k = new Tensor({BATCH_SIZE, (size_t)p->n_kv_heads * p->head_dim}, stream);
+//   rs->v = new Tensor({BATCH_SIZE, (size_t)p->n_kv_heads * p->head_dim}, stream);
+  //rs->att = new Tensor({BATCH_SIZE, (size_t)p->n_attn_heads, (size_t)p->seq_len}, stream);
   rs->logits = new Tensor({BATCH_SIZE, (size_t)p->vocab_size}, stream);
 
   rs->key_cache = new Tensor(
@@ -245,12 +250,13 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
     stream);
 
   // mask needs to be batch because they are not zero_allocated
-  rs->mask = new Tensor({BATCH_SIZE, (size_t)p->seq_len, (size_t)p->seq_len}, stream);
-  size_t single_mask_elems = (size_t)p->seq_len * p->seq_len;
-  for (int b = 0; b < BATCH_SIZE; b++) {
-    float *dest_ptr = rs->mask->buf + b * single_mask_elems;
-    memcpy(dest_ptr, s->mask, single_mask_elems * sizeof(float));
-  }
+  //rs->mask = new Tensor({BATCH_SIZE, (size_t)p->seq_len, (size_t)p->seq_len}, stream);
+  rs->mask = new Tensor({1, 1}, stream);
+//   size_t single_mask_elems = (size_t)p->seq_len * p->seq_len;
+//   for (int b = 0; b < BATCH_SIZE; b++) {
+//     float *dest_ptr = rs->mask->buf + b * single_mask_elems;
+//     memcpy(dest_ptr, s->mask, single_mask_elems * sizeof(float));
+//   }
   rs->mask->to_device(stream);
 
   // MoE buffer
@@ -679,10 +685,10 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->mlp1_out =
     new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, 2 * (size_t)p->intermediate_dim}, stream);
 
-  rs->gate =
-    new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
-  rs->up =
-    new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
+//   rs->gate =
+//     new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
+//   rs->up =
+//     new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
 
   // rs->gate_up = new Tensor({(size_t)p->intermediate_dim}, s->gate_up);
   rs->gate_up =
@@ -700,7 +706,7 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->q = new Tensor({BATCH_SIZE, (size_t)p->n_attn_heads * p->head_dim}, stream);
   rs->k = new Tensor({BATCH_SIZE, (size_t)p->n_kv_heads * p->head_dim}, stream);
   rs->v = new Tensor({BATCH_SIZE, (size_t)p->n_kv_heads * p->head_dim}, stream);
-  rs->att = new Tensor({BATCH_SIZE, (size_t)p->n_attn_heads, (size_t)p->seq_len}, stream);
+  //rs->att = new Tensor({BATCH_SIZE, (size_t)p->n_attn_heads, (size_t)p->seq_len}, stream);
   rs->logits = new Tensor({BATCH_SIZE, (size_t)p->vocab_size}, stream);
 
   rs->key_cache = new Tensor({BATCH_SIZE, ((size_t)p->n_layers / PP), (size_t)p->seq_len,
@@ -815,10 +821,10 @@ void our_free_each(OurTransformerWeights *weights, OurRunState *rs) {
     delete rs->topk_i;
   if (rs->mlp1_out)
     delete rs->mlp1_out;
-  if (rs->gate)
-    delete rs->gate;
-  if (rs->up)
-    delete rs->up;
+//   if (rs->gate)
+//     delete rs->gate;
+//   if (rs->up)
+//     delete rs->up;
   if (rs->gate_up)
     delete rs->gate_up;
   if (rs->e_agg)
@@ -829,12 +835,12 @@ void our_free_each(OurTransformerWeights *weights, OurRunState *rs) {
     delete rs->qkv;
   if (rs->q)
     delete rs->q;
-  if (rs->k)
-    delete rs->k;
-  if (rs->v)
-    delete rs->v;
-  if (rs->att)
-    delete rs->att;
+//   if (rs->k)
+//     delete rs->k;
+//   if (rs->v)
+//     delete rs->v;
+//   if (rs->att)
+//     delete rs->att;
   if (rs->logits)
     delete rs->logits;
   if (rs->key_cache)
