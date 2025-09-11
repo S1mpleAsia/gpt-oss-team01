@@ -76,8 +76,6 @@ __global__ void residual_rmsnorm_f32_kernel(const float *input, float *residual,
   __syncthreads();
   s_norm = s_shared;
 
-  // const int vecN = hidden_dim >> 2;
-  // const float4 *rs4 = reinterpret_cast<const float4 *>(res_row);
   const float4 *g4 = reinterpret_cast<const float4 *>(g_row);
   float4 *o4 = reinterpret_cast<float4 *>(out_row);
 
@@ -151,20 +149,6 @@ void embedding_lookup_batched(Tensor *embedding,      // Shape: [vocab_size, hid
 
   embedding_lookup_kernel<<<grid_size, block_size, 0, stream>>>(
     embedding_ptr, x_ptr, tokens_buf->d_buf, hidden_dim, cur_batch_size);
-
-  // for (int i = 0; i < cur_batch_size; i++) {
-  //   if (x->dtype == DType::BF16) {
-  //     bf16 *src = (bf16 *)embedding->d_buf + (size_t)tokens[i] * hidden_dim;
-  //     bf16 *dst = (bf16 *)x->d_buf + 1ll * i * hidden_dim;
-  //     CHECK_HIP(
-  //       hipMemcpyAsync(dst, src, hidden_dim * sizeof(bf16), hipMemcpyDeviceToDevice, stream));
-  //   } else {
-  //     float *src = (float *)embedding->d_buf + (size_t)tokens[i] * hidden_dim;
-  //     float *dst = (float *)x->d_buf + 1ll * i * hidden_dim;
-  //     CHECK_HIP(
-  //       hipMemcpyAsync(dst, src, hidden_dim * sizeof(float), hipMemcpyDeviceToDevice, stream));
-  //   }
-  // }
 
   if (x_from_device) {
     x->from_device(stream);
@@ -647,10 +631,10 @@ void qkv_split_rope_fused(Tensor *qkv_out,  // Shape: [batch_size, (n_q + 2*n_kv
   const int kv_dim = n_kv * head_dim;
 
   // pre-offset caches to the current layer (BY ELEMENTS)
-  void *k_ptr = (char *)K_cache->d_buf +
-                (size_t)layer_offset * (size_t)(K_cache->shape[2] * kv_dim) * sizeof(float);
-  void *v_ptr = (char *)V_cache->d_buf +
-                (size_t)layer_offset * (size_t)(V_cache->shape[2] * kv_dim) * sizeof(float);
+  
+  const size_t elem_bytes = (K_cache->dtype == DType::BF16) ? sizeof(bf16) : sizeof(float);
+  void *k_ptr = (char*)K_cache->d_buf + (size_t)layer_offset * (size_t)(K_cache->shape[2] * kv_dim) * elem_bytes;
+  void *v_ptr = (char*)V_cache->d_buf + (size_t)layer_offset * (size_t)(V_cache->shape[2] * kv_dim) * elem_bytes;
 
   const int h2 = head_dim >> 1;
   const int total_pairs = n_kv > n_q ? n_kv * h2 : n_q * h2;
