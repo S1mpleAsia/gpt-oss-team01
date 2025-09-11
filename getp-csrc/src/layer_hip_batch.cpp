@@ -113,28 +113,58 @@ void residual_rmsnorm_batched(Tensor *x,         // Shape: [batch_size, hidden_d
     x_ptr, residual_ptr, w_ptr, out_ptr, hidden_dim, epsilon);
 }
 
-void embedding_lookup_batched(Tensor *embedding,  // Shape: [vocab_size, hidden_dim]
-                              int *tokens,        // Shape: [batch_size]
-                              Tensor *x,          // Shape: [batch_size, hidden_dim]
+__global__ void embedding_lookup_kernel(const bf16 *__restrict__ embedding_table,
+                                        float *__restrict__ output, const int *__restrict__ tokens,
+                                        const size_t hidden_dim, const int batch_size) {
+  int batch_idx = blockIdx.y * blockDim.y + threadIdx.y;
+  int hidden_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (batch_idx >= batch_size || hidden_idx >= hidden_dim) {
+    return;
+  }
+
+  int token_idx = tokens[batch_idx];
+  const bf16 *src_ptr = embedding_table + (size_t)token_idx * hidden_dim + hidden_idx;
+  float *dst_ptr = output + (size_t)batch_idx * hidden_dim + hidden_idx;
+
+  *dst_ptr = (float)(*src_ptr);
+}
+
+void embedding_lookup_batched(Tensor *embedding,      // Shape: [vocab_size, hidden_dim]
+                              int *tokens,            // Shape: [batch_size]
+                              TensorI32 *tokens_buf,  // Shape: [batch_size]
+                              Tensor *x,              // Shape: [batch_size, hidden_dim]
                               int cur_batch_size, bool x_from_device, hipStream_t stream) {
   // GpuTimer timer("embedding_lookup", stream);
 
   // const int batch_size = x->shape[0];
   const size_t hidden_dim = x->shape[1];
+  const bf16 *embedding_ptr = (const bf16 *)embedding->d_buf;
+  float *x_ptr = (float *)x->d_buf;
 
-  for (int i = 0; i < cur_batch_size; i++) {
-    if (x->dtype == DType::BF16) {
-      bf16 *src = (bf16 *)embedding->d_buf + (size_t)tokens[i] * hidden_dim;
-      bf16 *dst = (bf16 *)x->d_buf + 1ll * i * hidden_dim;
-      CHECK_HIP(
-        hipMemcpyAsync(dst, src, hidden_dim * sizeof(bf16), hipMemcpyDeviceToDevice, stream));
-    } else {
-      float *src = (float *)embedding->d_buf + (size_t)tokens[i] * hidden_dim;
-      float *dst = (float *)x->d_buf + 1ll * i * hidden_dim;
-      CHECK_HIP(
-        hipMemcpyAsync(dst, src, hidden_dim * sizeof(float), hipMemcpyDeviceToDevice, stream));
-    }
-  }
+  CHECK_HIP(hipMemcpyAsync(tokens_buf->d_buf, tokens, tokens_buf->num_elem() * sizeof(int),
+                           hipMemcpyHostToDevice, stream));
+
+  dim3 block_size(32, 16);
+  dim3 grid_size((hidden_dim + block_size.x - 1) / block_size.x,
+                 (cur_batch_size + block_size.y - 1) / block_size.y);
+
+  embedding_lookup_kernel<<<grid_size, block_size, 0, stream>>>(
+    embedding_ptr, x_ptr, tokens_buf->d_buf, hidden_dim, cur_batch_size);
+
+  // for (int i = 0; i < cur_batch_size; i++) {
+  //   if (x->dtype == DType::BF16) {
+  //     bf16 *src = (bf16 *)embedding->d_buf + (size_t)tokens[i] * hidden_dim;
+  //     bf16 *dst = (bf16 *)x->d_buf + 1ll * i * hidden_dim;
+  //     CHECK_HIP(
+  //       hipMemcpyAsync(dst, src, hidden_dim * sizeof(bf16), hipMemcpyDeviceToDevice, stream));
+  //   } else {
+  //     float *src = (float *)embedding->d_buf + (size_t)tokens[i] * hidden_dim;
+  //     float *dst = (float *)x->d_buf + 1ll * i * hidden_dim;
+  //     CHECK_HIP(
+  //       hipMemcpyAsync(dst, src, hidden_dim * sizeof(float), hipMemcpyDeviceToDevice, stream));
+  //   }
+  // }
 
   if (x_from_device) {
     x->from_device(stream);
@@ -142,7 +172,7 @@ void embedding_lookup_batched(Tensor *embedding,  // Shape: [vocab_size, hidden_
   }
 }
 
-__global__ void rmsnorm_kernel(const float *x, const float *w, float *out, int hidden_dim,
+__global__ void rmsnorm_kernel(const float *x, const bf16 *w, float *out, int hidden_dim,
                                float eps) {
   const int batch_idx = blockIdx.x;
   const int tid = threadIdx.x;
@@ -177,7 +207,7 @@ __global__ void rmsnorm_kernel(const float *x, const float *w, float *out, int h
   __syncthreads();
 
   for (int j = tid; j < hidden_dim; j += block_size) {
-    o_row[j] = w[j] * (final_inv_rms * x_row[j]);
+    o_row[j] = (float)w[j] * (final_inv_rms * x_row[j]);
   }
 }
 
@@ -199,7 +229,7 @@ void rmsnorm_batched(Tensor *x,    // Shape: [batch_size, hidden_dim]
   size_t shared_mem_size = block_dim.x * sizeof(double);
 
   const float *x_ptr = (float *)x->d_buf;
-  const float *w_ptr = (float *)w->d_buf + 1ll * layer_offset * hidden_dim;
+  const bf16 *w_ptr = (const bf16 *)w->d_buf + 1ll * layer_offset * hidden_dim;
   float *out_ptr = (float *)out->d_buf;
 
   rmsnorm_kernel<<<grid_dim, block_dim, shared_mem_size, stream>>>(x_ptr, w_ptr, out_ptr,
@@ -1623,12 +1653,21 @@ void classifier_gemm_batched_v2(const Tensor *W_out,  // Shape: [hidden_dim, voc
   float *logits_buf = (float *)logits->d_buf;
 
   {
+#if BATCH_SIZE <= 16
     constexpr int BM = 16;
     constexpr int BN = 128;
     constexpr int BK = 32;
     constexpr int TM = 16;
     constexpr int TN = 16;
     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
+#else
+    constexpr int BM = 32;
+    constexpr int BN = 256;
+    constexpr int BK = 16;
+    constexpr int TM = 32;
+    constexpr int TN = 32;
+    constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
+#endif
 
     dim3 block_size(blockDim);
     dim3 grid_size((vocab_size + BN - 1) / BN, ((cur_batch_size + BM - 1) / BM));

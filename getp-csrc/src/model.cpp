@@ -12,8 +12,8 @@ float *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flo
   hipStream_t stream = total_streams[flow_id];
 
   // copy the token embedding into x
-  embedding_lookup_batched(weights_now->token_embedding_table, tokens, rs_now->x, cur_batch_size,
-                           false, stream);
+  embedding_lookup_batched(weights_now->token_embedding_table, tokens, rs_now->tokens_buf,
+                           rs_now->x, cur_batch_size, false, stream);
 
   long long kv_dim = 1ll * p->n_kv_heads * p->head_dim;
   long long loff_one = 1ll * p->seq_len * kv_dim;
