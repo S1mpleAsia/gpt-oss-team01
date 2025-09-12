@@ -2,6 +2,7 @@
 
 #include "tensor.hpp"
 #include <hip/hip_runtime.h>
+#include <ctime>
 
 void memcpy_tensor(Tensor *to, const Tensor *from, long long to_offset, long long from_offset,
                    size_t num_elem, bool copy_host, bool copy_device, hipStream_t stream = 0);
@@ -34,6 +35,13 @@ struct GpuTimer {
   }
 };
 
-struct Timer {
-  
+struct CPUTimer {
+  // Member variable to store the starting time.
+  double startTime;
+  const char *function_name;
+  hipStream_t stream;
+
+  // Constructor: Records the start event.
+  CPUTimer(const char *name);
+  ~CPUTimer();
 };

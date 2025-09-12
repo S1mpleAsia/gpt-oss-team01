@@ -51,3 +51,21 @@ void printDebugFloat(bf16 *d_buf, const std::string &descr) {
 
     free(tmp_test);
 }
+
+double get_time_kernel() {
+  struct timespec tv;
+  clock_gettime(CLOCK_MONOTONIC, &tv);
+  // Combine seconds and nanoseconds into a single double value.
+  return tv.tv_sec + tv.tv_nsec * 1e-9;
+}
+
+CPUTimer::CPUTimer(const char* name) : function_name(name) {
+    startTime = get_time_kernel();
+}
+
+CPUTimer::~CPUTimer() {
+    double endTime = get_time_kernel();
+    double elapsedTime = endTime - startTime;
+    printf("%s CPU time: %.6f seconds\n", function_name, elapsedTime);
+    fflush(stdout);
+}

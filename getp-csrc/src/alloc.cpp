@@ -296,6 +296,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     for (size_t l = 0; l < n_layers; l++) {
       long long offset = 1ll * l * tmp_elems;
 
+      #pragma omp parallel for collapse(2)
       for (size_t i = 0; i < n_heads * head_dim; i++) {
         for (size_t j = 0; j < hidden_dim; j++) {
           // hoán vị 2 chiều cuối
@@ -343,6 +344,8 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
     for (size_t l = 0; l < n_layers; l++) {
       long long offset = 1ll * l * tmp_elems;
+      
+      #pragma omp parallel for collapse(2)
       for (size_t i = 0; i < hidden_dim; i++) {
         for (size_t j = 0; j < n_heads * head_dim; j++) {
           tmp[j * hidden_dim + i] = w_o_ptr[offset + i * (n_heads * head_dim) + j];
@@ -377,7 +380,14 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
       {layers_each, experts_each, 2 * (size_t)p->intermediate_dim, (size_t)p->hidden_dim}, w_mlp1_ptr, device_id, DType::BF16
     );
   */
-  alloc_w_mlp1_new(weights->w_mlp1, w_mlp1_ptr, p, device_id);
+  /*
+  for (int start_layer = 0; start_layer < layers_each; start_layer += OFFSET_LAYER) {
+    for (int start_moe = 0; start_moe < experts_each; start_moe += OFFSET_MOE) {
+      alloc_w_mlp1_v2(weights->w_mlp1, w_mlp1_ptr, p, device_id, start_layer, start_moe);
+    }
+  }
+  */
+  // alloc_w_mlp1(weights->w_mlp1, w_mlp1_ptr, p, device_id);
   /*
     {
       printf("Starting alloc mlp1\n");
@@ -482,12 +492,12 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
       for (size_t e = 0; e < n_experts; e++) {
         size_t base = 1ll * l * l_offset + 1ll * e * e_offset;
 
+        #pragma omp parallel for
         for (size_t i = 0; i < 2 * shard_dim; i++) {
           float value = b_mlp1_ptr[base + i];
           tmp[i] = bf16(value);
         }
 
-        fflush(stdout);
         size_t d_offset = 1ll * l * l_offset_d + 1ll * e * e_offset_d;
         CHECK_HIP(hipMemcpy(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16),
                                  hipMemcpyHostToDevice));
@@ -534,7 +544,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
       {layers_each, experts_each, (size_t)p->hidden_dim, (size_t)p->intermediate_dim}, w_mlp2_ptr, device_id, DType::BF16
     );
   */
-  alloc_w_mlp2_new(weights->w_mlp2, w_mlp2_ptr, p, device_id);
+  // alloc_w_mlp2_v2(weights->w_mlp2, w_mlp2_ptr, p, device_id);
   /*
     {
       printf("Starting alloc mlp2\n");
@@ -729,8 +739,6 @@ void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunSt
   total_events->tp_ready = new hipEvent_t[TOTAL_GPUS_NEEDED];
   total_events->tp_finish = new hipEvent_t[TOTAL_GPUS_NEEDED];
   total_events->pp_sync = new hipEvent_t[TOTAL_GPUS_NEEDED];
-
-  #pragma omp parallel for num_threads(TOTAL_GPUS_NEEDED)
   for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
     CHECK_HIP(hipSetDevice(i));
     
@@ -742,6 +750,13 @@ void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunSt
     our_init_weights(w, p, &weights[i], i);
     our_init_run_state(s, p, &rs[i], i);
   }
+
+  for (int start_layer = 0; start_layer < (p->n_layers / PP); start_layer += OFFSET_LAYER) {
+    for (int start_moe = 0; start_moe < p->n_experts; start_moe += OFFSET_MOE) {
+      alloc_w_mlp1_final(weights, w->w_mlp1, p, start_layer, start_moe);
+    }
+  }
+
 }
 
 void our_free_each(OurTransformerWeights *weights, OurRunState *rs) {
