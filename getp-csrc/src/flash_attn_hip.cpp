@@ -2,8 +2,10 @@
 #include <cfloat>
 #include <cmath>
 #include <hip/hip_runtime.h>
+#include <hip/hip_bfloat16.h>
 
-// Wave size on AMD
+using bf16 = hip_bfloat16;
+
 #ifndef WARP_SIZE
 #define WARP_SIZE 64
 #endif
@@ -32,11 +34,12 @@ __device__ __forceinline__ double block_reduce_sum(double v, double *s_red) {
   return s_red[0];
 }
 
-template <int TILE_TOKENS = 128, int THREADS = 128>
+// Allow K and V to have independent dtypes
+template <int TILE_TOKENS = 128, int THREADS = 128, bool K_BF16 = false, bool V_BF16 = false>
 __global__ void flash_attn_decode_kernel(
   const float *__restrict__ q,           // [B, n_q*hd]
-  const float *__restrict__ K_cache,     // [B, L, S, kv_dim]   (base already at layer)
-  const float *__restrict__ V_cache,     // [B, L, S, kv_dim]   (base already at layer)
+  const void *__restrict__ K_cache,      // [B, L, S, kv_dim]   (base already at layer)
+  const void *__restrict__ V_cache,      // [B, L, S, kv_dim]   (base already at layer)
   const float *__restrict__ attn_sinks,  // [n_q]               (for this layer)
   float *__restrict__ tb,                // [B, n_q*hd]
   int head_dim, int n_q, int kv_mul, int kv_dim, int total_seq_len, int pos, int sliding_window,
@@ -55,8 +58,16 @@ __global__ void flash_attn_decode_kernel(
     q + (size_t)batch_idx * qtb_stride + (size_t)head_idx * head_dim;
   float *__restrict__ tb_head = tb + (size_t)batch_idx * qtb_stride + (size_t)head_idx * head_dim;
 
-  const float *__restrict__ K_base = K_cache + (size_t)batch_idx * kv_batch_stride;
-  const float *__restrict__ V_base = V_cache + (size_t)batch_idx * kv_batch_stride;
+  const void *__restrict__ K_base;
+  const void *__restrict__ V_base;
+  if constexpr (K_BF16)
+    K_base = ((const bf16 *)K_cache) + (size_t)batch_idx * kv_batch_stride;
+  else
+    K_base = ((const float *)K_cache) + (size_t)batch_idx * kv_batch_stride;
+  if constexpr (V_BF16)
+    V_base = ((const bf16 *)V_cache) + (size_t)batch_idx * kv_batch_stride;
+  else
+    V_base = ((const float *)V_cache) + (size_t)batch_idx * kv_batch_stride;
   const float *__restrict__ attn_sinks_head = attn_sinks + (size_t)head_idx;
 
   const float scale = rsqrtf((float)head_dim);
@@ -90,12 +101,19 @@ __global__ void flash_attn_decode_kernel(
     // Pass 1: scores + tile max
     double local_max = -DBL_MAX;
     for (int t = threadIdx.x; t < tile_len; t += blockDim.x) {
-      const float *__restrict__ k_vec = K_base + (size_t)(t0 + t) * kv_dim + kv_head_off;
+      const size_t k_offset = (size_t)(t0 + t) * kv_dim + kv_head_off;
       float s = 0.f;
 #pragma unroll 64
       for (int d = 0; d < 64; ++d) {
         // for (int d = 0; d < head_dim; ++d)
-        s += s_q[d] * k_vec[d];
+        float k_val;
+        if constexpr (K_BF16) {
+          bf16 k_bf16 = ((const bf16 *)K_base)[k_offset + d];
+          k_val = float(k_bf16);
+        } else {
+          k_val = ((const float *)K_base)[k_offset + d];
+        }
+        s += s_q[d] * k_val;
       }
       const float score_f = s * scale;
       s_scores[t] = score_f;
@@ -128,8 +146,15 @@ __global__ void flash_attn_decode_kernel(
       double acc = o_i;
       for (int t = 0; t < tile_len; ++t) {
         const double w = (double)s_scores[t];
-        const float *__restrict__ v_vec = V_base + (size_t)(t0 + t) * kv_dim + kv_head_off;
-        acc += w * (double)v_vec[i_out];
+        const size_t v_offset = (size_t)(t0 + t) * kv_dim + kv_head_off;
+        float v_val;
+        if constexpr (V_BF16) {
+          bf16 v_bf16 = ((const bf16 *)V_base)[v_offset + i_out];
+          v_val = float(v_bf16);
+        } else {
+          v_val = ((const float *)V_base)[v_offset + i_out];
+        }
+        acc += w * (double)v_val;
       }
       o_i = acc;
     }
@@ -171,8 +196,16 @@ void single_query_attn_flash_batched(Tensor *q, Tensor *K_cache, Tensor *V_cache
   // const int B = (int)q->shape[0];
   const int n_layers = (int)attn_sinks->shape[0];
 
-  const float *K_ptr = (const float *)K_cache->d_buf + 1ll * layer_offset * seq_len * kv_dim;
-  const float *V_ptr = (const float *)V_cache->d_buf + 1ll * layer_offset * seq_len * kv_dim;
+  const void *K_ptr;
+  const void *V_ptr;
+  if (K_cache->dtype == DType::BF16)
+    K_ptr = ((const bf16 *)K_cache->d_buf) + 1ll * layer_offset * seq_len * kv_dim;
+  else
+    K_ptr = ((const float *)K_cache->d_buf) + 1ll * layer_offset * seq_len * kv_dim;
+  if (V_cache->dtype == DType::BF16)
+    V_ptr = ((const bf16 *)V_cache->d_buf) + 1ll * layer_offset * seq_len * kv_dim;
+  else
+    V_ptr = ((const float *)V_cache->d_buf) + 1ll * layer_offset * seq_len * kv_dim;
   const float *S_ptr = (const float *)attn_sinks->d_buf + 1ll * layer_offset * n_q;
 
   const int use_window =
@@ -184,9 +217,25 @@ void single_query_attn_flash_batched(Tensor *q, Tensor *K_cache, Tensor *V_cache
   size_t shmem = (size_t)head_dim * sizeof(float) + (size_t)TILE_TOKENS * sizeof(float) +
                  (size_t)THREADS * sizeof(double);
 
-  flash_attn_decode_kernel<TILE_TOKENS, THREADS><<<grid, block, shmem, stream>>>(
-    (const float *)q->d_buf, K_ptr, V_ptr, S_ptr, (float *)tb->d_buf, head_dim, n_q, kv_mul, kv_dim,
-    seq_len, pos, sliding_window, cur_batch_size, n_layers, use_window);
+  const bool K_is_bf16 = (K_cache->dtype == DType::BF16);
+  const bool V_is_bf16 = (V_cache->dtype == DType::BF16);
+  if (K_is_bf16 && V_is_bf16) {
+    flash_attn_decode_kernel<TILE_TOKENS, THREADS, true, true><<<grid, block, shmem, stream>>>(
+      (const float *)q->d_buf, K_ptr, V_ptr, S_ptr, (float *)tb->d_buf, head_dim, n_q, kv_mul, kv_dim,
+      seq_len, pos, sliding_window, cur_batch_size, n_layers, use_window);
+  } else if (K_is_bf16 && !V_is_bf16) {
+    flash_attn_decode_kernel<TILE_TOKENS, THREADS, true, false><<<grid, block, shmem, stream>>>(
+      (const float *)q->d_buf, K_ptr, V_ptr, S_ptr, (float *)tb->d_buf, head_dim, n_q, kv_mul, kv_dim,
+      seq_len, pos, sliding_window, cur_batch_size, n_layers, use_window);
+  } else if (!K_is_bf16 && V_is_bf16) {
+    flash_attn_decode_kernel<TILE_TOKENS, THREADS, false, true><<<grid, block, shmem, stream>>>(
+      (const float *)q->d_buf, K_ptr, V_ptr, S_ptr, (float *)tb->d_buf, head_dim, n_q, kv_mul, kv_dim,
+      seq_len, pos, sliding_window, cur_batch_size, n_layers, use_window);
+  } else {
+    flash_attn_decode_kernel<TILE_TOKENS, THREADS, false, false><<<grid, block, shmem, stream>>>(
+      (const float *)q->d_buf, K_ptr, V_ptr, S_ptr, (float *)tb->d_buf, head_dim, n_q, kv_mul, kv_dim,
+      seq_len, pos, sliding_window, cur_batch_size, n_layers, use_window);
+  }
 
   CHECK_HIP(hipGetLastError());
   if (tb_from_device) {

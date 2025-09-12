@@ -6,19 +6,13 @@
 void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *weights,
                       int device_id, hipStream_t stream) {
   CHECK_HIP(hipSetDevice(device_id));
-  // Create Tensor wrappers for weight matrices
+
   weights->token_embedding_table = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim},
                                               w->token_embedding_table, stream, DType::BF16);
 
   weights->rms_attn_w =
     new Tensor({(size_t)p->n_layers * p->hidden_dim}, w->rms_attn_w, stream, DType::BF16);
   weights->rms_ffn_w = new Tensor({(size_t)p->n_layers * p->hidden_dim}, w->rms_ffn_w, stream);
-
-  // weights->w_qkv =
-  //   new Tensor({(size_t)p->n_layers,
-  //               ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * (size_t)p->head_dim,
-  //               (size_t)p->hidden_dim},
-  //              w->w_qkv);
 
   {
     size_t n_layers = p->n_layers;
@@ -46,9 +40,6 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     {(size_t)p->n_layers, ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim},
     w->b_qkv, stream, DType::BF16);
 
-  // weights->w_o =
-  //   new Tensor({(size_t)p->n_layers, (size_t)p->hidden_dim, (size_t)p->n_attn_heads * p->head_dim},
-  //              w->w_o);
   {
     size_t n_layers = p->n_layers;
     size_t hidden_dim = p->hidden_dim;
@@ -73,17 +64,12 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   weights->b_o =
     new Tensor({(size_t)p->n_layers, (size_t)p->hidden_dim}, w->b_o, stream, DType::BF16);
 
-  // Tensor *attn_sinks; // (n_layers, n_attn_heads)
   weights->attn_sinks =
     new Tensor({(size_t)p->n_layers, (size_t)p->n_attn_heads}, w->attn_sinks, stream);
 
   weights->w_router = new Tensor({(size_t)p->n_layers, (size_t)p->n_experts, (size_t)p->hidden_dim},
                                  w->w_router, stream);
   weights->b_router = new Tensor({(size_t)p->n_layers, (size_t)p->n_experts}, w->b_router, stream);
-
-  // weights->w_mlp1 = new Tensor({(size_t)p->n_layers, (size_t)p->n_experts,
-  //                               2 * (size_t)p->intermediate_dim, (size_t)p->hidden_dim},
-  //                              w->w_mlp1, 0, DType::BF16);
 
   {
     printf("Starting alloc mlp1\n");
@@ -129,10 +115,6 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     new Tensor({(size_t)p->n_layers, (size_t)p->n_experts, 2 * (size_t)p->intermediate_dim},
                w->b_mlp1, stream, DType::BF16);
 
-  // weights->w_mlp2 = new Tensor(
-  //   {(size_t)p->n_layers, (size_t)p->n_experts, (size_t)p->hidden_dim, (size_t)p->intermediate_dim},
-  //   w->w_mlp2, 0, DType::BF16);
-
   {
     printf("Starting alloc mlp2\n");
     fflush(stdout);
@@ -156,10 +138,6 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
           for (size_t h = 0; h < hidden_dim; h++) {
             float value = w->w_mlp2[base + h * inter_dim + i];
             tmp[i * hidden_dim + h] = bf16(value);
-            // weights->w_mlp2->buf[l * n_experts * inter_dim * hidden_dim +
-            //                      e * inter_dim * hidden_dim + i * hidden_dim + h] =
-            //   w->w_mlp2[l * n_experts * inter_dim * hidden_dim + e * inter_dim * hidden_dim +
-            //             h * inter_dim + i];
           }
         }
 
@@ -181,7 +159,6 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
                                w->b_mlp2, stream, DType::BF16);
 
   weights->rms_out_w = new Tensor({(size_t)p->hidden_dim}, w->rms_out_w, stream, DType::BF16);
-  // weights->out = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->out, device_id);
 
   {
     size_t vocab_size = p->vocab_size;
@@ -202,7 +179,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
                         hipStream_t stream) {
   CHECK_HIP(hipSetDevice(device_id));
-  // Create Tensor wrappers for state buffers
+
   rs->x = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
 
   rs->t = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
@@ -217,13 +194,6 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
 
   rs->mlp1_out =
     new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, 2 * (size_t)p->intermediate_dim}, stream);
-
-  // rs->gate =
-  //   new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
-  // rs->up =
-  //   new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
-
-  // rs->gate_up = new Tensor({(size_t)p->intermediate_dim}, s->gate_up);
   rs->gate_up =
     new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
 
@@ -233,25 +203,27 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->qkv = new Tensor(
     {BATCH_SIZE, ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim}, stream);
   rs->q = new Tensor({BATCH_SIZE, (size_t)p->n_attn_heads * p->head_dim}, stream);
-  // rs->k = new Tensor({BATCH_SIZE, (size_t)p->n_kv_heads * p->head_dim}, stream);
-  // rs->v = new Tensor({BATCH_SIZE, (size_t)p->n_kv_heads * p->head_dim}, stream);
-  // rs->att = new Tensor({BATCH_SIZE, (size_t)p->n_attn_heads, (size_t)p->seq_len}, stream);
   rs->logits = new Tensor({BATCH_SIZE, (size_t)p->vocab_size}, stream);
 
+#ifdef KV16
+  printf("using BF16 KV cache\n");
+  rs->key_cache = new Tensor(
+    {BATCH_SIZE, (size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
+    stream, DType::BF16);
+  rs->value_cache = new Tensor(
+    {BATCH_SIZE, (size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
+    stream, DType::BF16);
+#else 
+  print("using FP32 KV cache\n");
   rs->key_cache = new Tensor(
     {BATCH_SIZE, (size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
     stream);
   rs->value_cache = new Tensor(
     {BATCH_SIZE, (size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
     stream);
+#endif
 
-  // mask needs to be batch because they are not zero_allocated
   rs->mask = new Tensor({BATCH_SIZE, (size_t)1, (size_t)1}, stream);
-  // size_t single_mask_elems = (size_t)p->seq_len * p->seq_len;
-  // for (int b = 0; b < BATCH_SIZE; b++) {
-  // float *dest_ptr = rs->mask->buf + b * single_mask_elems;
-  // memcpy(dest_ptr, s->mask, single_mask_elems * sizeof(float));
-  // }
   rs->mask->to_device(stream);
 
   // MoE buffer
@@ -287,41 +259,15 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   // Create Tensor wrappers for weight matrices
   if (pp_rank == 0) {
     weights->token_embedding_table =
-      new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->token_embedding_table, stream);
+      new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->token_embedding_table, stream, DType::BF16);
   } else {
     weights->token_embedding_table = nullptr;
   }
 
   weights->rms_attn_w = new Tensor({layers_per_stage * p->hidden_dim},
-                                   w->rms_attn_w + 1ll * pp_offset * p->hidden_dim, stream);
+                                   w->rms_attn_w + 1ll * pp_offset * p->hidden_dim, stream, DType::BF16);
   weights->rms_ffn_w = new Tensor({layers_per_stage * p->hidden_dim},
                                   w->rms_ffn_w + 1ll * pp_offset * p->hidden_dim, stream);
-
-  /** w_qkv
-    weights->w_qkv =
-      new Tensor({layers_per_stage, (size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * (size_t)p->head_dim, (size_t)p->hidden_dim},
-                w->w_qkv + 1ll * pp_offset * ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * (size_t)p->head_dim * (size_t)p->hidden_dim, stream);
-  */
-  // {
-  //   size_t hidden_dim = p->hidden_dim;
-
-  //   weights->w_qkv =
-  //     new Tensor({layers_per_stage, hidden_dim, qkv_layer_size}, stream, DType::BF16);
-
-  //   float *w_qkv_ptr = w->w_qkv + 1ll * pp_offset * qkv_layer_size * hidden_dim;
-
-  //   for (size_t l = 0; l < layers_per_stage; l++) {
-  //     for (size_t i = 0; i < qkv_layer_size; i++) {
-  //       for (size_t j = 0; j < hidden_dim; j++) {
-  //         weights->w_qkv->buf[l * hidden_dim * qkv_layer_size + j * qkv_layer_size + i] =
-  //           w_qkv_ptr[l * hidden_dim * qkv_layer_size + i * hidden_dim + j];
-  //       }
-  //     }
-  //   }
-
-  //   weights->w_qkv->to_device(stream);
-  // }
-
   {
     size_t hidden_dim = p->hidden_dim;
     size_t shard_qkv_size = qkv_layer_size / TP;
@@ -401,34 +347,6 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
     weights->b_qkv->to_device(stream);
   }
-  // weights->b_qkv = new Tensor({layers_per_stage, qkv_layer_size},
-  //                             w->b_qkv + 1ll * pp_offset * qkv_layer_size, stream, DType::BF16);
-
-  /** w_o
-    weights->w_o = new Tensor(
-    {layers_per_stage, (size_t)p->hidden_dim, (size_t)p->n_attn_heads * p->head_dim}, w->w_o + 1ll * pp_offset * (size_t)p->hidden_dim * (size_t)p->n_attn_heads * p->head_dim, device_id);
-  */
-  // {
-  //   size_t hidden_dim = p->hidden_dim;
-  //   size_t n_attn_heads = p->n_attn_heads;
-  //   size_t head_dim = p->head_dim;
-
-  //   weights->w_o =
-  //     new Tensor({layers_per_stage, n_attn_heads * head_dim, hidden_dim}, stream, DType::BF16);
-
-  //   float *w_o_ptr = w->w_o + 1ll * pp_offset * hidden_dim * n_attn_heads * head_dim;
-
-  //   for (size_t l = 0; l < layers_per_stage; l++) {
-  //     for (size_t i = 0; i < hidden_dim; i++) {
-  //       for (size_t j = 0; j < n_attn_heads * head_dim; j++) {
-  //         weights->w_o->buf[l * n_attn_heads * head_dim * hidden_dim + j * hidden_dim + i] =
-  //           w_o_ptr[l * hidden_dim * n_attn_heads * head_dim + i * n_attn_heads * head_dim + j];
-  //       }
-  //     }
-  //   }
-
-  //   weights->w_o->to_device(stream);
-  // }
 
   {
     size_t hidden_dim = p->hidden_dim;
@@ -457,11 +375,6 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   weights->b_o = new Tensor({layers_per_stage, (size_t)p->hidden_dim},
                             w->b_o + 1ll * pp_offset * (size_t)p->hidden_dim, stream, DType::BF16);
 
-  // Tensor *attn_sinks; // (n_layers, n_attn_heads)
-  // weights->attn_sinks =
-  //   new Tensor({layers_per_stage, (size_t)p->n_attn_heads},
-  //              w->attn_sinks + 1ll * pp_offset * (size_t)p->n_attn_heads, stream);
-
   {
     size_t n_attn_heads = p->n_attn_heads;
     size_t shard_attn_heads = n_attn_heads / TP;
@@ -487,11 +400,6 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
   float *w_mlp1_ptr = w->w_mlp1 + 1ll * pp_offset * (size_t)p->n_experts * 2 *
                                     (size_t)p->intermediate_dim * (size_t)p->hidden_dim;
-  /** w_mlp1
-    weights->w_mlp1 = new Tensor(
-      {layers_per_stage, experts_per_gpu, 2 * (size_t)p->intermediate_dim, (size_t)p->hidden_dim}, w_mlp1_ptr, device_id, DType::BF16
-    );
-  */
   {
     printf("Starting alloc mlp1\n");
     fflush(stdout);
@@ -753,10 +661,8 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   */
 
   if (pp_rank + 1 == PP) {
-    weights->rms_out_w = new Tensor({(size_t)p->hidden_dim}, w->rms_out_w, stream);
-    /** w->out
-      weights->out = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->out, device_id);
-    */
+    weights->rms_out_w = new Tensor({(size_t)p->hidden_dim}, w->rms_out_w, stream, DType::BF16);
+    
     {
       size_t vocab_size = p->vocab_size;
       size_t hidden_dim = p->hidden_dim;
@@ -774,24 +680,9 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
       weights->out_buffer->to_device(stream);
     }
-
-    // {
-    //   size_t vocab_size = p->vocab_size;
-    //   size_t hidden_dim = p->hidden_dim;
-
-    //   weights->out = new Tensor({hidden_dim, vocab_size}, stream, DType::BF16);
-
-    //   for (size_t i = 0; i < vocab_size; i++) {
-    //     for (size_t j = 0; j < hidden_dim; j++) {
-    //       weights->out->buf[j * vocab_size + i] = w->out[i * hidden_dim + j];
-    //     }
-    //   }
-
-    //   weights->out->to_device(stream);
-    // }
   } else {
     weights->rms_out_w = nullptr;
-    // weights->out = nullptr;
+    
     weights->out_buffer = nullptr;
   }
 }
@@ -799,7 +690,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
                         hipStream_t stream) {
   CHECK_HIP(hipSetDevice(device_id));
-  // Create Tensor wrappers for state buffers
+  
   rs->x = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
 
   rs->t = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
@@ -833,7 +724,6 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->up =
     new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
 
-  // rs->gate_up = new Tensor({(size_t)p->intermediate_dim}, s->gate_up);
   rs->gate_up =
     new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
 
@@ -846,8 +736,6 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
 
   rs->qkv = new Tensor(
     {BATCH_SIZE, ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim / TP}, stream);
-  // rs->tmp_qkv = new Tensor(
-  //   {BATCH_SIZE, ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim / TP}, stream);
 
   rs->q = new Tensor({BATCH_SIZE, (size_t)p->n_attn_heads * p->head_dim / TP}, stream);
   rs->k = new Tensor({BATCH_SIZE, (size_t)p->n_kv_heads * p->head_dim / TP}, stream);
@@ -857,12 +745,24 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->logits = new Tensor({BATCH_SIZE, (size_t)p->vocab_size}, stream);
   rs->tmp_logits = new Tensor({BATCH_SIZE, (size_t)p->vocab_size / TP}, stream);
 
+#ifdef KV16
+  printf("using BF16 KV cache\n");
+  rs->key_cache = new Tensor({BATCH_SIZE, ((size_t)p->n_layers / PP), (size_t)p->seq_len,
+                              (size_t)p->n_kv_heads * p->head_dim / TP},
+                             stream, DType::BF16);
+  rs->value_cache = new Tensor({BATCH_SIZE, ((size_t)p->n_layers / PP), (size_t)p->seq_len,
+                                (size_t)p->n_kv_heads * p->head_dim / TP},
+                               stream, DType::BF16);
+#else
+  printf("using FP32 KV cache\n");
   rs->key_cache = new Tensor({BATCH_SIZE, ((size_t)p->n_layers / PP), (size_t)p->seq_len,
                               (size_t)p->n_kv_heads * p->head_dim / TP},
                              stream);
   rs->value_cache = new Tensor({BATCH_SIZE, ((size_t)p->n_layers / PP), (size_t)p->seq_len,
                                 (size_t)p->n_kv_heads * p->head_dim / TP},
                                stream);
+#endif
+                
 
   // mask needs to be batch because they are not zero_allocated
   rs->mask = new Tensor({BATCH_SIZE, (size_t)p->seq_len, (size_t)p->seq_len}, stream);
