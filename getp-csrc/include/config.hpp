@@ -8,6 +8,7 @@
 // #include "config_run.hpp"
 
 #define BATCH_SIZE 128
+#define KV16 1
 // #define PRINT_LOGITS
 // #define TIME_GPU
 // #define DEBUG

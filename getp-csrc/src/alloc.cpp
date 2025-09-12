@@ -214,7 +214,7 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
     {BATCH_SIZE, (size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
     stream, DType::BF16);
 #else 
-  print("using FP32 KV cache\n");
+  printf("using FP32 KV cache\n");
   rs->key_cache = new Tensor(
     {BATCH_SIZE, (size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
     stream);
