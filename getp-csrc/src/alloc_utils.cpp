@@ -143,16 +143,18 @@ void alloc_w_mlp1_final(
             }
 
             // CPUTimer *convert_timer = new CPUTimer("convert_timer");
-            #pragma omp parallel for collapse(3)
+            #pragma omp parallel for collapse(4)
             for (int tp_rank = 0; tp_rank < TP; tp_rank++) {
                 for (int pp_rank = 0; pp_rank < PP; pp_rank++) {
                     for (int e_sm = 0; e_sm < BATCH_MLP1; e_sm++) {
                         size_t base = base_out + 1ll * pp_rank * pp_offset + 1ll * tp_rank * tp_offset + 1ll * e_sm * e_offset;
                         size_t base_tmp = base_tmp_out + 1ll * (pp_rank * TP + tp_rank) * BATCH_MLP1 * tmp_elems + 1ll * e_sm * tmp_elems;
-                        #pragma omp simd
-                        for (size_t i = 0; i < 2ll * shard_dim * hidden_dim; i++) {
-                            float value = w_mlp1_ptr[base + i];
-                            tmp[base_tmp + i] = bf16(value);
+                        for (size_t i = 0; i < 2 * shard_dim; i++) {
+                            #pragma omp simd
+                            for (size_t h = 0; h < hidden_dim; h++) {
+                                float value = w_mlp1_ptr[base + i * hidden_dim + h];
+                                tmp[base_tmp + i * hidden_dim + h] = bf16(value);
+                            }
                         }
                     }
                 }
@@ -185,33 +187,22 @@ void alloc_w_mlp1_final(
     }
 
     // final sync
-    #pragma omp parallel for collapse(2)
-    for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
-        for (int j = 0; j < BUFFER_MLP1; j++) {
-            CHECK_HIP(hipEventSynchronize(copy_dones[i + j * TOTAL_GPUS_NEEDED]));
-        }
-    }
-
-    #pragma omp parallel for collapse(2)
-    for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
-        for (int j = 0; j < BUFFER_MLP1; j++) {
-            // CHECK_HIP(hipStreamSynchronize(transpose_streams[i + j * TOTAL_GPUS_NEEDED]));
-        }
+    #pragma omp parallel for
+    for (int i = 0; i < TOTAL_GPUS_NEEDED * BUFFER_MLP1; i++) {
+        CHECK_HIP(hipEventSynchronize(copy_dones[i]));
     }
     
     free(tmp);
 
+    #pragma omp parallel for
     for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
         CHECK_HIP(hipFree(d_tmp_arr[i]));
     }
 
-    #pragma omp parallel for collapse(2)
-    for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
-        for (int j = 0; j < BUFFER_MLP1; j++) {
-            CHECK_HIP(hipStreamDestroy(copy_streams[i + j * TOTAL_GPUS_NEEDED]));
-            CHECK_HIP(hipStreamDestroy(transpose_streams[i + j * TOTAL_GPUS_NEEDED]));
-            CHECK_HIP(hipEventDestroy(copy_dones[i + j * TOTAL_GPUS_NEEDED]));
-        }
+    #pragma omp parallel for
+    for (int i = 0; i < TOTAL_GPUS_NEEDED * BUFFER_MLP1; i++) {
+        CHECK_HIP(hipStreamDestroy(copy_streams[i]));
+        CHECK_HIP(hipEventDestroy(copy_dones[i]));
     }
     
     delete[] d_tmp_arr;
@@ -310,7 +301,6 @@ void alloc_w_mlp2_final(
 
     bf16** d_buf_array = new bf16*[TOTAL_GPUS_NEEDED];
     hipStream_t *copy_streams = new hipStream_t[TOTAL_GPUS_NEEDED * BUFFER_MLP2];
-    hipStream_t *transpose_streams = new hipStream_t[TOTAL_GPUS_NEEDED * BUFFER_MLP2];
     hipEvent_t *copy_dones = new hipEvent_t[TOTAL_GPUS_NEEDED * BUFFER_MLP2];
 
     int end_layer = start_layer + OFFSET_LAYER;
@@ -322,7 +312,6 @@ void alloc_w_mlp2_final(
         CHECK_HIP(hipSetDevice(i));
         for (int j = 0; j < BUFFER_MLP2; j++) {
             CHECK_HIP(hipStreamCreate(&copy_streams[i + j * TOTAL_GPUS_NEEDED]));
-            CHECK_HIP(hipStreamCreate(&transpose_streams[i + j * TOTAL_GPUS_NEEDED]));
             CHECK_HIP(hipEventCreate(&copy_dones[i + j * TOTAL_GPUS_NEEDED]));
         }
     }
@@ -379,7 +368,7 @@ void alloc_w_mlp2_final(
                         for (size_t h = 0; h < hidden_dim; h++) {
                             #pragma omp simd
                             for (size_t i = 0; i < shard_dim; i++) {
-                                float value = w_mlp2_ptr[base_out + h * inter_dim + i];
+                                float value = w_mlp2_ptr[base + h * inter_dim + i];
                                 tmp[base_tmp + h * shard_dim + i] = bf16(value);
                             }
                         }
@@ -414,39 +403,27 @@ void alloc_w_mlp2_final(
     }
 
     // final sync
-    #pragma omp parallel for collapse(2)
-    for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
-        for (int j = 0; j < BUFFER_MLP2; j++) {
-            CHECK_HIP(hipEventSynchronize(copy_dones[i + j * TOTAL_GPUS_NEEDED]));
-        }
-    }
-
-    #pragma omp parallel for collapse(2)
-    for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
-        for (int j = 0; j < BUFFER_MLP2; j++) {
-            // CHECK_HIP(hipStreamSynchronize(transpose_streams[i + j * TOTAL_GPUS_NEEDED]));
-        }
+    #pragma omp parallel for
+    for (int i = 0; i < TOTAL_GPUS_NEEDED * BUFFER_MLP2; i++) {
+        CHECK_HIP(hipEventSynchronize(copy_dones[i]));
     }
     
     free(tmp);
 
+    #pragma omp parallel for
     for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
         CHECK_HIP(hipFree(d_tmp_arr[i]));
     }
 
-    #pragma omp parallel for collapse(2)
-    for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
-        for (int j = 0; j < BUFFER_MLP2; j++) {
-            CHECK_HIP(hipStreamDestroy(copy_streams[i + j * TOTAL_GPUS_NEEDED]));
-            CHECK_HIP(hipStreamDestroy(transpose_streams[i + j * TOTAL_GPUS_NEEDED]));
-            CHECK_HIP(hipEventDestroy(copy_dones[i + j * TOTAL_GPUS_NEEDED]));
-        }
+    #pragma omp parallel for
+    for (int i = 0; i < TOTAL_GPUS_NEEDED * BUFFER_MLP2; i++) {
+        CHECK_HIP(hipStreamDestroy(copy_streams[i]));
+        CHECK_HIP(hipEventDestroy(copy_dones[i]));
     }
     
     delete[] d_tmp_arr;
     delete[] d_buf_array;
     delete[] copy_streams;
-    delete[] transpose_streams;
     delete[] copy_dones;
 
     printf("End alloc mlp1 final\n");
