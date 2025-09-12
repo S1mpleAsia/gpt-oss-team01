@@ -739,6 +739,8 @@ void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunSt
   total_events->tp_ready = new hipEvent_t[TOTAL_GPUS_NEEDED];
   total_events->tp_finish = new hipEvent_t[TOTAL_GPUS_NEEDED];
   total_events->pp_sync = new hipEvent_t[TOTAL_GPUS_NEEDED];
+
+  #pragma omp parallel for num_threads(TOTAL_GPUS_NEEDED)
   for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
     CHECK_HIP(hipSetDevice(i));
     
@@ -754,6 +756,12 @@ void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunSt
   for (int start_layer = 0; start_layer < (p->n_layers / PP); start_layer += OFFSET_LAYER) {
     for (int start_moe = 0; start_moe < p->n_experts; start_moe += OFFSET_MOE) {
       alloc_w_mlp1_final(weights, w->w_mlp1, p, start_layer, start_moe);
+    }
+  }
+
+  for (int start_layer = 0; start_layer < (p->n_layers / PP); start_layer += OFFSET_LAYER) {
+    for (int start_moe = 0; start_moe < p->n_experts; start_moe += OFFSET_MOE) {
+      alloc_w_mlp2_final(weights, w->w_mlp2, p, start_layer, start_moe);
     }
   }
 
