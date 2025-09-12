@@ -161,7 +161,7 @@ void *thread_handler(void *arg) {
     }
 #endif
 
-    for (int pos = 0; pos < max_seq_len && active_count > 0; ++pos) {
+    for (int pos = 0; pos < max_seq_len - 1 && active_count > 0; ++pos) {
 #ifdef RUN_20B
       float *batch_logits = forward_gpu_20b_batched(current_tokens.data(), pos, current_size, id);
 #else
@@ -234,7 +234,7 @@ void *thread_handler(void *arg) {
         generated_len = 0;
 
       output_batch[i][generated_len + 1] = -1;
-      local_token_count += generated_len;
+      local_token_count += (generated_len + 1);
     }
   }
 

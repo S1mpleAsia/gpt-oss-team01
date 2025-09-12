@@ -1634,6 +1634,27 @@ void classifier_gemm_batched(const Tensor *W_out,  // Shape: [vocab_size, hidden
   }
 }
 
+// __global__ void input_convert_kernel(const float *x_ptr, bf16 *x_bf16_ptr, int size) {
+//   int idx = (blockDim.x * blockIdx.x + threadIdx.x) * 4;
+
+//   if (idx + 3 < size) {
+//     const float4 *x_f4_ptr = reinterpret_cast<const float4 *>(x_ptr);
+//     float4 f4_val = x_f4_ptr[idx / 4];
+
+//     // Chuyển đổi từng thành phần
+//     bf16 vals[4];
+//     vals[0] = bf16(f4_val.x);
+//     vals[1] = bf16(f4_val.y);
+//     vals[2] = bf16(f4_val.z);
+//     vals[3] = bf16(f4_val.w);
+
+//     // Ép kiểu con trỏ để ghi 1 lần 4 giá trị bf16 (tổng 64 bit)
+//     // uint2 có kích thước 64 bit
+//     uint2 *out_u2_ptr = reinterpret_cast<uint2 *>(x_bf16_ptr);
+//     out_u2_ptr[idx / 4] = *reinterpret_cast<uint2 *>(vals);
+//   }
+// }
+
 void classifier_gemm_batched_v2(const Tensor *W_out,  // Shape: [hidden_dim, vocab_size]
                                 Tensor *x,            // Shape: [batch_size, hidden_dim]
                                 Tensor *logits,       // Shape: [batch_size, vocab_size]
@@ -1651,6 +1672,17 @@ void classifier_gemm_batched_v2(const Tensor *W_out,  // Shape: [hidden_dim, voc
   const bf16 *w_out_ptr = (const bf16 *)W_out->d_buf;
   const float *x_ptr = (const float *)x->d_buf;
   float *logits_buf = (float *)logits->d_buf;
+  // bf16 *x_bf16_ptr = nullptr;
+  // CHECK_HIP(hipMalloc(&x_bf16_ptr, cur_batch_size * hidden_dim * sizeof(bf16)));
+
+  // {
+  //   GpuTimer timer("convert_bf16", stream);
+
+  //   dim3 block_size(256);
+  //   dim3 grid_size((cur_batch_size * hidden_dim + 255) / 256);
+  //   input_convert_kernel<<<grid_size, block_size, 0, stream>>>(x_ptr, x_bf16_ptr,
+  //                                                              cur_batch_size * hidden_dim);
+  // }
 
   {
 #if BATCH_SIZE <= 16
@@ -1674,6 +1706,9 @@ void classifier_gemm_batched_v2(const Tensor *W_out,  // Shape: [hidden_dim, voc
 
     gemm_mfma<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
       x_ptr, w_out_ptr, logits_buf, nullptr, cur_batch_size, vocab_size, hidden_dim);
+
+    // gemm_mfma_bf16<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+    // x_bf16_ptr, w_out_ptr, logits_buf, nullptr, cur_batch_size, vocab_size, hidden_dim);
   }
 
   // {
