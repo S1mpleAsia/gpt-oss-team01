@@ -7,11 +7,11 @@
 #include "tensor.hpp"
 // #include "config_run.hpp"
 
-#define BATCH_SIZE 128
+#define BATCH_SIZE 32
 // #define PRINT_LOGITS
 // #define TIME_GPU
 // #define DEBUG
-#define RUN_20B
+// #define RUN_20B
 
 #ifdef RUN_20B
 #define DP 8
@@ -105,7 +105,6 @@ typedef struct {
   int max_rows;
 
   // Multi-GPU related
-  Tensor *reduce_temp_buffer;
   TensorI32 *tokens_buf;
 } OurRunState;
 

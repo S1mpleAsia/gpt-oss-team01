@@ -264,7 +264,7 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
 
   rs->cos_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2}, stream);
   rs->sin_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2}, stream);
-  RopePrecomputeCS(p, rs->cos_tensor, rs->sin_tensor);
+  rope_precompute_cs(p, rs->cos_tensor, rs->sin_tensor, stream);
 }
 
 #else
@@ -286,14 +286,15 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
   // Create Tensor wrappers for weight matrices
   if (pp_rank == 0) {
-    weights->token_embedding_table =
-      new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->token_embedding_table, stream);
+    weights->token_embedding_table = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim},
+                                                w->token_embedding_table, stream, DType::BF16);
   } else {
     weights->token_embedding_table = nullptr;
   }
 
-  weights->rms_attn_w = new Tensor({layers_per_stage * p->hidden_dim},
-                                   w->rms_attn_w + 1ll * pp_offset * p->hidden_dim, stream);
+  weights->rms_attn_w =
+    new Tensor({layers_per_stage * p->hidden_dim}, w->rms_attn_w + 1ll * pp_offset * p->hidden_dim,
+               stream, DType::BF16);
   weights->rms_ffn_w = new Tensor({layers_per_stage * p->hidden_dim},
                                   w->rms_ffn_w + 1ll * pp_offset * p->hidden_dim, stream);
 
@@ -753,7 +754,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   */
 
   if (pp_rank + 1 == PP) {
-    weights->rms_out_w = new Tensor({(size_t)p->hidden_dim}, w->rms_out_w, stream);
+    weights->rms_out_w = new Tensor({(size_t)p->hidden_dim}, w->rms_out_w, stream, DType::BF16);
     /** w->out
       weights->out = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->out, device_id);
     */
@@ -775,6 +776,8 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
       weights->out_buffer->to_device(stream);
     }
 
+    weights->out = nullptr;
+
     // {
     //   size_t vocab_size = p->vocab_size;
     //   size_t hidden_dim = p->hidden_dim;
@@ -791,7 +794,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     // }
   } else {
     weights->rms_out_w = nullptr;
-    // weights->out = nullptr;
+    weights->out = nullptr;
     weights->out_buffer = nullptr;
   }
 }
@@ -865,12 +868,12 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
                                stream);
 
   // mask needs to be batch because they are not zero_allocated
-  rs->mask = new Tensor({BATCH_SIZE, (size_t)p->seq_len, (size_t)p->seq_len}, stream);
-  size_t single_mask_elems = (size_t)p->seq_len * p->seq_len;
-  for (int b = 0; b < BATCH_SIZE; b++) {
-    float *dest_ptr = rs->mask->buf + b * single_mask_elems;
-    memcpy(dest_ptr, s->mask, single_mask_elems * sizeof(float));
-  }
+  rs->mask = new Tensor({BATCH_SIZE, (size_t)1, (size_t)1}, stream);
+  // size_t single_mask_elems = (size_t)p->seq_len * p->seq_len;
+  // for (int b = 0; b < BATCH_SIZE; b++) {
+  //   float *dest_ptr = rs->mask->buf + b * single_mask_elems;
+  //   memcpy(dest_ptr, s->mask, single_mask_elems * sizeof(float));
+  // }
   rs->mask->to_device(stream);
 
   // MoE buffers
@@ -879,9 +882,11 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->x_packed =
     new Tensor({(size_t)BATCH_SIZE * p->experts_per_token, (size_t)p->hidden_dim}, stream);
 
+  rs->tokens_buf = new TensorI32({(size_t)BATCH_SIZE}, stream);
+
   rs->cos_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2}, stream);
   rs->sin_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2}, stream);
-  RopePrecomputeCS(p, rs->cos_tensor, rs->sin_tensor);
+  rope_precompute_cs(p, rs->cos_tensor, rs->sin_tensor, stream);
 }
 
 #endif

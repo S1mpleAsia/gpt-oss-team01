@@ -2,8 +2,6 @@
 #include "getp_eval.cpp"
 
 #include "src/tensor.cpp"
-#include "src/layer.cpp"
-#include "src/layer_hip.cpp"
 #include "src/layer_hip_batch.cpp"
 #include "src/model.cpp"
 #include "src/alloc.cpp"
