@@ -5,12 +5,13 @@
 #include <cstring>
 
 #include "tensor.hpp"
+#include "pipeline.hpp"
 
-#define BATCH_SIZE 8
+#define BATCH_SIZE 32
 // #define PRINT_LOGITS
 // #define TIME_GPU
 // #define DEBUG
-#define RUN_20B
+// #define RUN_20B
 
 #ifdef RUN_20B
   #define DP 4
@@ -100,6 +101,7 @@ typedef struct {
 
   // Multi-GPU related
   Tensor *reduce_temp_buffer;
+  PipelineEach *pipeline_each;
 } OurRunState;
 
 typedef struct {

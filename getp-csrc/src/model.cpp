@@ -19,6 +19,8 @@ float *forward_gpu_20b_batched(
   long long kv_dim = 1ll * p->n_kv_heads * p->head_dim;
   long long loff_one = 1ll * p->seq_len * kv_dim;
   long long loff_one_batch = 1ll * p->n_layers * loff_one;
+  
+  int total_pairs = BATCH_SIZE * p->experts_per_token;
 
   // forward all the layers
   for (int l = 0; l < p->n_layers; l++) {
@@ -62,22 +64,6 @@ float *forward_gpu_20b_batched(
     topk_softmax_batched(rs_now->router_score, rs_now->topk_v, rs_now->topk_i, false, false, false, stream);
 
     // Route the tokens to their corresponding top-k experts
-    // moe_apply_topk_batched(rs_now->t, weights_now->w_mlp1, weights_now->b_mlp1, weights_now->w_mlp2,
-    //                        weights_now->b_mlp2, rs_now->topk_i, rs_now->topk_v, rs_now->mlp1_out, rs_now->gate_up,
-    //                        rs_now->tb3, rs_now->e_agg, p->swiglu_limit, 1ll * l, false, false, false,
-    //                        false);
-
-    // moe_mlp1_batched(rs_now->t, weights_now->w_mlp1, weights_now->b_mlp1, rs_now->topk_i, rs_now->mlp1_out, false,
-    //                  false, 1ll * l);
-
-    // moe_swiglu_batched(rs_now->mlp1_out, rs_now->gate_up, p->experts_per_token, p->swiglu_limit);
-
-    // moe_mlp2_batched(rs_now->gate_up, weights_now->w_mlp2, weights_now->b_mlp2, rs_now->tb3, rs_now->topk_i,
-    //                  p->experts_per_token, true, 1ll * l);
-
-    // moe_agg_batched(rs_now->tb3, rs_now->topk_v, rs_now->e_agg, p->experts_per_token, false);
-
-    int total_pairs = BATCH_SIZE * p->experts_per_token;
     moe_init_buffers_hip(rs_now->e_agg, rs_now->mlp1_out, rs_now->gate_up, rs_now->tb3, rs_now->sorted_pair_ids,
                          rs_now->expert_offsets, rs_now->x_packed, BATCH_SIZE, p->hidden_dim, stream);
 
@@ -102,11 +88,6 @@ float *forward_gpu_20b_batched(
     moe_scatter_aggregate_hip(rs_now->tb3, rs_now->sorted_pair_ids, rs_now->topk_v, rs_now->e_agg,
                               rs_now->expert_offsets, p->hidden_dim, p->experts_per_token, p->n_experts,
                               max_rows, stream);
-
-    // moe_block_matmul_style_hip(rs_now->t, rs_now->topk_i, rs_now->topk_v, weights_now->w_mlp1, weights_now->b_mlp1,
-    //                            weights_now->w_mlp2, weights_now->b_mlp2, rs_now->e_agg, rs_now->mlp1_out,
-    //                            rs_now->gate_up, rs_now->tb3, rs_now->sorted_pair_ids, rs_now->expert_offsets,
-    //                            rs_now->x_packed, p->swiglu_limit, 1ll * l);
 
     // residual connection
     add_vector_batched(rs_now->x, rs_now->e_agg, false, false, false, stream);  // equals residual add
@@ -242,8 +223,12 @@ float *forward_gpu_120b_batched(
       stream = total_streams[cur_device];
 
       // sync from rs_now->x to rs_now->x
-      CHECK_HIP(hipStreamWaitEvent(stream, pp_sync));
-      CHECK_HIP(hipMemcpyPeerAsync(rs_new->x->d_buf, cur_device, rs_now->x->d_buf, cur_device - TP, rs_now->x->num_elem() * rs_now->x->get_dtype_size(), stream));
+      /*
+        CHECK_HIP(hipStreamWaitEvent(stream, pp_sync));
+        CHECK_HIP(hipMemcpyPeerAsync(rs_new->x->d_buf, cur_device, rs_now->x->d_buf, cur_device - TP, rs_now->x->num_elem() * rs_now->x->get_dtype_size(), stream));
+      */
+      rs_new->pipeline_each->enqueueElem(rs_now->x, cur_device - TP, pp_sync, stream);
+      rs_new->pipeline_each->dequeue(rs_new->x, stream);
 
       weights_now = &weights[cur_device];
       rs_now = &rs[cur_device];

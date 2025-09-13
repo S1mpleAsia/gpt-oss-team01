@@ -9,6 +9,7 @@
 #include "src/alloc.cpp"
 #include "src/alloc_utils.cpp"
 #include "src/utils.cpp"
+#include "src/pipeline.cpp"
 #include "src/kernel.cpp"
 
 #ifndef GETP_RUN

@@ -177,6 +177,8 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id) 
   rs->cos_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2}, device_id);
   rs->sin_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2}, device_id);
   RopePrecomputeCS(p, rs->cos_tensor, rs->sin_tensor);
+
+  rs->pipeline_each = nullptr;
 }
 
 #else
@@ -602,6 +604,8 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 }
 
 void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id) {
+  int pp_rank = (device_id / TP) % PP;
+  int tp_rank = device_id % TP;
   // Create Tensor wrappers for state buffers
   rs->x = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, device_id);
 
@@ -610,7 +614,7 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id) 
   rs->tb2 = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, device_id);
 
   rs->tb3 = new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, device_id);
-  if (device_id % TP == 0) {
+  if (tp_rank == 0) {
     rs->tb3_buf = new Tensor({TP, BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, device_id);
   } else {
     rs->tb3_buf = nullptr;
@@ -660,6 +664,12 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id) 
   rs->cos_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2}, device_id);
   rs->sin_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2}, device_id);
   RopePrecomputeCS(p, rs->cos_tensor, rs->sin_tensor);
+  
+  if (pp_rank > 0) {
+    rs->pipeline_each = new PipelineEach({BATCH_SIZE, (size_t)p->hidden_dim}, device_id, SIZE_OF_BUF, DType::FP32);
+  } else {
+    rs->pipeline_each = nullptr;
+  }
 }
 
 #endif
@@ -733,6 +743,8 @@ void our_free_each(OurTransformerWeights *weights, OurRunState *rs) {
   if (rs->key_cache) delete rs->key_cache;
   if (rs->value_cache) delete rs->value_cache;
   if (rs->mask) delete rs->mask;
+
+  if (rs->pipeline_each) delete rs->pipeline_each;
 
   // Others
   if (rs->cos_tensor) delete rs->cos_tensor;
