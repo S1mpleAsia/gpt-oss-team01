@@ -6,9 +6,9 @@
 #include <hip/hip_bf16.h> // Header for bfloat16 types and conversion functions
 
 #define BUFFER_MLP1 8
-#define BATCH_MLP1 2
+#define BATCH_MLP1 4
 #define BUFFER_MLP2 8
-#define BATCH_MLP2 1
+#define BATCH_MLP2 4
 
 #define OFFSET_LAYER 3
 #define OFFSET_MOE 32

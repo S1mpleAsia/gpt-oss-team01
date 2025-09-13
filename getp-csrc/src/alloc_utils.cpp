@@ -119,8 +119,8 @@ void alloc_w_mlp1_final(
     );
 
     for (size_t l = 0; l < n_layers; l++) {
+        CPUTimer each_exp_timer("each_exp_timer");
         for (size_t e = 0; e < n_experts; e += BATCH_MLP1) {
-            CPUTimer each_exp_timer("each_exp_timer");
 
             size_t base_out = 1ll * l * l_offset + 1ll * e * e_offset;
             int le_id = (l * n_experts + e) / (BUFFER_MLP1 * BATCH_MLP1);
@@ -130,14 +130,14 @@ void alloc_w_mlp1_final(
             size_t base_tmp_out_each = 1ll * le_slot_id * batch_tmp_elems;
 
             if (le_id) {
-                CPUTimer sync("event sync");
+               // CPUTimer sync("event sync");
                 #pragma omp parallel for
                 for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
                     CHECK_HIP(hipEventSynchronize(copy_dones[i + le_slot]));
                 }
             }
 
-            CPUTimer *convert_timer = new CPUTimer("convert_timer");
+            // CPUTimer *convert_timer = new CPUTimer("convert_timer");
             for (int pp_rank = 0; pp_rank < PP; pp_rank++) {
                 for (int tp_rank = 0; tp_rank < TP; tp_rank++) {
                     for (int e_sm = 0; e_sm < BATCH_MLP1; e_sm++) {
@@ -154,7 +154,7 @@ void alloc_w_mlp1_final(
                     }
                 }
             }
-            delete convert_timer;
+            // delete convert_timer;
 
             size_t d_offset = 1ll * l * l_offset_d + 1ll * e * e_offset_d;
             #pragma omp parallel for
@@ -330,9 +330,9 @@ void alloc_w_mlp2_final(
     );
 
     for (size_t l = 0; l < n_layers; l++) {
+        CPUTimer each_exp_timer("each_exp_timer");
         for (size_t e = 0; e < n_experts; e += BATCH_MLP2) {
-            CPUTimer each_exp_timer("each_exp_timer");
-
+            
             size_t base_out = 1ll * l * l_offset + 1ll * e * e_offset;
             int le_id = (l * n_experts + e) / (BUFFER_MLP2 * BATCH_MLP2);
             int le_slot_id = ((l * n_experts + e) / BATCH_MLP2) % BUFFER_MLP2;
