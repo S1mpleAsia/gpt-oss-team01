@@ -6,14 +6,14 @@
 
 #include "tensor.hpp"
 
-#define BATCH_SIZE 32
+#define BATCH_SIZE 8
 // #define PRINT_LOGITS
 // #define TIME_GPU
 // #define DEBUG
-// #define RUN_20B
+#define RUN_20B
 
 #ifdef RUN_20B
-  #define DP 8
+  #define DP 4
   #define PP 1
   #define TP 1
 #else

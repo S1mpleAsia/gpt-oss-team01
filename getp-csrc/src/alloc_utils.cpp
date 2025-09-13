@@ -105,6 +105,22 @@ void alloc_w_mlp1_final(
     size_t pp_offset = 1ll * n_layers * n_experts * hidden_dim * 2 * inter_dim;
     size_t le_slot_offset = 1ll * TOTAL_PIPELINES * batch_tmp_elems;
 
+    size_t base_values[TOTAL_BASE_VALUES_MLP1];
+    size_t base_tmp_values[TOTAL_BASE_VALUES_MLP1];
+
+    // Loop to populate the new 3D array
+    #pragma omp parallel for collapse(3)
+    for (int pp_rank = 0; pp_rank < PP; pp_rank++) {
+        for (int e_sm = 0; e_sm < BATCH_MLP1; e_sm++) {
+            for (int tp_rank = 0; tp_rank < TP; tp_rank++) {
+                // The new value is the sum of the corresponding values from the original arrays
+                int id = (pp_rank * BATCH_MLP1 + e_sm) * TP + tp_rank;
+                base_values[id] = 1ll * pp_rank * pp_offset + 1ll * tp_rank * tp_offset + 1ll * e_sm * e_offset;
+                base_tmp_values[id] = 1ll * (pp_rank * TP + tp_rank) * batch_tmp_elems + 1ll * e_sm * tmp_elems;
+            }
+        }
+    }
+
     int w = hidden_dim;
     int h = 2 * shard_dim;
     
@@ -138,19 +154,13 @@ void alloc_w_mlp1_final(
             }
 
             // CPUTimer *convert_timer = new CPUTimer("convert_timer");
-            for (int pp_rank = 0; pp_rank < PP; pp_rank++) {
-                for (int tp_rank = 0; tp_rank < TP; tp_rank++) {
-                    for (int e_sm = 0; e_sm < BATCH_MLP1; e_sm++) {
-                        size_t base = base_out + 1ll * pp_rank * pp_offset + 1ll * tp_rank * tp_offset + 1ll * e_sm * e_offset;
-                        size_t base_tmp = base_tmp_out + 1ll * (pp_rank * TP + tp_rank) * batch_tmp_elems + 1ll * e_sm * tmp_elems;
-                        #pragma omp parallel for
-                        for (size_t i = 0; i < 2 * shard_dim; i++) {
-                            #pragma omp simd
-                            for (size_t h = 0; h < hidden_dim; h++) {
-                                float value = w_mlp1_ptr[base + i * hidden_dim + h];
-                                tmp[base_tmp + i * hidden_dim + h] = bf16(value);
-                            }
-                        }
+            #pragma omp parallel for collapse(2)
+            for (int idx = 0; idx < TOTAL_BASE_VALUES_MLP1; idx++) {
+                for (size_t i = 0; i < 2 * shard_dim; i++) {
+                    #pragma omp simd
+                    for (size_t h = 0; h < hidden_dim; h++) {
+                        float value = w_mlp1_ptr[base_out + base_values[idx] + i * hidden_dim + h];
+                        tmp[base_tmp_out + base_tmp_values[idx] + i * hidden_dim + h] = bf16(value);
                     }
                 }
             }
@@ -329,10 +339,27 @@ void alloc_w_mlp2_final(
         BATCH_MLP2
     );
 
+    size_t base_values[TOTAL_BASE_VALUES_MLP2];
+    size_t base_tmp_values[TOTAL_BASE_VALUES_MLP2];
+
+    // Loop to populate the new 3D array
+    #pragma omp parallel for collapse(3)
+    for (int pp_rank = 0; pp_rank < PP; pp_rank++) {
+        for (int e_sm = 0; e_sm < BATCH_MLP2; e_sm++) {
+            for (int tp_rank = 0; tp_rank < TP; tp_rank++) {
+                // The new value is the sum of the corresponding values from the original arrays
+                int id = (pp_rank * BATCH_MLP2 + e_sm) * TP + tp_rank;
+                base_values[id] = 1ll * pp_rank * pp_offset + 1ll * tp_rank * tp_offset + 1ll * e_sm * e_offset;
+                base_tmp_values[id] = 1ll * (pp_rank * TP + tp_rank) * batch_tmp_elems + 1ll * e_sm * tmp_elems;
+            }
+        }
+    }
+
+
     for (size_t l = 0; l < n_layers; l++) {
         CPUTimer each_exp_timer("each_exp_timer");
         for (size_t e = 0; e < n_experts; e += BATCH_MLP2) {
-            
+
             size_t base_out = 1ll * l * l_offset + 1ll * e * e_offset;
             int le_id = (l * n_experts + e) / (BUFFER_MLP2 * BATCH_MLP2);
             int le_slot_id = ((l * n_experts + e) / BATCH_MLP2) % BUFFER_MLP2;
@@ -349,19 +376,13 @@ void alloc_w_mlp2_final(
             }
 
             // CPUTimer *convert_timer = new CPUTimer("convert_timer");
-            #pragma omp parallel for collapse(4)
-            for (int pp_rank = 0; pp_rank < PP; pp_rank++) {
-                for (int tp_rank = 0; tp_rank < TP; tp_rank++) {
-                    for (int e_sm = 0; e_sm < BATCH_MLP2; e_sm++) {
-                        size_t base = base_out + 1ll * pp_rank * pp_offset + 1ll * tp_rank * tp_offset + 1ll * e_sm * e_offset;
-                        size_t base_tmp = base_tmp_out + 1ll * (pp_rank * TP + tp_rank) * batch_tmp_elems + 1ll * e_sm * tmp_elems;
-                        for (size_t h = 0; h < hidden_dim; h++) {
-                            #pragma omp simd
-                            for (size_t i = 0; i < shard_dim; i++) {
-                                float value = w_mlp2_ptr[base + h * inter_dim + i];
-                                tmp[base_tmp + h * shard_dim + i] = bf16(value);
-                            }
-                        }
+            #pragma omp parallel for collapse(2)
+            for (int idx = 0; idx < TOTAL_BASE_VALUES_MLP2; idx++) {
+                for (size_t h = 0; h < hidden_dim; h++) {
+                    #pragma omp simd
+                    for (size_t i = 0; i < shard_dim; i++) {
+                        float value = w_mlp2_ptr[base_out + base_values[idx] + h * inter_dim + i];
+                        tmp[base_tmp_out + base_tmp_values[idx] + h * shard_dim + i] = bf16(value);
                     }
                 }
             }
@@ -416,7 +437,7 @@ void alloc_w_mlp2_final(
     delete[] copy_streams;
     delete[] copy_dones;
 
-    printf("End alloc mlp1 final\n");
+    printf("End alloc mlp2 final\n");
     fflush(stdout);
 }
 
