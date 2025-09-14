@@ -7,7 +7,7 @@
 #include "tensor.hpp"
 #include "pipeline.hpp"
 
-#define BATCH_SIZE 8
+#define BATCH_SIZE 16
 // #define PRINT_LOGITS
 // #define TIME_GPU
 // #define DEBUG
@@ -19,8 +19,8 @@
   #define TP 1
 #else
   #define DP 1
-  #define PP 2
-  #define TP 2
+  #define PP 1
+  #define TP 4
 #endif
 #define TOTAL_GPUS_NEEDED ((DP) * (PP) * (TP))
 #define TOTAL_PIPELINES ((PP) * (TP))
