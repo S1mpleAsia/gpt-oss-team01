@@ -115,12 +115,18 @@ typedef struct {
 typedef struct {
   int tp_rank;
   int pp_rank;
-  vector<int> *current_tokens;
-  int pos;
-  int current_size;
   int id;
-  float *logits;
+  /*
+    int **current_tokens;
+    int pos;
+    int current_size;
+    float *logits;
+  */
+  WorkItem **work_items;
   pthread_barrier_t *tp_barrier;
+  pthread_barrier_t *debug_barrier;
+  long long *total_generate_tokens;
+  int num_loops;
 } OnePathInsideArgs;
 
 typedef struct {

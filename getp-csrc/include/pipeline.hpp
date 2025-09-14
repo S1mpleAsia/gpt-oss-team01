@@ -28,3 +28,26 @@ struct PipelineEach {
     );
     void dequeue(Tensor *x, hipStream_t stream);
 };
+
+struct WorkItem {
+    int current_size;
+
+    const char **input_batch;
+    int **output_batch;
+    int **batch_prompt_tokens;
+    int *num_prompt_tokens;
+    int *current_tokens;
+    int *current_pos;
+    bool *active;
+    int active_count;
+    long long total_generate_tokens;
+
+    WorkItem(int current_size);
+    ~WorkItem();
+
+    void initItem(
+        Requests *requests, Tokenizer *tokenizer, Config *p, int cur_idx
+    );
+    void nextStep(Config *p, float *batch_logits);
+    void retrieveResults(long long *result_out);
+};
