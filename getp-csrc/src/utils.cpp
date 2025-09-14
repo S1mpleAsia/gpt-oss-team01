@@ -35,3 +35,37 @@ void memset_tensor(Tensor *in, int value, bool set_host, bool set_device, hipStr
     CHECK_HIP(hipMemsetAsync(in->d_buf, 0, in->num_elem() * in->get_dtype_size(), stream));
   }
 }
+
+void printDebugFloat(bf16 *d_buf, const std::string &descr) {
+  int total_used = 50;
+  bf16 *tmp_test = (bf16 *)malloc(total_used * sizeof(bf16));
+  CHECK_HIP(hipMemcpy(tmp_test, d_buf, total_used * sizeof(bf16), hipMemcpyDeviceToHost));
+
+  printf("Print debug %s: ", descr.c_str());
+  for (int i = 0; i < total_used; i++) {
+    float value = float(tmp_test[i]);
+    printf("%.6f ", value);
+  }
+  printf("\n");
+  fflush(stdout);
+
+  free(tmp_test);
+}
+
+double get_time_kernel() {
+  struct timespec tv;
+  clock_gettime(CLOCK_MONOTONIC, &tv);
+  // Combine seconds and nanoseconds into a single double value.
+  return tv.tv_sec + tv.tv_nsec * 1e-9;
+}
+
+CPUTimer::CPUTimer(const char *name) : function_name(name) {
+  startTime = get_time_kernel();
+}
+
+CPUTimer::~CPUTimer() {
+  double endTime = get_time_kernel();
+  double elapsedTime = endTime - startTime;
+  printf("%s CPU time: %.6f seconds\n", function_name, elapsedTime);
+  fflush(stdout);
+}

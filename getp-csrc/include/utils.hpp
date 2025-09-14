@@ -2,10 +2,12 @@
 
 #include "tensor.hpp"
 #include <hip/hip_runtime.h>
+#include <ctime>
 
 void memcpy_tensor(Tensor *to, const Tensor *from, long long to_offset, long long from_offset,
                    size_t num_elem, bool copy_host, bool copy_device, hipStream_t stream = 0);
 void memset_tensor(Tensor *in, int value, bool set_host, bool set_device, hipStream_t stream = 0);
+void printDebugFloat(bf16 *d_buf, const std::string &descr);
 
 struct GpuTimer {
   hipEvent_t start_event, stop_event;
@@ -33,4 +35,15 @@ struct GpuTimer {
     CHECK_HIP(hipEventDestroy(stop_event));
 #endif
   }
+};
+
+struct CPUTimer {
+  // Member variable to store the starting time.
+  double startTime;
+  const char *function_name;
+  hipStream_t stream;
+
+  // Constructor: Records the start event.
+  CPUTimer(const char *name);
+  ~CPUTimer();
 };
