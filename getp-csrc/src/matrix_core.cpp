@@ -3,9 +3,9 @@
 
 typedef float f32x4 __attribute__((ext_vector_type(4)));
 
-__global__ void gemm_mfma_16x16x16_bf16(const float *__restrict__ A,
-                                        const hip_bfloat16 *__restrict__ B, float *__restrict__ D,
-                                        int M, int N, int K) {
+__global__ void gemm_mfma_fp32_naive(const float *__restrict__ A,
+                                     const hip_bfloat16 *__restrict__ B, float *__restrict__ D,
+                                     int M, int N, int K) {
   const int lx = threadIdx.x;
   const int ly = threadIdx.y;
   const int m0 = blockIdx.y * 16;
@@ -338,142 +338,6 @@ __global__ void gemm_mfma_moe(const float *__restrict__ A, const bf16 *__restric
           }
 
           C[(size_t)row_global * N + col] = res;
-        }
-      }
-    }
-  }
-}
-
-typedef float f32x16 __attribute__((ext_vector_type(16)));
-typedef short v4s __attribute__((ext_vector_type(4)));
-
-template <const int BM, const int BN, const int BK, const int TM, const int TN, const int blockDim>
-__global__ void gemm_mfma_bf16(const hip_bfloat16 *__restrict__ A,
-                               const hip_bfloat16 *__restrict__ B,  // B có shape [K, N]
-                               float *__restrict__ C, const hip_bfloat16 *__restrict__ bias, int M,
-                               int N, int K) {
-  constexpr int WM = 16, WN = 16, WK = 4;
-
-  const int tid = threadIdx.x;
-  const int wave_id = tid >> 6;
-  const int lane_id = tid % 64;
-
-  const int waves_per_block_m = BM / TM;
-  const int waves_per_block_n = BN / TN;
-  const int wave_row = wave_id / waves_per_block_n;
-  const int wave_col = wave_id % waves_per_block_n;
-
-  const int block_row_start = blockIdx.y * BM;
-  const int block_col_start = blockIdx.x * BN;
-
-  const int wave_row_start = block_row_start + wave_row * TM;
-  const int wave_col_start = block_col_start + wave_col * TN;
-
-  __shared__ hip_bfloat16 As[BM][BK + 4];
-  __shared__ hip_bfloat16 Bs[BK][BN + 4];
-
-  constexpr int M_TILES = TM / WM;
-  constexpr int N_TILES = TN / WN;
-
-  f32x16 acc[M_TILES][N_TILES];
-#pragma unroll
-  for (int i = 0; i < M_TILES; i++) {
-#pragma unroll
-    for (int j = 0; j < N_TILES; j++) {
-      acc[i][j] = {};
-    }
-  }
-
-  constexpr int A_TILES_PER_THREAD = (BM * BK) / blockDim;
-  constexpr int VEC_B_SIZE = 8;
-  constexpr int B_VEC_ELEMS = (BK * BN) / VEC_B_SIZE;
-  constexpr int B_VEC_PER_THREAD = B_VEC_ELEMS / blockDim;
-
-  for (int k_base = 0; k_base < K; k_base += BK) {
-// Tải A vào As
-#pragma unroll
-    for (int i = 0; i < A_TILES_PER_THREAD; i++) {
-      int idx = tid + i * blockDim;
-      int r = idx / BK;
-      int c = idx % BK;
-      int g_row = block_row_start + r;
-      int g_col = k_base + c;
-      if (g_row < M && g_col < K) {
-        As[r][c] = A[(size_t)g_row * K + g_col];
-      } else {
-        As[r][c] = 0.0f;
-      }
-    }
-
-// Tải B[K, N] vào Bs[BK, BN] một cách trực tiếp (sao chép liền kề)
-#pragma unroll
-    for (int i = 0; i < B_VEC_PER_THREAD; i++) {
-      int vec_idx = tid + i * blockDim;
-      int elem_idx = vec_idx * VEC_B_SIZE;
-      int r_local = elem_idx / BN;
-      int c_local = elem_idx % BN;
-      int g_row = k_base + r_local;
-      int g_col = block_col_start + c_local;
-
-      if (g_row < K && (g_col + VEC_B_SIZE - 1) < N) {
-        *reinterpret_cast<uint4 *>(&Bs[r_local][c_local]) =
-          *reinterpret_cast<const uint4 *>(&B[(size_t)g_row * N + g_col]);
-      } else {
-        for (int j = 0; j < VEC_B_SIZE; ++j) {
-          if (g_row < K && (g_col + j) < N) {
-            Bs[r_local][c_local + j] = B[(size_t)g_row * N + (g_col + j)];
-          } else {
-            Bs[r_local][c_local + j] = 0.0f;
-          }
-        }
-      }
-    }
-    __syncthreads();
-
-    const int lx = lane_id % 16;
-#pragma unroll
-    for (int k = 0; k < BK; k += WK) {
-#pragma unroll
-      for (int m_tile = 0; m_tile < M_TILES; m_tile++) {
-#pragma unroll
-        for (int n_tile = 0; n_tile < N_TILES; n_tile++) {
-          int a_row_offset = wave_row * TM + m_tile * WM;
-          int b_col_offset = wave_col * TN + n_tile * WN;
-
-          v4s av_v4s = *reinterpret_cast<v4s *>(&As[a_row_offset + lx][k]);
-
-          // Đọc B không hiệu quả từ shared memory (strided access)
-          hip_bfloat16 b_pack[4];
-          b_pack[0] = Bs[k + 0][b_col_offset + lx];
-          b_pack[1] = Bs[k + 1][b_col_offset + lx];
-          b_pack[2] = Bs[k + 2][b_col_offset + lx];
-          b_pack[3] = Bs[k + 3][b_col_offset + lx];
-          v4s bv_v4s = *reinterpret_cast<v4s *>(b_pack);
-
-          acc[m_tile][n_tile] =
-            __builtin_amdgcn_mfma_f32_16x16x4bf16_1k(av_v4s, bv_v4s, acc[m_tile][n_tile], 0, 0, 0);
-        }
-      }
-    }
-    __syncthreads();
-  }
-
-  // Lưu kết quả
-  const int lx = lane_id % 16;
-#pragma unroll
-  for (int m_tile = 0; m_tile < M_TILES; m_tile++) {
-#pragma unroll
-    for (int n_tile = 0; n_tile < N_TILES; n_tile++) {
-#pragma unroll
-      for (int i = 0; i < 4; i++) {
-        int row = wave_row_start + m_tile * WM + (i + 4 * (lane_id / 16));
-        int col = wave_col_start + n_tile * WN + lx;
-        if (row < M && col < N) {
-          float res = acc[m_tile][n_tile][i];
-          if (bias) {
-            res += (float)bias[col];
-          }
-          C[(size_t)row * N + col] = res;
         }
       }
     }

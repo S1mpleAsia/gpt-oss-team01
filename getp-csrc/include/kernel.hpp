@@ -31,8 +31,8 @@ static inline void moe_pack_inputs(
   int batch_size, int hidden_dim, int experts_per_token, hipStream_t stream);
 
 // 3) lấy max số hàng trên mỗi expert từ offsets
-static inline int moe_get_max_rows_per_expert(TensorI32 *expert_offsets, int n_experts,
-                                              hipStream_t stream);
+static inline int moe_get_max_rows_per_expert(TensorI32 *expert_offsets, int *d_max_rows,
+                                              int n_experts, hipStream_t stream);
 
 // 4) MLP1: (x_packed @ W1 + b1) -> mlp1_out  (2*inter_dim)
 // w_mlp1: [n_layers, n_experts, hidden_dim, 2*inter_dim]

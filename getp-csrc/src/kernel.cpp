@@ -647,17 +647,17 @@ static inline void moe_init_buffers(Tensor *e_agg, Tensor *mlp1_out, Tensor *gat
                                     Tensor *x_packed, int batch_size, int hidden_dim,
                                     hipStream_t stream) {
   CHECK_HIP(hipMemsetAsync(e_agg->d_buf, 0, e_agg->num_elem() * e_agg->get_dtype_size(), stream));
-  CHECK_HIP(
-    hipMemsetAsync(mlp1_out->d_buf, 0, mlp1_out->num_elem() * mlp1_out->get_dtype_size(), stream));
-  CHECK_HIP(
-    hipMemsetAsync(gate_up->d_buf, 0, gate_up->num_elem() * gate_up->get_dtype_size(), stream));
-  CHECK_HIP(hipMemsetAsync(tb3->d_buf, 0, tb3->num_elem() * tb3->get_dtype_size(), stream));
-  CHECK_HIP(
-    hipMemsetAsync(sorted_pair_ids->d_buf, 0, sorted_pair_ids->num_elem() * sizeof(int), stream));
-  CHECK_HIP(
-    hipMemsetAsync(expert_offsets->d_buf, 0, expert_offsets->num_elem() * sizeof(int), stream));
-  CHECK_HIP(
-    hipMemsetAsync(x_packed->d_buf, 0, x_packed->num_elem() * x_packed->get_dtype_size(), stream));
+  // CHECK_HIP(
+  //   hipMemsetAsync(mlp1_out->d_buf, 0, mlp1_out->num_elem() * mlp1_out->get_dtype_size(), stream));
+  // CHECK_HIP(
+  //   hipMemsetAsync(gate_up->d_buf, 0, gate_up->num_elem() * gate_up->get_dtype_size(), stream));
+  // CHECK_HIP(hipMemsetAsync(tb3->d_buf, 0, tb3->num_elem() * tb3->get_dtype_size(), stream));
+  // CHECK_HIP(
+  //   hipMemsetAsync(sorted_pair_ids->d_buf, 0, sorted_pair_ids->num_elem() * sizeof(int), stream));
+  // CHECK_HIP(
+  //   hipMemsetAsync(expert_offsets->d_buf, 0, expert_offsets->num_elem() * sizeof(int), stream));
+  // CHECK_HIP(
+  //   hipMemsetAsync(x_packed->d_buf, 0, x_packed->num_elem() * x_packed->get_dtype_size(), stream));
 }
 
 // 1) sort & build offsets
@@ -695,18 +695,14 @@ static inline void moe_pack_inputs(
 }
 
 // 3) lấy max số hàng trên mỗi expert từ offsets
-static inline int moe_get_max_rows_per_expert(TensorI32 *expert_offsets, int n_experts,
-                                              hipStream_t stream) {
+static inline int moe_get_max_rows_per_expert(TensorI32 *expert_offsets, int *d_max_rows,
+                                              int n_experts, hipStream_t stream) {
   int max_rows_per_expert = 0;
-  int *d_max_rows = nullptr;
-  CHECK_HIP(hipMalloc(&d_max_rows, sizeof(int)));
   CHECK_HIP(hipMemsetAsync(d_max_rows, 0, sizeof(int), stream));
   compute_max_rows_from_offsets_kernel<<<(n_experts + 255) / 256, 256, 0, stream>>>(
     expert_offsets->d_buf, n_experts, d_max_rows);
   CHECK_HIP(
     hipMemcpyAsync(&max_rows_per_expert, d_max_rows, sizeof(int), hipMemcpyDeviceToHost, stream));
-  CHECK_HIP(hipStreamSynchronize(stream));
-  CHECK_HIP(hipFree(d_max_rows));
   return max_rows_per_expert;
 }
 

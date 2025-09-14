@@ -161,8 +161,8 @@ static inline void moe_pack_inputs_hip(
   Tensor *x_packed,            // [batch_size * experts_per_token, hidden_dim]
   int batch_size, int hidden_dim, int experts_per_token, hipStream_t stream);
 
-static inline int moe_get_max_rows_per_expert_hip(TensorI32 *expert_offsets, int n_experts,
-                                                  hipStream_t stream);
+static inline int moe_get_max_rows_per_expert_hip(TensorI32 *expert_offsets, int *d_max_rows,
+                                                  int n_experts, hipStream_t stream);
 
 static inline void moe_mlp1_forward_hip(Tensor *x_packed,  // [total_pairs, hidden_dim]
                                         Tensor *w_mlp1, Tensor *b_mlp1,

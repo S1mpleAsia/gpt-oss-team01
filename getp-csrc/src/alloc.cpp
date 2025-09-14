@@ -261,6 +261,7 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
     new Tensor({(size_t)BATCH_SIZE * p->experts_per_token, (size_t)p->hidden_dim}, stream);
 
   rs->tokens_buf = new TensorI32({(size_t)BATCH_SIZE}, stream);
+  CHECK_HIP(hipMalloc(&rs->max_rows, sizeof(int)));
 
   rs->cos_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2}, stream);
   rs->sin_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2}, stream);
@@ -883,6 +884,7 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
     new Tensor({(size_t)BATCH_SIZE * p->experts_per_token, (size_t)p->hidden_dim}, stream);
 
   rs->tokens_buf = new TensorI32({(size_t)BATCH_SIZE}, stream);
+  CHECK_HIP(hipMalloc(&rs->max_rows, sizeof(int)));
 
   rs->cos_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2}, stream);
   rs->sin_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2}, stream);
@@ -1014,6 +1016,8 @@ void our_free_each(OurTransformerWeights *weights, OurRunState *rs) {
 
   if (rs->tokens_buf)
     delete rs->tokens_buf;
+
+  CHECK_HIP(hipFree(rs->max_rows));
 
   // Others
   if (rs->cos_tensor)

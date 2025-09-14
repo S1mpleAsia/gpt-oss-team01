@@ -110,7 +110,8 @@ float *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flo
     moe_pack_inputs_hip(rs_now->t, rs_now->sorted_pair_ids, rs_now->x_packed, cur_batch_size,
                         p->hidden_dim, p->experts_per_token, stream);
 
-    int max_rows = moe_get_max_rows_per_expert_hip(rs_now->expert_offsets, p->n_experts, stream);
+    int max_rows = moe_get_max_rows_per_expert_hip(rs_now->expert_offsets, rs_now->max_rows,
+                                                   p->n_experts, stream);
     moe_mlp1_forward_hip(rs_now->x_packed, weights_now->w_mlp1, weights_now->b_mlp1,
                          rs_now->expert_offsets, rs_now->mlp1_out, 1ll * l, p->n_experts,
                          p->hidden_dim, p->intermediate_dim, max_rows, total_pairs, stream);
@@ -673,7 +674,8 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
         rs_now->x_packed->printDebug("rs_now->x_packed", tp_rank, 0, stream);
 #endif
 
-      int max_rows = moe_get_max_rows_per_expert_hip(rs_now->expert_offsets, p->n_experts, stream);
+      int max_rows = moe_get_max_rows_per_expert_hip(rs_now->expert_offsets, rs_now->max_rows,
+                                                     p->n_experts, stream);
       moe_mlp1_forward_hip(rs_now->x_packed, weights_now->w_mlp1, weights_now->b_mlp1,
                            rs_now->expert_offsets, rs_now->mlp1_out, 1ll * l, p->n_experts,
                            p->hidden_dim, p->intermediate_dim / TP, max_rows, total_pairs, stream);

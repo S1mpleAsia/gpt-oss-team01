@@ -1420,10 +1420,10 @@ static inline void moe_pack_inputs_hip(
                   stream);
 }
 
-static inline int moe_get_max_rows_per_expert_hip(TensorI32 *expert_offsets, int n_experts,
-                                                  hipStream_t stream) {
+static inline int moe_get_max_rows_per_expert_hip(TensorI32 *expert_offsets, int *d_max_rows,
+                                                  int n_experts, hipStream_t stream) {
   // GpuTimer timer("moe_max_row", stream);
-  return moe_get_max_rows_per_expert(expert_offsets, n_experts, stream);
+  return moe_get_max_rows_per_expert(expert_offsets, d_max_rows, n_experts, stream);
 }
 
 static inline void moe_mlp1_forward_hip(Tensor *x_packed,  // [total_pairs, hidden_dim]
