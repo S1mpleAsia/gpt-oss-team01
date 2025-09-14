@@ -122,6 +122,7 @@ void reduce_tb3(
   }
 
   #ifdef DEBUG
+    bool flag = (tp_rank == 0);
     if (flag) rs_now->tb3->printDebug("rs_now->tb3 after copy to leader", tp_rank, 0, stream);
   #endif
 
@@ -185,7 +186,7 @@ float *forward_gpu_120b_batched(
   int tp_rank, int pp_rank, pthread_barrier_t *tp_barrier
 ) {
   Config *p = public_config;
-  int cur_device = flow_id * TOTAL_PIPELINES + tp_rank;
+  int cur_device = flow_id * TOTAL_PIPELINES + pp_rank * TP + tp_rank;
 
   OurTransformerWeights *weights_now = &weights[cur_device];
   OurRunState *rs_now = &rs[cur_device];
@@ -199,15 +200,17 @@ float *forward_gpu_120b_batched(
   #ifdef DEBUG
     bool flag = (flow_id == 0);
     if (flag) {
-      printf("Running on device %d.....\n", cur_device);
+      printf("Running on device %d w/ tp_rank=%d and pp_rank=%d.....\n", cur_device, tp_rank, pp_rank);
       fflush(stdout);
     }
   #endif
 
-  CHECK_HIP(hipSetDevice(cur_device));
-
   // copy the token embedding into x
-  embedding_lookup_batched(weights_now->token_embedding_table, tokens, rs_now->x, false, stream);
+  if (pp_rank == 0) {
+    embedding_lookup_batched(weights_now->token_embedding_table, tokens, rs_now->x, false, stream);
+  } else {
+    rs_now->pipeline_each->dequeue(rs_now->x, stream);
+  }
 
   long long kv_dim = 1ll * p->n_kv_heads * p->head_dim;
   long long loff_one = 1ll * p->seq_len * kv_dim;
@@ -215,222 +218,409 @@ float *forward_gpu_120b_batched(
 
   // forward all the layers
   for (int pipeline_id = 0; pipeline_id < PP; pipeline_id++) {
-    if (pipeline_id) {
-      cur_device += TP;
-      CHECK_HIP(hipSetDevice(cur_device));
+    /** SYNC LOOP
+      if (pipeline_id) {
+        cur_device += TP;
+        CHECK_HIP(hipSetDevice(cur_device));
 
-      OurRunState *rs_new = &rs[cur_device];
-      stream = total_streams[cur_device];
+        OurRunState *rs_new = &rs[cur_device];
+        stream = total_streams[cur_device];
 
-      // sync from rs_now->x to rs_now->x
-      /*
-        CHECK_HIP(hipStreamWaitEvent(stream, pp_sync));
-        CHECK_HIP(hipMemcpyPeerAsync(rs_new->x->d_buf, cur_device, rs_now->x->d_buf, cur_device - TP, rs_now->x->num_elem() * rs_now->x->get_dtype_size(), stream));
-      */
-      rs_new->pipeline_each->enqueueElem(rs_now->x, cur_device - TP, pp_sync, stream);
-      rs_new->pipeline_each->dequeue(rs_new->x, stream);
+        // sync from rs_now->x to rs_now->x
+        rs_new->pipeline_each->enqueueElem(rs_now->x, cur_device - TP, pp_sync, stream);
+        rs_new->pipeline_each->dequeue(rs_new->x, stream);
 
-      weights_now = &weights[cur_device];
-      rs_now = &rs[cur_device];
-      rs_leader = &rs[cur_device - tp_rank];
-      tp_ready = total_events->tp_ready[cur_device];
-      tp_finish = total_events->tp_finish[cur_device];
-      pp_sync = total_events->pp_sync[cur_device];
+        weights_now = &weights[cur_device];
+        rs_now = &rs[cur_device];
+        rs_leader = &rs[cur_device - tp_rank];
+        tp_ready = total_events->tp_ready[cur_device];
+        tp_finish = total_events->tp_finish[cur_device];
+        pp_sync = total_events->pp_sync[cur_device];
+      }
+    */
+
+    /** MAIN LOOP
+      for (int l = 0; l < p->n_layers / PP; l++) {
+        #ifdef DEBUG
+          if (flag) {
+            printf("Layer l=%d running...\n", l);
+            fflush(stdout);
+            rs_now->x->printDebug("rs_now->x", tp_rank, 0, stream);
+          }
+        #endif
+
+        // attention rmsnorm
+        rmsnorm_batched(rs_now->x, weights_now->rms_attn_w, rs_now->t, 1ll * l, false, false, 1e-5f, stream);
+
+        #ifdef DEBUG
+          if (flag) rs_now->t->printDebug("rs_now->t", tp_rank, 0, stream);
+        #endif
+
+        // key and value point to the kv cache
+        long long loff = 1ll * l * loff_one;  // kv cache layer offset
+
+        // QKV projection
+        qkv_gemm_batched_v2(rs_now->t, weights_now->w_qkv, weights_now->b_qkv, rs_now->qkv, 1ll * l, false,
+                            false, stream);  // This kernel diverges the most
+
+        #ifdef DEBUG
+          if (flag) rs_now->qkv->printDebug("rs_now->qkv", tp_rank, 0, stream);
+        #endif
+
+        // // Separate q, k, v + RoPE + Store k, v in cache
+        qkv_split_rope_fused(rs_now->qkv, rs_now->q, rs_now->key_cache, rs_now->value_cache, rs_now->cos_tensor,
+                            rs_now->sin_tensor, p->head_dim, p->n_attn_heads, p->n_kv_heads, pos, l, stream);
+
+        #ifdef DEBUG
+          if (flag) {
+            rs_now->q->printDebug("rs_now->q", tp_rank, 0, stream);
+            rs_now->key_cache->printDebug("rs_now->key_cache", tp_rank, 0, stream);
+            rs_now->value_cache->printDebug("rs_now->value_cache", tp_rank, 0, stream);
+          }
+        #endif
+
+        // multihead attention
+        int kv_mul = p->n_attn_heads / p->n_kv_heads;  // integer multiplier for GQA
+
+        // FIX single_query_attn_batched later
+        single_query_attn_batched(rs_now->q, rs_now->key_cache, rs_now->value_cache, rs_now->mask, weights_now->attn_sinks,
+                                  rs_now->tb, p->head_dim, p->n_attn_heads, kv_mul, kv_dim, p->seq_len,
+                                  p->sliding_window, pos, 1ll * l, false, false, false, false, false, stream);
+
+        #ifdef DEBUG
+          if (flag) rs_now->tb->printDebug("rs_now->tb", tp_rank, 0, stream);
+        #endif
+
+        // final matmul to get the output of the attention
+        attn_out_project_batched_v2(rs_now->tb, weights_now->w_o, weights_now->b_o, rs_now->tb2, 1ll * l, false, false, stream);
+
+        #ifdef DEBUG
+          if (flag) rs_now->tb2->printDebug("rs_now->tb2", tp_rank, 0, stream);
+        #endif
+
+        // residual connection back into x + ffn rmsnorm
+        residual_rmsnorm_batched(rs_now->tb2, rs_now->x, weights_now->rms_ffn_w, rs_now->t, 1ll * l, 1e-5f, stream);
+
+        #ifdef DEBUG
+          if (flag) rs_now->x->printDebug("rs_now->x", tp_rank, 0, stream);
+        #endif
+
+        // MoE routing
+        router_gemm_batched(weights_now->w_router, rs_now->t, weights_now->b_router, rs_now->router_score, 1ll * l,
+                            false, false, stream);
+
+        #ifdef DEBUG
+          if (flag) rs_now->router_score->printDebug("rs_now->router_score", tp_rank, 0, stream);
+        #endif
+
+        // Select top-k experts
+        topk_softmax_batched(rs_now->router_score, rs_now->topk_v, rs_now->topk_i, false, false, false, stream);
+
+        #ifdef DEBUG
+          if (flag) rs_now->topk_v->printDebug("rs_now->topk_v", tp_rank, 0, stream);
+        #endif
+
+        int total_pairs = BATCH_SIZE * p->experts_per_token;
+        moe_init_buffers_hip(rs_now->e_agg, rs_now->mlp1_out, rs_now->gate_up, rs_now->tb3, rs_now->sorted_pair_ids,
+                            rs_now->expert_offsets, rs_now->x_packed, BATCH_SIZE, p->hidden_dim, stream);
+
+        #ifdef DEBUG
+          if (flag) rs_now->sorted_pair_ids->printDebug("rs_now->sorted_pair_ids", tp_rank, 0, stream);
+        #endif
+
+        if (tp_rank == 0) {
+          moe_build_offsets_hip(rs_now->topk_i, rs_now->sorted_pair_ids, rs_now->expert_offsets,
+                                cur_batch_size, p->experts_per_token, p->n_experts, stream);
+
+          CHECK_HIP(hipEventRecord(tp_ready, stream));
+        }
+
+        pthread_barrier_wait(tp_barrier);
+
+        if (tp_rank > 0) {
+          hipEvent_t leader_tp_ready = total_events->tp_ready[cur_device - tp_rank];
+          CHECK_HIP(hipStreamWaitEvent(stream, leader_tp_ready));
+
+          void *dst_sorted_ids = rs_now->sorted_pair_ids->d_buf;
+          const void *src_sorted_ids = rs_leader->sorted_pair_ids->d_buf;
+          size_t bytes_sorted_ids = rs_now->sorted_pair_ids->num_elem() * sizeof(int);
+
+          void *dst_offsets = rs_now->expert_offsets->d_buf;
+          const void *src_offsets = rs_leader->expert_offsets->d_buf;
+          size_t bytes_offsets = rs_now->expert_offsets->num_elem() * sizeof(int);
+
+          CHECK_HIP(hipMemcpyPeerAsync(dst_sorted_ids, cur_device, src_sorted_ids,
+                                      cur_device - tp_rank, bytes_sorted_ids, stream));
+          CHECK_HIP(hipMemcpyPeerAsync(dst_offsets, cur_device, src_offsets, cur_device - tp_rank,
+                                      bytes_offsets, stream));
+        }
+
+        pthread_barrier_wait(tp_barrier);
+
+        #ifdef DEBUG
+          if (flag) rs_now->sorted_pair_ids->printDebug("rs_now->sorted_pair_ids build offset", tp_rank, 0, stream);
+        #endif
+
+        moe_pack_inputs_hip(rs_now->t, rs_now->sorted_pair_ids, rs_now->x_packed, BATCH_SIZE, p->hidden_dim,
+                            p->experts_per_token, stream);
+
+        #ifdef DEBUG
+          if (flag) rs_now->sorted_pair_ids->printDebug("rs_now->sorted_pair_ids pack inputs", tp_rank, 0, stream);
+        #endif
+
+        int max_rows = moe_get_max_rows_per_expert_hip(rs_now->expert_offsets, p->n_experts, stream);
+        moe_mlp1_forward_hip(rs_now->x_packed, weights_now->w_mlp1, weights_now->b_mlp1, rs_now->expert_offsets,
+                            rs_now->mlp1_out, 1ll * l, p->n_experts, p->hidden_dim, p->intermediate_dim / TP,
+                            max_rows, total_pairs, stream);
+
+        #ifdef DEBUG
+          if (flag) rs_now->expert_offsets->printDebug("rs_now->expert_offsets", tp_rank, 0, stream);
+        #endif
+
+        moe_swiglu_hip(rs_now->mlp1_out, rs_now->gate_up, BATCH_SIZE, p->experts_per_token, p->intermediate_dim / TP,
+                      p->swiglu_limit, stream);
+
+        #ifdef DEBUG
+          if (flag) rs_now->gate_up->printDebug("rs_now->gate_up", tp_rank, 0, stream);
+        #endif
+
+        moe_mlp2_forward_hip(rs_now->gate_up, weights_now->w_mlp2, weights_now->b_mlp2, rs_now->expert_offsets, rs_now->tb3,
+                            tp_rank == 0, 1ll * l, p->n_experts, p->intermediate_dim / TP, p->hidden_dim, max_rows,
+                            total_pairs, stream);
+
+        #ifdef DEBUG
+          if (flag) rs_now->tb3->printDebug("rs_now->tb3", tp_rank, 0, stream);
+        #endif
+
+        reduce_tb3(rs_now, rs_leader, tp_rank, cur_device, tp_barrier, 
+                    stream, tp_ready, tp_finish);
+
+        #ifdef DEBUG
+          if (flag) rs_now->tb3->printDebug("rs_now->tb3 after", tp_rank, 0, stream);
+        #endif
+
+        moe_scatter_aggregate_hip(rs_now->tb3, rs_now->sorted_pair_ids, rs_now->topk_v, rs_now->e_agg,
+                                  rs_now->expert_offsets, p->hidden_dim, p->experts_per_token, p->n_experts,
+                                  max_rows, stream);
+        
+        #ifdef DEBUG
+          if (flag) rs_now->e_agg->printDebug("rs_now->e_agg", tp_rank, 0, stream);
+        #endif
+        
+        // residual connection
+        add_vector_batched(rs_now->x, rs_now->e_agg, false, false, false, stream);  // equals residual add
+        
+        #ifdef DEBUG
+          if (flag) rs_now->x->printDebug("rs_now->x", tp_rank, 0, stream);
+        #endif
+      }
+      
+      CHECK_HIP(hipEventRecord(pp_sync, stream));  
+    */
+  }
+  
+  for (int l = 0; l < p->n_layers / PP; l++) {
+    #ifdef DEBUG
+      if (flag) {
+        printf("Layer l=%d running...\n", l);
+        fflush(stdout);
+        rs_now->x->printDebug("rs_now->x", tp_rank, 0, stream);
+      }
+    #endif
+
+    // attention rmsnorm
+    rmsnorm_batched(rs_now->x, weights_now->rms_attn_w, rs_now->t, 1ll * l, false, false, 1e-5f, stream);
+
+    #ifdef DEBUG
+      if (flag) rs_now->t->printDebug("rs_now->t", tp_rank, 0, stream);
+    #endif
+
+    // key and value point to the kv cache
+    long long loff = 1ll * l * loff_one;  // kv cache layer offset
+
+    // QKV projection
+    qkv_gemm_batched_v2(rs_now->t, weights_now->w_qkv, weights_now->b_qkv, rs_now->qkv, 1ll * l, false,
+                        false, stream);  // This kernel diverges the most
+
+    #ifdef DEBUG
+      if (flag) rs_now->qkv->printDebug("rs_now->qkv", tp_rank, 0, stream);
+    #endif
+
+    // // Separate q, k, v + RoPE + Store k, v in cache
+    qkv_split_rope_fused(rs_now->qkv, rs_now->q, rs_now->key_cache, rs_now->value_cache, rs_now->cos_tensor,
+                        rs_now->sin_tensor, p->head_dim, p->n_attn_heads, p->n_kv_heads, pos, l, stream);
+
+    #ifdef DEBUG
+      if (flag) {
+        rs_now->q->printDebug("rs_now->q", tp_rank, 0, stream);
+        rs_now->key_cache->printDebug("rs_now->key_cache", tp_rank, 0, stream);
+        rs_now->value_cache->printDebug("rs_now->value_cache", tp_rank, 0, stream);
+      }
+    #endif
+
+    // multihead attention
+    int kv_mul = p->n_attn_heads / p->n_kv_heads;  // integer multiplier for GQA
+
+    // FIX single_query_attn_batched later
+    single_query_attn_batched(rs_now->q, rs_now->key_cache, rs_now->value_cache, rs_now->mask, weights_now->attn_sinks,
+                              rs_now->tb, p->head_dim, p->n_attn_heads, kv_mul, kv_dim, p->seq_len,
+                              p->sliding_window, pos, 1ll * l, false, false, false, false, false, stream);
+
+    #ifdef DEBUG
+      if (flag) rs_now->tb->printDebug("rs_now->tb", tp_rank, 0, stream);
+    #endif
+
+    // final matmul to get the output of the attention
+    attn_out_project_batched_v2(rs_now->tb, weights_now->w_o, weights_now->b_o, rs_now->tb2, 1ll * l, false, false, stream);
+
+    #ifdef DEBUG
+      if (flag) rs_now->tb2->printDebug("rs_now->tb2", tp_rank, 0, stream);
+    #endif
+
+    // residual connection back into x + ffn rmsnorm
+    residual_rmsnorm_batched(rs_now->tb2, rs_now->x, weights_now->rms_ffn_w, rs_now->t, 1ll * l, 1e-5f, stream);
+
+    #ifdef DEBUG
+      if (flag) rs_now->x->printDebug("rs_now->x", tp_rank, 0, stream);
+    #endif
+
+    // MoE routing
+    router_gemm_batched(weights_now->w_router, rs_now->t, weights_now->b_router, rs_now->router_score, 1ll * l,
+                        false, false, stream);
+
+    #ifdef DEBUG
+      if (flag) rs_now->router_score->printDebug("rs_now->router_score", tp_rank, 0, stream);
+    #endif
+
+    // Select top-k experts
+    topk_softmax_batched(rs_now->router_score, rs_now->topk_v, rs_now->topk_i, false, false, false, stream);
+
+    #ifdef DEBUG
+      if (flag) rs_now->topk_v->printDebug("rs_now->topk_v", tp_rank, 0, stream);
+    #endif
+
+    int total_pairs = BATCH_SIZE * p->experts_per_token;
+    moe_init_buffers_hip(rs_now->e_agg, rs_now->mlp1_out, rs_now->gate_up, rs_now->tb3, rs_now->sorted_pair_ids,
+                        rs_now->expert_offsets, rs_now->x_packed, BATCH_SIZE, p->hidden_dim, stream);
+
+    #ifdef DEBUG
+      if (flag) rs_now->sorted_pair_ids->printDebug("rs_now->sorted_pair_ids", tp_rank, 0, stream);
+    #endif
+
+    if (tp_rank == 0) {
+      moe_build_offsets_hip(rs_now->topk_i, rs_now->sorted_pair_ids, rs_now->expert_offsets,
+                            cur_batch_size, p->experts_per_token, p->n_experts, stream);
+
+      CHECK_HIP(hipEventRecord(tp_ready, stream));
     }
 
-    for (int l = 0; l < p->n_layers / PP; l++) {
-      #ifdef DEBUG
-        if (flag) {
-          printf("Layer l=%d running...\n", l);
-          fflush(stdout);
-          rs_now->x->printDebug("rs_now->x", tp_rank, 0, stream);
-        }
-      #endif
+    pthread_barrier_wait(tp_barrier);
 
-      // attention rmsnorm
-      rmsnorm_batched(rs_now->x, weights_now->rms_attn_w, rs_now->t, 1ll * l, false, false, 1e-5f, stream);
+    if (tp_rank > 0) {
+      hipEvent_t leader_tp_ready = total_events->tp_ready[cur_device - tp_rank];
+      CHECK_HIP(hipStreamWaitEvent(stream, leader_tp_ready));
 
-      #ifdef DEBUG
-        if (flag) rs_now->t->printDebug("rs_now->t", tp_rank, 0, stream);
-      #endif
+      void *dst_sorted_ids = rs_now->sorted_pair_ids->d_buf;
+      const void *src_sorted_ids = rs_leader->sorted_pair_ids->d_buf;
+      size_t bytes_sorted_ids = rs_now->sorted_pair_ids->num_elem() * sizeof(int);
 
-      // key and value point to the kv cache
-      long long loff = 1ll * l * loff_one;  // kv cache layer offset
+      void *dst_offsets = rs_now->expert_offsets->d_buf;
+      const void *src_offsets = rs_leader->expert_offsets->d_buf;
+      size_t bytes_offsets = rs_now->expert_offsets->num_elem() * sizeof(int);
 
-      // QKV projection
-      qkv_gemm_batched_v2(rs_now->t, weights_now->w_qkv, weights_now->b_qkv, rs_now->qkv, 1ll * l, false,
-                          false, stream);  // This kernel diverges the most
-
-      #ifdef DEBUG
-        if (flag) rs_now->qkv->printDebug("rs_now->qkv", tp_rank, 0, stream);
-      #endif
-
-      // // Separate q, k, v + RoPE + Store k, v in cache
-      qkv_split_rope_fused(rs_now->qkv, rs_now->q, rs_now->key_cache, rs_now->value_cache, rs_now->cos_tensor,
-                          rs_now->sin_tensor, p->head_dim, p->n_attn_heads, p->n_kv_heads, pos, l, stream);
-
-      #ifdef DEBUG
-        if (flag) {
-          rs_now->q->printDebug("rs_now->q", tp_rank, 0, stream);
-          rs_now->key_cache->printDebug("rs_now->key_cache", tp_rank, 0, stream);
-          rs_now->value_cache->printDebug("rs_now->value_cache", tp_rank, 0, stream);
-        }
-      #endif
-
-      // multihead attention
-      int kv_mul = p->n_attn_heads / p->n_kv_heads;  // integer multiplier for GQA
-
-      // FIX single_query_attn_batched later
-      single_query_attn_batched(rs_now->q, rs_now->key_cache, rs_now->value_cache, rs_now->mask, weights_now->attn_sinks,
-                                rs_now->tb, p->head_dim, p->n_attn_heads, kv_mul, kv_dim, p->seq_len,
-                                p->sliding_window, pos, 1ll * l, false, false, false, false, false, stream);
-
-      #ifdef DEBUG
-        if (flag) rs_now->tb->printDebug("rs_now->tb", tp_rank, 0, stream);
-      #endif
-
-      // final matmul to get the output of the attention
-      attn_out_project_batched_v2(rs_now->tb, weights_now->w_o, weights_now->b_o, rs_now->tb2, 1ll * l, false, false, stream);
-
-      #ifdef DEBUG
-        if (flag) rs_now->tb2->printDebug("rs_now->tb2", tp_rank, 0, stream);
-      #endif
-
-      // residual connection back into x + ffn rmsnorm
-      residual_rmsnorm_batched(rs_now->tb2, rs_now->x, weights_now->rms_ffn_w, rs_now->t, 1ll * l, 1e-5f, stream);
-
-      #ifdef DEBUG
-        if (flag) rs_now->x->printDebug("rs_now->x", tp_rank, 0, stream);
-      #endif
-
-      // MoE routing
-      router_gemm_batched(weights_now->w_router, rs_now->t, weights_now->b_router, rs_now->router_score, 1ll * l,
-                          false, false, stream);
-
-      #ifdef DEBUG
-        if (flag) rs_now->router_score->printDebug("rs_now->router_score", tp_rank, 0, stream);
-      #endif
-
-      // Select top-k experts
-      topk_softmax_batched(rs_now->router_score, rs_now->topk_v, rs_now->topk_i, false, false, false, stream);
-
-      #ifdef DEBUG
-        if (flag) rs_now->topk_v->printDebug("rs_now->topk_v", tp_rank, 0, stream);
-      #endif
-
-      int total_pairs = BATCH_SIZE * p->experts_per_token;
-      moe_init_buffers_hip(rs_now->e_agg, rs_now->mlp1_out, rs_now->gate_up, rs_now->tb3, rs_now->sorted_pair_ids,
-                          rs_now->expert_offsets, rs_now->x_packed, BATCH_SIZE, p->hidden_dim, stream);
-
-      #ifdef DEBUG
-        if (flag) rs_now->sorted_pair_ids->printDebug("rs_now->sorted_pair_ids", tp_rank, 0, stream);
-      #endif
-
-      if (tp_rank == 0) {
-        moe_build_offsets_hip(rs_now->topk_i, rs_now->sorted_pair_ids, rs_now->expert_offsets,
-                              cur_batch_size, p->experts_per_token, p->n_experts, stream);
-
-        CHECK_HIP(hipEventRecord(tp_ready, stream));
-      }
-
-      pthread_barrier_wait(tp_barrier);
-
-      if (tp_rank > 0) {
-        hipEvent_t leader_tp_ready = total_events->tp_ready[cur_device - tp_rank];
-        CHECK_HIP(hipStreamWaitEvent(stream, leader_tp_ready));
-
-        void *dst_sorted_ids = rs_now->sorted_pair_ids->d_buf;
-        const void *src_sorted_ids = rs_leader->sorted_pair_ids->d_buf;
-        size_t bytes_sorted_ids = rs_now->sorted_pair_ids->num_elem() * sizeof(int);
-
-        void *dst_offsets = rs_now->expert_offsets->d_buf;
-        const void *src_offsets = rs_leader->expert_offsets->d_buf;
-        size_t bytes_offsets = rs_now->expert_offsets->num_elem() * sizeof(int);
-
-        CHECK_HIP(hipMemcpyPeerAsync(dst_sorted_ids, cur_device, src_sorted_ids,
-                                     cur_device - tp_rank, bytes_sorted_ids, stream));
-        CHECK_HIP(hipMemcpyPeerAsync(dst_offsets, cur_device, src_offsets, cur_device - tp_rank,
-                                     bytes_offsets, stream));
-      }
-
-      pthread_barrier_wait(tp_barrier);
-
-      #ifdef DEBUG
-        if (flag) rs_now->sorted_pair_ids->printDebug("rs_now->sorted_pair_ids build offset", tp_rank, 0, stream);
-      #endif
-
-      moe_pack_inputs_hip(rs_now->t, rs_now->sorted_pair_ids, rs_now->x_packed, BATCH_SIZE, p->hidden_dim,
-                          p->experts_per_token, stream);
-
-      #ifdef DEBUG
-        if (flag) rs_now->sorted_pair_ids->printDebug("rs_now->sorted_pair_ids pack inputs", tp_rank, 0, stream);
-      #endif
-
-      int max_rows = moe_get_max_rows_per_expert_hip(rs_now->expert_offsets, p->n_experts, stream);
-      moe_mlp1_forward_hip(rs_now->x_packed, weights_now->w_mlp1, weights_now->b_mlp1, rs_now->expert_offsets,
-                          rs_now->mlp1_out, 1ll * l, p->n_experts, p->hidden_dim, p->intermediate_dim / TP,
-                          max_rows, total_pairs, stream);
-
-      #ifdef DEBUG
-        if (flag) rs_now->expert_offsets->printDebug("rs_now->expert_offsets", tp_rank, 0, stream);
-      #endif
-
-      moe_swiglu_hip(rs_now->mlp1_out, rs_now->gate_up, BATCH_SIZE, p->experts_per_token, p->intermediate_dim / TP,
-                    p->swiglu_limit, stream);
-
-      #ifdef DEBUG
-        if (flag) rs_now->gate_up->printDebug("rs_now->gate_up", tp_rank, 0, stream);
-      #endif
-
-      moe_mlp2_forward_hip(rs_now->gate_up, weights_now->w_mlp2, weights_now->b_mlp2, rs_now->expert_offsets, rs_now->tb3,
-                          tp_rank == 0, 1ll * l, p->n_experts, p->intermediate_dim / TP, p->hidden_dim, max_rows,
-                          total_pairs, stream);
-
-      #ifdef DEBUG
-        if (flag) rs_now->tb3->printDebug("rs_now->tb3", tp_rank, 0, stream);
-      #endif
-
-      reduce_tb3(rs_now, rs_leader, tp_rank, cur_device, tp_barrier, 
-                  stream, tp_ready, tp_finish);
-
-      #ifdef DEBUG
-        if (flag) rs_now->tb3->printDebug("rs_now->tb3 after", tp_rank, 0, stream);
-      #endif
-
-      moe_scatter_aggregate_hip(rs_now->tb3, rs_now->sorted_pair_ids, rs_now->topk_v, rs_now->e_agg,
-                                rs_now->expert_offsets, p->hidden_dim, p->experts_per_token, p->n_experts,
-                                max_rows, stream);
-      
-      #ifdef DEBUG
-        if (flag) rs_now->e_agg->printDebug("rs_now->e_agg", tp_rank, 0, stream);
-      #endif
-      
-      // residual connection
-      add_vector_batched(rs_now->x, rs_now->e_agg, false, false, false, stream);  // equals residual add
-      
-      #ifdef DEBUG
-        if (flag) rs_now->x->printDebug("rs_now->x", tp_rank, 0, stream);
-      #endif
+      CHECK_HIP(hipMemcpyPeerAsync(dst_sorted_ids, cur_device, src_sorted_ids,
+                                  cur_device - tp_rank, bytes_sorted_ids, stream));
+      CHECK_HIP(hipMemcpyPeerAsync(dst_offsets, cur_device, src_offsets, cur_device - tp_rank,
+                                  bytes_offsets, stream));
     }
+
+    pthread_barrier_wait(tp_barrier);
+
+    #ifdef DEBUG
+      if (flag) rs_now->sorted_pair_ids->printDebug("rs_now->sorted_pair_ids build offset", tp_rank, 0, stream);
+    #endif
+
+    moe_pack_inputs_hip(rs_now->t, rs_now->sorted_pair_ids, rs_now->x_packed, BATCH_SIZE, p->hidden_dim,
+                        p->experts_per_token, stream);
+
+    #ifdef DEBUG
+      if (flag) rs_now->sorted_pair_ids->printDebug("rs_now->sorted_pair_ids pack inputs", tp_rank, 0, stream);
+    #endif
+
+    int max_rows = moe_get_max_rows_per_expert_hip(rs_now->expert_offsets, p->n_experts, stream);
+    moe_mlp1_forward_hip(rs_now->x_packed, weights_now->w_mlp1, weights_now->b_mlp1, rs_now->expert_offsets,
+                        rs_now->mlp1_out, 1ll * l, p->n_experts, p->hidden_dim, p->intermediate_dim / TP,
+                        max_rows, total_pairs, stream);
+
+    #ifdef DEBUG
+      if (flag) rs_now->expert_offsets->printDebug("rs_now->expert_offsets", tp_rank, 0, stream);
+    #endif
+
+    moe_swiglu_hip(rs_now->mlp1_out, rs_now->gate_up, BATCH_SIZE, p->experts_per_token, p->intermediate_dim / TP,
+                  p->swiglu_limit, stream);
+
+    #ifdef DEBUG
+      if (flag) rs_now->gate_up->printDebug("rs_now->gate_up", tp_rank, 0, stream);
+    #endif
+
+    moe_mlp2_forward_hip(rs_now->gate_up, weights_now->w_mlp2, weights_now->b_mlp2, rs_now->expert_offsets, rs_now->tb3,
+                        tp_rank == 0, 1ll * l, p->n_experts, p->intermediate_dim / TP, p->hidden_dim, max_rows,
+                        total_pairs, stream);
+
+    #ifdef DEBUG
+      if (flag) rs_now->tb3->printDebug("rs_now->tb3", tp_rank, 0, stream);
+    #endif
+
+    reduce_tb3(rs_now, rs_leader, tp_rank, cur_device, tp_barrier, 
+                stream, tp_ready, tp_finish);
+
+    #ifdef DEBUG
+      if (flag) rs_now->tb3->printDebug("rs_now->tb3 after", tp_rank, 0, stream);
+    #endif
+
+    moe_scatter_aggregate_hip(rs_now->tb3, rs_now->sorted_pair_ids, rs_now->topk_v, rs_now->e_agg,
+                              rs_now->expert_offsets, p->hidden_dim, p->experts_per_token, p->n_experts,
+                              max_rows, stream);
     
-    CHECK_HIP(hipEventRecord(pp_sync, stream));
+    #ifdef DEBUG
+      if (flag) rs_now->e_agg->printDebug("rs_now->e_agg", tp_rank, 0, stream);
+    #endif
+    
+    // residual connection
+    add_vector_batched(rs_now->x, rs_now->e_agg, false, false, false, stream);  // equals residual add
+    
+    #ifdef DEBUG
+      if (flag) rs_now->x->printDebug("rs_now->x", tp_rank, 0, stream);
+    #endif
   }
 
-  // final rmsnorm
-  rmsnorm_batched(rs_now->x, weights_now->rms_out_w, rs_now->x, 0ll, false, false, 1e-5f, stream);
+  if ((pp_rank + 1) % PP == 0) {
+    // final rmsnorm
+    rmsnorm_batched(rs_now->x, weights_now->rms_out_w, rs_now->x, 0ll, false, false, 1e-5f, stream);
 
-  // classifier into logits
-  classifier_gemm_batched_v2(weights_now->out, rs_now->x, rs_now->logits, false, true, stream);
+    // classifier into logits
+    classifier_gemm_batched_v2(weights_now->out, rs_now->x, rs_now->logits, false, true, stream);
+    
+    #ifdef DEBUG
+      if (flag) {
+        printf("Finish DEBUG\n");
+        fflush(stdout);
+        exit(1);
+      }
+    #endif
 
-  #ifdef DEBUG
-    if (flag) {
-      printf("Finish DEBUG\n");
-      fflush(stdout);
-      exit(1);
-    }
-  #endif
+    return rs_now->logits->buf;
+  } else {
+    CHECK_HIP(hipEventRecord(pp_sync, stream)); 
 
-  return rs_now->logits->buf;
+    OurRunState *rs_new = &rs[cur_device + TP];
+    hipStream_t stream_new = total_streams[cur_device + TP];
+    rs_new->pipeline_each->enqueueElem(
+      rs_now->x, cur_device, pp_sync, stream_new
+    );
+
+    return nullptr;
+  }
 }
 
 #endif

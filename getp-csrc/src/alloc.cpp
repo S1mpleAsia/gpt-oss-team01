@@ -604,7 +604,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 }
 
 void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id) {
-  int pp_rank = (device_id / TP) % PP;
+  int pp_rank = (device_id % TOTAL_PIPELINES) / TP;
   int tp_rank = device_id % TP;
   // Create Tensor wrappers for state buffers
   rs->x = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, device_id);
@@ -683,7 +683,7 @@ void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunSt
   total_events->tp_finish = new hipEvent_t[TOTAL_GPUS_NEEDED];
   total_events->pp_sync = new hipEvent_t[TOTAL_GPUS_NEEDED];
 
-  // #pragma omp parallel for num_threads(TOTAL_GPUS_NEEDED)
+  #pragma omp parallel for num_threads(TOTAL_GPUS_NEEDED)
   for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
     CHECK_HIP(hipSetDevice(i));
     

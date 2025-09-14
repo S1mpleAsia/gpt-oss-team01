@@ -36,6 +36,7 @@ void PipelineEach::enqueueElem(
     not_full_cond.wait(lock, [this]() { return (tail + 1) % size_buf != head; });
     
     // Wait for the slot to be ready
+    CHECK_HIP(hipSetDevice(gpu_id));
     CHECK_HIP(hipStreamWaitEvent(recv_stream, x_ready));
     CHECK_HIP(hipStreamWaitEvent(recv_stream, slot_events[tail]));
     

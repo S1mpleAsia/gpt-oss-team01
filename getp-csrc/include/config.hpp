@@ -7,7 +7,7 @@
 #include "tensor.hpp"
 #include "pipeline.hpp"
 
-#define BATCH_SIZE 32
+#define BATCH_SIZE 8
 // #define PRINT_LOGITS
 // #define TIME_GPU
 // #define DEBUG
@@ -109,7 +109,7 @@ typedef struct {
   long long *local_token_ptr;
   int start_idx;
   int end_idx;
-  pthread_barrier_t tp_barrier;
+  pthread_barrier_t *tp_barrier;
 } OnePathArgs;
 
 typedef struct {

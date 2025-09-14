@@ -77,6 +77,8 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     // Set the device context for this thread
     CHECK_HIP(hipSetDevice(cur_device));
 
+    pthread_barrier_wait(args->tp_barrier);
+
     args->logits = forward_gpu_120b_batched(args->current_tokens->data(), args->pos, args->current_size, args->id, args->tp_rank, args->pp_rank, args->tp_barrier);
 
     return nullptr;
@@ -90,19 +92,23 @@ void *thread_handler(void *arg) {
   int id = args->id;
   int max_seq_len = public_requests->max_seq_len;
   int end_idx = args->end_idx;
+  args->tp_barrier = new pthread_barrier_t[PP];
 
   #ifdef RUN_20B 
     CHECK_HIP(hipSetDevice(id));
   #else
-    pthread_t inside_threads[TP];
-    OnePathInsideArgs inside_args[TP];
+    pthread_t inside_threads[TOTAL_PIPELINES];
+    OnePathInsideArgs inside_args[TOTAL_PIPELINES];
     
-    pthread_barrier_init(&(args->tp_barrier), NULL, TP);
+    // barrier for different pipeline stages
+    for (int i = 0; i < PP; i++) {
+      pthread_barrier_init(&(args->tp_barrier[i]), NULL, TP);
+    }
 
-    for (int i = 0; i < TP; i++) {
+    for (int i = 0; i < TOTAL_PIPELINES; i++) {
       inside_args[i].tp_rank = (i % TP);
-      inside_args[i].pp_rank = 0;
-      inside_args[i].tp_barrier = &(args->tp_barrier);
+      inside_args[i].pp_rank = (i % TOTAL_PIPELINES) / TP;
+      inside_args[i].tp_barrier = &(args->tp_barrier[inside_args[i].pp_rank]);
     }
   #endif
 
@@ -150,7 +156,7 @@ void *thread_handler(void *arg) {
     }
 
     #ifndef RUN_20B
-      for (int i = 0; i < TP; i++) {
+      for (int i = 0; i < TOTAL_PIPELINES; i++) {
         inside_args[i].current_tokens = &current_tokens;
         inside_args[i].current_size = current_size;
         inside_args[i].id = id;
@@ -161,20 +167,20 @@ void *thread_handler(void *arg) {
       #ifdef RUN_20B
         float *batch_logits = forward_gpu_20b_batched(current_tokens.data(), pos, current_size, id);
       #else
-        for (int i = 0; i < TP; i++) {
+        for (int i = 0; i < TOTAL_PIPELINES; i++) {
           inside_args[i].pos = pos;
         }
 
-        for (int i = 0; i < TP; i++) {
+        for (int i = 0; i < TOTAL_PIPELINES; i++) {
           pthread_create(&inside_threads[i], NULL, inside_thread_handler,
                       (void *)&inside_args[i]);
         }
         
-        for (int i = 0; i < TP; i++) {
+        for (int i = 0; i < TOTAL_PIPELINES; i++) {
           pthread_join(inside_threads[i], NULL);
         }
         
-        float *batch_logits = inside_args[0].logits;
+        float *batch_logits = inside_args[TOTAL_PIPELINES - PP].logits;
       #endif
 
       for (int i = 0; i < current_size; i++) {
@@ -235,8 +241,12 @@ void *thread_handler(void *arg) {
   }
   
   #ifndef RUN_20B
-    pthread_barrier_destroy(&(args->tp_barrier));
+    for (int i = 0; i < PP; i++) {
+      pthread_barrier_destroy(&(args->tp_barrier[i]));
+    }
   #endif
+
+  delete args->tp_barrier;
 
   *(args->local_token_ptr) = local_token_count;
 
