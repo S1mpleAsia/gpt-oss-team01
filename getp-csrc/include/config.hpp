@@ -73,7 +73,7 @@ typedef struct {
   Tensor *tb_buf;
   Tensor *tb2;  // (hidden_dim, )
   Tensor *tb2_buf;
-  Tensor *tb3;  // (n_experts, hidden_dim)
+  Tensor *tb3;  // (BATCH_SIZE, experts_per_token)
   Tensor *tb3_buf;
   Tensor *router_score;  // router score (n_experts, )
   Tensor *topk_v;        // topk expert weights (experts_per_token, )
@@ -102,6 +102,8 @@ typedef struct {
   TensorI32 *sorted_pair_ids;  // [batch_size * experts_per_token]
   TensorI32 *expert_offsets;   // [n_experts + 1]
   Tensor *x_packed;            // [batch_size * experts_per_token, hidden_dim]
+  Tensor *x_packed_local;
+  TensorI32 *expert_offsets_local;
   int *max_rows;
 
   // Multi-GPU related
