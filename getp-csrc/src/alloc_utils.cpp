@@ -199,56 +199,302 @@ void alloc_w_mlp1_final(OurTransformerWeights *weights_total, float *__restrict_
   fflush(stdout);
 }
 
-void alloc_w_mlp1(Tensor *&w_mlp1, float *w_mlp1_ptr, Config *p, int device_id,
-                  hipStream_t stream) {
-  CPUTimer timer("alloc_w_mlp1");
-  printf("Starting alloc mlp1\n");
+void alloc_w_mlp1_ep(OurTransformerWeights *weights_total, float *__restrict__ w_mlp1_ptr,
+                     Config *p, hipStream_t *total_streams) {
+  CPUTimer timer("alloc_w_mlp1_ep");
+  printf("Starting alloc mlp1 EP\n");
   fflush(stdout);
 
-  int tp_rank = device_id % TP;
-  size_t n_layers = p->n_layers / PP;
-  size_t n_experts = p->n_experts;
+  size_t layers_per_stage = p->n_layers / PP;
+  size_t total_experts = p->n_experts;
   size_t hidden_dim = p->hidden_dim;
   size_t inter_dim = p->intermediate_dim;
-  size_t shard_dim = p->intermediate_dim / TP;
+  size_t experts_per_gpu = total_experts / TP;
 
-  w_mlp1_ptr += tp_rank * (2 * shard_dim) * hidden_dim;  // offset shard_dim;
+  for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
+    CHECK_HIP(hipSetDevice(i));
+    (&(weights_total[i]))->w_mlp1 =
+      new Tensor({layers_per_stage, experts_per_gpu, hidden_dim, 2 * inter_dim}, w_mlp1_ptr,
+                 total_streams[i], DType::BF16, false);
+  }
 
-  w_mlp1 = new Tensor({n_layers, n_experts, hidden_dim, 2 * shard_dim}, w_mlp1_ptr, stream,
-                      DType::BF16, false);
+  size_t expert_elems = 2 * inter_dim * hidden_dim;
+  size_t expert_bytes = expert_elems * sizeof(bf16);
 
-  size_t tmp_elems = hidden_dim * 2 * shard_dim;
-  bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
+  size_t batch_tmp_elems = BATCH_MLP1 * expert_elems;
+  size_t batch_tmp_bytes = BATCH_MLP1 * expert_bytes;
 
-  bf16 *d_buf = (bf16 *)(w_mlp1->d_buf);
+  size_t size_tmp = 1ll * TOTAL_PIPELINES * BUFFER_MLP1 * batch_tmp_elems;
+  bf16 *h_circular_buffer = (bf16 *)malloc(size_tmp * sizeof(bf16));
 
-  size_t l_offset = 1ll * n_experts * (2 * inter_dim) * hidden_dim;
-  size_t e_offset = 1ll * (2 * inter_dim) * hidden_dim;
+  bf16 **d_circular_buffers = new bf16 *[TOTAL_GPUS_NEEDED];
+#pragma omp parallel for
+  for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
+    CHECK_HIP(hipSetDevice(i));
+    CHECK_HIP(hipMalloc(&d_circular_buffers[i], 1ll * BUFFER_MLP1 * batch_tmp_bytes));
+  }
 
-  size_t l_offset_d = 1ll * n_experts * hidden_dim * (2 * shard_dim);
-  size_t e_offset_d = 1ll * hidden_dim * (2 * shard_dim);
+  bf16 **d_dest_ptr = new bf16 *[TOTAL_GPUS_NEEDED];
+  for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
+    d_dest_ptr[i] = (bf16 *)((&weights_total[i])->w_mlp1->d_buf);
+  }
 
-  for (size_t l = 0; l < n_layers; l++) {
-    for (size_t e = 0; e < n_experts; e++) {
-      size_t base = 1ll * l * l_offset + 1ll * e * e_offset;
+  hipStream_t *copy_streams = new hipStream_t[TOTAL_GPUS_NEEDED * BUFFER_MLP1];
+  hipEvent_t *copy_dones = new hipEvent_t[TOTAL_GPUS_NEEDED * BUFFER_MLP1];
 
-      for (size_t h = 0; h < hidden_dim; h++) {
-        for (size_t i = 0; i < 2 * shard_dim; i++) {
-          float value = w_mlp1_ptr[base + i * hidden_dim + h];
-          tmp[h * 2 * shard_dim + i] = bf16(value);
+  for (int i = 0; i < TOTAL_GPUS_NEEDED * BUFFER_MLP1; i++) {
+    int gpu_id = i % TOTAL_GPUS_NEEDED;
+    CHECK_HIP(hipSetDevice(gpu_id));
+    CHECK_HIP(hipStreamCreate(&copy_streams[i]));
+    CHECK_HIP(hipEventCreate(&copy_dones[i]));
+  }
+
+  for (size_t l = 0; l < layers_per_stage; l++) {
+    for (size_t e = 0; e < experts_per_gpu; e += BATCH_MLP1) {
+      int le_id = (l * experts_per_gpu + e) / (BUFFER_MLP1 * BATCH_MLP1);
+      int le_slot_id = ((l * experts_per_gpu + e) / BATCH_MLP1) % BUFFER_MLP1;
+      int le_slot_offset = le_slot_id * TOTAL_GPUS_NEEDED;
+
+      size_t h_circular_buf_offset = 1ll * le_slot_id * TOTAL_PIPELINES * batch_tmp_elems;
+      size_t d_circular_buf_offset = 1ll * le_slot_id * batch_tmp_elems;
+
+      if (le_id > 0) {
+#pragma omp parallel for
+        for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
+          CHECK_HIP(hipEventSynchronize(copy_dones[i + le_slot_offset]));
         }
       }
 
-      size_t d_offset = 1ll * l * l_offset_d + 1ll * e * e_offset_d;
-      CHECK_HIP(
-        hipMemcpyAsync(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16), hipMemcpyHostToDevice, 0));
+#pragma omp parallel for collapse(2)
+      for (int gpu_id = 0; gpu_id < TOTAL_GPUS_NEEDED; gpu_id++) {
+        for (int e_in_batch = 0; e_in_batch < BATCH_MLP1; e_in_batch++) {
+          int pp_rank = gpu_id / TP;
+          int tp_rank = gpu_id % TP;  // tp_rank bây giờ là expert_parallel_rank
+
+          // Con trỏ tới expert cụ thể trong file trọng số gốc
+          size_t expert_id_in_layer = tp_rank * experts_per_gpu + e + e_in_batch;
+          float *src_ptr =
+            w_mlp1_ptr +
+            1ll * pp_rank * layers_per_stage * total_experts * expert_elems +  // Offset PP
+            1ll * l * total_experts * expert_elems +                           // Offset Layer
+            1ll * expert_id_in_layer * expert_elems;                           // Offset Expert
+
+          // Con trỏ đích trong circular buffer trên host
+          bf16 *dst_ptr_host = h_circular_buffer + h_circular_buf_offset +
+                               1ll * gpu_id * batch_tmp_elems + 1ll * e_in_batch * expert_elems;
+
+          // Thực hiện chuyển đổi
+          for (size_t i = 0; i < expert_elems; ++i) {
+            dst_ptr_host[i] = bf16(src_ptr[i]);
+          }
+        }
+      }
+
+#pragma omp parallel for
+      for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
+        CHECK_HIP(hipSetDevice(i));
+        hipStream_t current_stream = copy_streams[i + le_slot_offset];
+
+        // Copy batch expert (chưa chuyển vị) lên buffer tạm của GPU
+        CHECK_HIP(
+          hipMemcpyAsync(d_circular_buffers[i] + d_circular_buf_offset,
+                         h_circular_buffer + h_circular_buf_offset + 1ll * i * batch_tmp_elems,
+                         batch_tmp_bytes, hipMemcpyHostToDevice, current_stream));
+
+        // Vị trí đích cuối cùng cho batch expert này
+        size_t d_final_offset = 1ll * l * experts_per_gpu * expert_elems + 1ll * e * expert_elems;
+
+        // Kích thước ma trận nguồn
+        int src_h = 2 * inter_dim;
+        int src_w = hidden_dim;
+
+        const int TILE_DIM = 16;
+        dim3 block_dim(TILE_DIM, TILE_DIM, 1);
+        dim3 grid_dim((src_w + TILE_DIM - 1) / TILE_DIM, (src_h + TILE_DIM - 1) / TILE_DIM,
+                      BATCH_MLP1);
+
+        batch_transpose_kernel_bf16<<<grid_dim, block_dim, 0, current_stream>>>(
+          d_circular_buffers[i] + d_circular_buf_offset, d_dest_ptr[i] + d_final_offset, BATCH_MLP1,
+          src_h, src_w);
+
+        CHECK_HIP(hipEventRecord(copy_dones[i + le_slot_offset], current_stream));
+      }
     }
   }
 
-  CHECK_HIP(hipStreamSynchronize(stream));
-  free(tmp);
+  for (int i = 0; i < TOTAL_GPUS_NEEDED * BUFFER_MLP1; i++) {
+    CHECK_HIP(hipEventSynchronize(copy_dones[i]));
+  }
 
-  printf("End alloc mlp1\n");
+  free(h_circular_buffer);
+  for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
+    CHECK_HIP(hipSetDevice(i));
+    CHECK_HIP(hipFree(d_circular_buffers[i]));
+  }
+  for (int i = 0; i < TOTAL_GPUS_NEEDED * BUFFER_MLP1; i++) {
+    int gpu_id = i % TOTAL_GPUS_NEEDED;
+    CHECK_HIP(hipSetDevice(gpu_id));
+    CHECK_HIP(hipStreamDestroy(copy_streams[i]));
+    CHECK_HIP(hipEventDestroy(copy_dones[i]));
+  }
+
+  delete[] d_circular_buffers;
+  delete[] d_dest_ptr;
+  delete[] copy_streams;
+  delete[] copy_dones;
+
+  printf("End alloc mlp1 for PP+EP\n");
+  fflush(stdout);
+}
+
+// Hàm load trọng số w_mlp2 cho PP + EP
+void alloc_w_mlp2_ep(OurTransformerWeights *weights_total,
+                     float *__restrict__ w_mlp2_ptr,  // <-- Con trỏ tới trọng số w_mlp2
+                     Config *p) {
+  CPUTimer timer("alloc_w_mlp2_ep");
+  printf("Starting alloc mlp2 EP\n");
+  fflush(stdout);
+
+  // --- 1. Khai báo các tham số ---
+  size_t layers_per_stage = p->n_layers / PP;
+  size_t total_experts = p->n_experts;
+  size_t hidden_dim = p->hidden_dim;
+  size_t inter_dim = p->intermediate_dim;
+  size_t experts_per_gpu = total_experts / TP;
+
+  // --- 2. Cấp phát Tensor đích trên mỗi GPU ---
+  // Shape của Tensor cho w_mlp2 là (..., inter_dim, hidden_dim)
+  for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
+    CHECK_HIP(hipSetDevice(i));
+    (&(weights_total[i]))->w_mlp2 = new Tensor(
+      {layers_per_stage, experts_per_gpu, inter_dim, hidden_dim}, nullptr, 0, DType::BF16, false);
+  }
+
+  // --- 3. Thiết lập Pipeline: Circular Buffers, Streams, Events ---
+  // Kích thước của MỘT expert w_mlp2 (chưa chuyển vị)
+  size_t single_expert_elems = inter_dim * hidden_dim;  // <-- THAY ĐỔI
+  size_t single_expert_bytes = single_expert_elems * sizeof(bf16);
+
+  size_t batch_tmp_elems = BATCH_MLP2 * single_expert_elems;
+  size_t batch_tmp_bytes = BATCH_MLP2 * single_expert_bytes;
+
+  size_t size_tmp = 1ll * TOTAL_PIPELINES * BUFFER_MLP2 * batch_tmp_elems;
+  bf16 *h_circular_buffer = (bf16 *)malloc(size_tmp * sizeof(bf16));
+
+  bf16 **d_circular_buffers = new bf16 *[TOTAL_GPUS_NEEDED];
+#pragma omp parallel for
+  for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
+    CHECK_HIP(hipSetDevice(i));
+    CHECK_HIP(hipMalloc(&d_circular_buffers[i], 1ll * BUFFER_MLP2 * batch_tmp_bytes));
+  }
+
+  bf16 **d_final_dest_array = new bf16 *[TOTAL_GPUS_NEEDED];
+  for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
+    d_final_dest_array[i] = (bf16 *)((&(weights_total[i]))->w_mlp2->d_buf);  // <-- THAY ĐỔI
+  }
+
+  hipStream_t *copy_streams = new hipStream_t[TOTAL_GPUS_NEEDED * BUFFER_MLP2];
+  hipEvent_t *copy_dones = new hipEvent_t[TOTAL_GPUS_NEEDED * BUFFER_MLP2];
+  for (int i = 0; i < TOTAL_GPUS_NEEDED * BUFFER_MLP2; i++) {
+    int gpu_id = i % TOTAL_GPUS_NEEDED;
+    CHECK_HIP(hipSetDevice(gpu_id));
+    CHECK_HIP(hipStreamCreate(&copy_streams[i]));
+    CHECK_HIP(hipEventCreate(&copy_dones[i]));
+  }
+
+  // --- 4. Vòng lặp chính xử lý theo Pipeline ---
+  for (size_t l = 0; l < layers_per_stage; l++) {
+    for (size_t e_group_start = 0; e_group_start < experts_per_gpu; e_group_start += BATCH_MLP2) {
+      int le_id = (l * experts_per_gpu + e_group_start) / (BUFFER_MLP2 * BATCH_MLP2);
+      int le_slot_id = ((l * experts_per_gpu + e_group_start) / BATCH_MLP2) % BUFFER_MLP2;
+      int le_slot_offset = le_slot_id * TOTAL_GPUS_NEEDED;
+
+      size_t h_circular_buf_offset = 1ll * le_slot_id * TOTAL_PIPELINES * batch_tmp_elems;
+      size_t d_circular_buf_offset = 1ll * le_slot_id * batch_tmp_elems;
+
+      if (le_id > 0) {
+#pragma omp parallel for
+        for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
+          CHECK_HIP(hipEventSynchronize(copy_dones[i + le_slot_offset]));
+        }
+      }
+
+#pragma omp parallel for collapse(2)
+      for (int gpu_id = 0; gpu_id < TOTAL_GPUS_NEEDED; gpu_id++) {
+        for (int e_in_batch = 0; e_in_batch < BATCH_MLP2; e_in_batch++) {
+          int pp_rank = gpu_id / TP;
+          int tp_rank = gpu_id % TP;
+
+          // Con trỏ tới expert w_mlp2 cụ thể trong file trọng số gốc
+          size_t expert_id_in_layer = tp_rank * experts_per_gpu + e_group_start + e_in_batch;
+          float *src_ptr = w_mlp2_ptr +
+                           1ll * pp_rank * layers_per_stage * total_experts * single_expert_elems +
+                           1ll * l * total_experts * single_expert_elems +
+                           1ll * expert_id_in_layer * single_expert_elems;
+
+          bf16 *dst_ptr_host = h_circular_buffer + h_circular_buf_offset +
+                               1ll * gpu_id * batch_tmp_elems +
+                               1ll * e_in_batch * single_expert_elems;
+
+          for (size_t i = 0; i < single_expert_elems; ++i) {
+            dst_ptr_host[i] = bf16(src_ptr[i]);
+          }
+        }
+      }
+
+#pragma omp parallel for
+      for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
+        CHECK_HIP(hipSetDevice(i));
+        hipStream_t current_stream = copy_streams[i + le_slot_offset];
+
+        CHECK_HIP(
+          hipMemcpyAsync(d_circular_buffers[i] + d_circular_buf_offset,
+                         h_circular_buffer + h_circular_buf_offset + 1ll * i * batch_tmp_elems,
+                         batch_tmp_bytes, hipMemcpyHostToDevice, current_stream));
+
+        size_t d_final_offset = 1ll * l * experts_per_gpu * single_expert_elems +
+                                1ll * e_group_start * single_expert_elems;
+
+        // Kích thước ma trận nguồn w_mlp2
+        int src_h = hidden_dim;
+        int src_w = inter_dim;
+
+        const int TILE_DIM = 16;
+        dim3 block_dim(TILE_DIM, TILE_DIM, 1);
+        dim3 grid_dim((src_w + TILE_DIM - 1) / TILE_DIM, (src_h + TILE_DIM - 1) / TILE_DIM,
+                      BATCH_MLP2);
+
+        batch_transpose_kernel_bf16<<<grid_dim, block_dim, 0, current_stream>>>(
+          d_circular_buffers[i] + d_circular_buf_offset, d_final_dest_array[i] + d_final_offset,
+          BATCH_MLP2, src_h, src_w);
+
+        CHECK_HIP(hipEventRecord(copy_dones[i + le_slot_offset], current_stream));
+      }
+    }
+  }
+
+  // --- 5. Dọn dẹp ---
+  // ... (logic dọn dẹp giữ nguyên như cũ)
+  for (int i = 0; i < TOTAL_GPUS_NEEDED * BUFFER_MLP2; i++) {
+    CHECK_HIP(hipEventSynchronize(copy_dones[i]));
+  }
+  free(h_circular_buffer);
+  for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
+    CHECK_HIP(hipSetDevice(i));
+    CHECK_HIP(hipFree(d_circular_buffers[i]));
+  }
+  for (int i = 0; i < TOTAL_GPUS_NEEDED * BUFFER_MLP2; i++) {
+    int gpu_id = i % TOTAL_GPUS_NEEDED;
+    CHECK_HIP(hipSetDevice(gpu_id));
+    CHECK_HIP(hipStreamDestroy(copy_streams[i]));
+    CHECK_HIP(hipEventDestroy(copy_dones[i]));
+  }
+  delete[] d_circular_buffers;
+  delete[] d_final_dest_array;
+  delete[] copy_streams;
+  delete[] copy_dones;
+
+  printf("End alloc mlp2 EP\n");
   fflush(stdout);
 }
 

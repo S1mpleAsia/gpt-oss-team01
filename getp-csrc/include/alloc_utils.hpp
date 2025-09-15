@@ -15,9 +15,13 @@
 
 void alloc_w_mlp1_final(OurTransformerWeights *weights_total, float *__restrict__ w_mlp1_ptr,
                         Config *p, hipStream_t *total_streams);
-void alloc_w_mlp1(Tensor *&w_mlp1, float *w_mlp1_ptr, Config *p, int device_id);
 void alloc_w_mlp2_final(OurTransformerWeights *weights_total, float *__restrict__ w_mlp2_ptr,
                         Config *p, hipStream_t *total_streams);
-void alloc_w_mlp2(Tensor *&w_mlp2, float *w_mlp2_ptr, Config *p, int device_id);
+
+void alloc_w_mlp1_ep(OurTransformerWeights *weights_total, float *__restrict__ w_mlp1_ptr,
+                     Config *p);
+void alloc_w_mlp2_ep(OurTransformerWeights *weights_total, float *__restrict__ w_mlp2_ptr,
+                     Config *p);
+
 void alloc_out(Tensor *&out, float *w_out, Config *p, int device_id);
 void alloc_out_new(Tensor *&out, float *w_out, Config *p, int device_id);
