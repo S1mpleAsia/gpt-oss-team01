@@ -326,7 +326,6 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   // }
 
   {
-    AllocTimer timer("w_qkv");
     size_t hidden_dim = p->hidden_dim;
     size_t shard_qkv_size = qkv_layer_size / TP;
     size_t q_size = p->n_attn_heads * p->head_dim;
@@ -375,7 +374,6 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   }
 
   {
-    AllocTimer timer("b_qkv");
     size_t shard_qkv_size = qkv_layer_size / TP;
     size_t q_size = p->n_attn_heads * p->head_dim;
     size_t kv_size = p->n_kv_heads * p->head_dim;
@@ -436,7 +434,6 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   // }
 
   {
-    AllocTimer timer("w_o");
     size_t hidden_dim = p->hidden_dim;
     size_t n_attn_heads = p->n_attn_heads;
     size_t head_dim = p->head_dim;
@@ -549,7 +546,6 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
   /* Expert parallelism */
   {
-    AllocTimer timer("w_mlp1");
     printf("Starting alloc mlp1\n");
     fflush(stdout);
 
@@ -565,25 +561,15 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     size_t tmp_elems = hidden_dim * 2 * inter_dim;
     bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
 
-    const size_t H_TILE = 32;
-    const size_t I_TILE = 128;
-
     for (size_t l = 0; l < layers_per_stage; l++) {
       for (size_t e = 0; e < experts_per_gpu; e++) {
         float *src_ptr = w_mlp1_ptr + l * total_experts * 2 * inter_dim * hidden_dim +
                          tp_rank * experts_per_gpu * 2 * inter_dim * hidden_dim +
                          e * 2 * inter_dim * hidden_dim;
-        for (size_t h = 0; h < hidden_dim; h += H_TILE) {
-          for (size_t i = 0; i < 2 * inter_dim; i += I_TILE) {
-            for (size_t h_tile = h; h_tile < h + H_TILE; h_tile++) {
-#pragma unroll 4
-              for (size_t i_tile = i; i_tile < i + I_TILE; i_tile++) {
-                float value = src_ptr[i_tile * hidden_dim + h_tile];
-                tmp[h_tile * 2 * inter_dim + i_tile] = bf16(value);
-              }
-            }
-            // float value = src_ptr[i * hidden_dim + h];
-            // tmp[h * 2 * inter_dim + i] = bf16(value);
+        for (size_t h = 0; h < hidden_dim; h++) {
+          for (size_t i = 0; i < 2 * inter_dim; i++) {
+            float value = src_ptr[i * hidden_dim + h];
+            tmp[h * 2 * inter_dim + i] = bf16(value);
           }
         }
 
@@ -657,7 +643,6 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
   /* Expert parallelism b_mlp1 */
   {
-    AllocTimer timer("b_mlp1");
     printf("Starting alloc b_mlp1\n");
     fflush(stdout);
 
@@ -753,7 +738,6 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
   /* Expert parallelism for w_mlp2 */
   {
-    AllocTimer timer("w_mlp2");
     printf("Starting alloc mlp2\n");
     fflush(stdout);
 
@@ -769,25 +753,16 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     size_t tmp_elems = inter_dim * hidden_dim;
     bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
 
-    size_t TILE_SIZE = 32;
-
     for (size_t l = 0; l < layers_per_stage; l++) {
       for (size_t e = 0; e < experts_per_gpu; e++) {
         float *src_ptr = w_mlp2_ptr + l * total_experts * hidden_dim * inter_dim +
                          tp_rank * experts_per_gpu * hidden_dim * inter_dim +
                          e * hidden_dim * inter_dim;
 
-        for (size_t i = 0; i < inter_dim; i += TILE_SIZE) {
-          for (size_t h = 0; h < hidden_dim; h += TILE_SIZE) {
-            for (size_t i_tile = i; i_tile < i + TILE_SIZE; i_tile++) {
-#pragma unroll 4
-              for (size_t h_tile = h; h_tile < h + TILE_SIZE; h_tile++) {
-                float value = src_ptr[h_tile * inter_dim + i_tile];
-                tmp[i_tile * hidden_dim + h_tile] = bf16(value);
-              }
-            }
-            // float value = src_ptr[h * inter_dim + i];
-            // tmp[i * hidden_dim + h] = bf16(value);
+        for (size_t i = 0; i < inter_dim; i++) {
+          for (size_t h = 0; h < hidden_dim; h++) {
+            float value = src_ptr[h * inter_dim + i];
+            tmp[i * hidden_dim + h] = bf16(value);
           }
         }
 
@@ -811,7 +786,6 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
   /* Expert parallelism b_mlp2*/
   {
-    AllocTimer timer("b_mlp2");
     printf("Starting alloc b_mlp2\n");
     fflush(stdout);
 
@@ -855,7 +829,6 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
       weights->out = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->out, device_id);
     */
     {
-      AllocTimer timer("w_out");
       size_t vocab_size = p->vocab_size;
       size_t hidden_dim = p->hidden_dim;
       size_t shard_vocab_size = vocab_size / TP;

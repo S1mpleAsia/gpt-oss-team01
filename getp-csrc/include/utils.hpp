@@ -35,26 +35,3 @@ struct GpuTimer {
 #endif
   }
 };
-
-static double get_time() {
-  struct timeval tv;
-  gettimeofday(&tv, 0);
-  return tv.tv_sec * 1000 + tv.tv_usec * 1e-3;
-}
-
-struct AllocTimer {
-  double start_time;
-  const char *function_name;
-  hipStream_t stream;
-
-  AllocTimer(const char *name) : function_name(name) {
-    start_time = get_time();
-  }
-
-  ~AllocTimer() {
-    double end_time = get_time();
-    double elapsed_time = end_time - start_time;
-
-    printf("%s: %f ms\n", function_name, elapsed_time);
-  }
-};
