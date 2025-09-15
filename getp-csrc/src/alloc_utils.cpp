@@ -19,32 +19,21 @@ __global__ void transpose_kernel_bf16(const bf16 *__restrict__ d_orig,
   }
 }
 
-__global__ void batch_transpose_kernel_bf16(const bf16 *__restrict__ d_orig,
-                                            bf16 *__restrict__ d_transpose, int batch, int h,
-                                            int w) {
-  // Get the global thread indices for the 2D matrix
+__global__ void batch_transpose_kernel_bf16(const bf16 *__restrict__ input,
+                                            bf16 *__restrict__ output, int batch, int h, int w) {
   int col = blockIdx.x * blockDim.x + threadIdx.x;
   int row = blockIdx.y * blockDim.y + threadIdx.y;
 
-  // Get the global thread index for the batch
   int batch_idx = blockIdx.z;
 
-  // Check if the thread is within the bounds of the original matrix and batch
   if (batch_idx < batch && row < h && col < w) {
-    // Calculate the base offset for the current matrix in the batch
-    // Calculate the 1D index for the original matrix, including the batch offset
     long long orig_idx = 1ll * batch_idx * h * w + 1ll * row * w + col;
 
-    // Calculate the 1D index for the transposed matrix, including the batch offset.
-    // The transposed matrix has dimensions (w, h), and the element at (row, col)
-    // in the original matrix moves to (col, row) in the transposed matrix.
     long long transpose_idx = 1ll * batch_idx * w * h + 1ll * col * h + row;
 
-    // Read the bf16 value from the original matrix
-    bf16 val = d_orig[orig_idx];
+    bf16 val = input[orig_idx];
 
-    // Store the bf16 value in the transposed matrix
-    d_transpose[transpose_idx] = val;
+    output[transpose_idx] = val;
   }
 }
 
@@ -64,7 +53,7 @@ void alloc_w_mlp1_final(OurTransformerWeights *weights_total, float *__restrict_
     CHECK_HIP(hipSetDevice(i));
     (&(weights_total[i]))->w_mlp1 =
       new Tensor({layers_per_stage, n_experts, hidden_dim, 2 * shard_dim}, w_mlp1_ptr,
-                 total_streams[i], DType::BF16);
+                 total_streams[i], DType::BF16, false);
   }
 
   size_t tmp_elems = hidden_dim * 2 * shard_dim;
@@ -225,8 +214,8 @@ void alloc_w_mlp1(Tensor *&w_mlp1, float *w_mlp1_ptr, Config *p, int device_id,
 
   w_mlp1_ptr += tp_rank * (2 * shard_dim) * hidden_dim;  // offset shard_dim;
 
-  w_mlp1 = new Tensor({n_layers, n_experts, hidden_dim, 2 * shard_dim}, w_mlp1_ptr, false, stream,
-                      DType::BF16);
+  w_mlp1 = new Tensor({n_layers, n_experts, hidden_dim, 2 * shard_dim}, w_mlp1_ptr, stream,
+                      DType::BF16, false);
 
   size_t tmp_elems = hidden_dim * 2 * shard_dim;
   bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
@@ -278,7 +267,7 @@ void alloc_w_mlp2_final(OurTransformerWeights *weights_total, float *__restrict_
   for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
     CHECK_HIP(hipSetDevice(i));
     (&(weights_total[i]))->w_mlp2 = new Tensor({n_layers, n_experts, shard_dim, hidden_dim},
-                                               w_mlp2_ptr, false, total_streams[i], DType::BF16);
+                                               w_mlp2_ptr, total_streams[i], DType::BF16, false);
   }
 
   size_t tmp_elems = shard_dim * hidden_dim;
@@ -440,8 +429,8 @@ void alloc_w_mlp2(Tensor *&w_mlp2, float *w_mlp2_ptr, Config *p, int device_id,
 
   w_mlp2_ptr += 1ll * tp_rank * shard_dim;  // offset shard_dim;
 
-  w_mlp2 = new Tensor({n_layers, n_experts, shard_dim, hidden_dim}, w_mlp2_ptr, false, stream,
-                      DType::BF16);
+  w_mlp2 = new Tensor({n_layers, n_experts, shard_dim, hidden_dim}, w_mlp2_ptr, stream, DType::BF16,
+                      false);
 
   size_t tmp_elems = shard_dim * hidden_dim;
   bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
@@ -490,7 +479,7 @@ void alloc_out_new(Tensor *&out, float *w_out, Config *p, int device_id, hipStre
 
   bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
 
-  out = new Tensor({hidden_dim, vocab_size}, w_out, false, stream, DType::BF16);
+  out = new Tensor({hidden_dim, vocab_size}, w_out, stream, DType::BF16, false);
 
   bf16 *d_buf = (bf16 *)out->d_buf;
 
@@ -519,7 +508,7 @@ void alloc_out(Tensor *&out, float *w_out, Config *p, int device_id, hipStream_t
 
   bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
 
-  out = new Tensor({hidden_dim, vocab_size}, w_out, false, stream, DType::BF16);
+  out = new Tensor({hidden_dim, vocab_size}, w_out, stream, DType::BF16, false);
 
   bf16 *d_buf = (bf16 *)out->d_buf;
 

@@ -34,7 +34,7 @@ struct Tensor {
 
   Tensor(const vector<size_t> &shape_, hipStream_t stream = 0, DType::Type dtype = DType::FP32);
   Tensor(const vector<size_t> &shape_, float *buf_, hipStream_t stream = 0,
-         DType::Type dtype = DType::FP32);
+         DType::Type dtype = DType::FP32, bool to_device_init = true);
   Tensor(const vector<size_t> &shape_, float *buf_, bool batch_alloc, hipStream_t stream,
          DType::Type dtype);
   ~Tensor();
