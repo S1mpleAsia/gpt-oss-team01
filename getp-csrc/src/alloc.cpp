@@ -2,6 +2,15 @@
 #include <cmath>
 #include <cstring>
 
+#ifndef MAX_DEVICES
+#define MAX_DEVICES 8
+#endif
+float *g_fa_pmax[MAX_DEVICES] = {nullptr};  // [B, n_q_dev, Cmax]
+float *g_fa_psum[MAX_DEVICES] = {nullptr};  // [B, n_q_dev, Cmax]
+float *g_fa_pnum[MAX_DEVICES] = {nullptr};  // [B, n_q_dev, Cmax, D]
+int    g_fa_C_max[MAX_DEVICES] = {0};
+int    g_fa_tile [MAX_DEVICES] = {128};     // TILE_TOKENS used by the kernel
+
 #ifdef RUN_20B
 void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *weights,
                       int device_id, hipStream_t stream) {
@@ -237,6 +246,24 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->cos_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2}, stream);
   rs->sin_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2}, stream);
   RopePrecomputeCS(p, rs->cos_tensor, rs->sin_tensor);
+  // ---- Allocate flash-decoding scratch for this device ----
+    int dev_id = device_id;            // we are already on this device
+    const int B   = BATCH_SIZE;
+    const int D   = p->head_dim;       // 64
+    const int n_q_dev = p->n_attn_heads;
+    const int tile = 128;              // keep in sync with kernel template below
+    const int Cmax = (p->seq_len + tile - 1) / tile;   // worst-case (no window), e.g. 2048/128 = 16
+
+    size_t pmax_elems = (size_t)B * n_q_dev * Cmax;
+    size_t pnum_elems = pmax_elems * (size_t)D;
+
+    CHECK_HIP(hipMalloc(&g_fa_pmax[dev_id], pmax_elems * sizeof(float)));
+    CHECK_HIP(hipMalloc(&g_fa_psum[dev_id], pmax_elems * sizeof(float)));
+    CHECK_HIP(hipMalloc(&g_fa_pnum[dev_id], pnum_elems * sizeof(float)));
+
+    g_fa_C_max[dev_id] = Cmax;
+    g_fa_tile [dev_id] = tile;
+
 }
 
 #else
@@ -782,6 +809,23 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->cos_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2}, stream);
   rs->sin_tensor = new Tensor({(size_t)p->seq_len, (size_t)p->head_dim / 2}, stream);
   RopePrecomputeCS(p, rs->cos_tensor, rs->sin_tensor);
+  // ---- Allocate flash-decoding scratch for this device ----
+    int dev_id = device_id;
+    const int B   = BATCH_SIZE;
+    const int D   = p->head_dim;                   // 64
+    const int n_q_dev = p->n_attn_heads / TP;      // per-TP shard
+    const int tile = 128;
+    const int Cmax = (p->seq_len + tile - 1) / tile;
+
+    size_t pmax_elems = (size_t)B * n_q_dev * Cmax;
+    size_t pnum_elems = pmax_elems * (size_t)D;
+
+    CHECK_HIP(hipMalloc(&g_fa_pmax[dev_id], pmax_elems * sizeof(float)));
+    CHECK_HIP(hipMalloc(&g_fa_psum[dev_id], pmax_elems * sizeof(float)));
+    CHECK_HIP(hipMalloc(&g_fa_pnum[dev_id], pnum_elems * sizeof(float)));
+
+    g_fa_C_max[dev_id] = Cmax;
+    g_fa_tile [dev_id] = tile;
 }
 
 #endif
@@ -820,6 +864,16 @@ void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunSt
 
 void our_free_each(OurTransformerWeights *weights, OurRunState *rs) {
   // weights
+// In our_free_each(...)
+int dev_id = 0;
+CHECK_HIP(hipGetDevice(&dev_id));
+
+if (g_fa_pmax[dev_id]) { CHECK_HIP(hipFree(g_fa_pmax[dev_id])); g_fa_pmax[dev_id] = nullptr; }
+if (g_fa_psum[dev_id]) { CHECK_HIP(hipFree(g_fa_psum[dev_id])); g_fa_psum[dev_id] = nullptr; }
+if (g_fa_pnum[dev_id]) { CHECK_HIP(hipFree(g_fa_pnum[dev_id])); g_fa_pnum[dev_id] = nullptr; }
+g_fa_C_max[dev_id] = 0;
+
+
   if (weights->token_embedding_table)
     delete weights->token_embedding_table;
   if (weights->rms_attn_w)

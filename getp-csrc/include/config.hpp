@@ -10,12 +10,12 @@
 #define BATCH_SIZE 128
 #define KV16 1
 // #define PRINT_LOGITS
-// #define TIME_GPU
+#define TIME_GPU
 // #define DEBUG
 #define RUN_20B
 
 #ifdef RUN_20B
-#define DP 8
+#define DP 1
 #define PP 1
 #define TP 1
 #else
