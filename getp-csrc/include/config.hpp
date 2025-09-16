@@ -8,21 +8,22 @@
 // #include "config_run.hpp"
 #include "pipeline.hpp"
 
-#define BATCH_SIZE 110
+#define BATCH_SIZE 256
+#define KV16
 // #define PRINT_LOGITS
 // #define TIME_GPU
 // #define DEBUG
-// #define RUN_20B
-#define RUN_EP
+#define RUN_20B
+// #define RUN_EP
 
 #ifdef RUN_20B
 #define DP 8
 #define PP 1
 #define TP 1
 #else
-#define DP 2
+#define DP 1
 #define PP 1
-#define TP 4
+#define TP 2
 #endif
 #define TOTAL_GPUS_NEEDED ((DP) * (PP) * (TP))
 #define TOTAL_PIPELINES ((PP) * (TP))
@@ -81,18 +82,18 @@ typedef struct {
   Tensor *topk_v;        // topk expert weights (experts_per_token, )
   TensorI32 *topk_i;     // topk expert indices (experts_per_token, )
   Tensor *mlp1_out;      // [batch_size * experts_per_token, 2 * inter_dim]
-  Tensor *gate;
-  Tensor *up;
+  // Tensor *gate;
+  // Tensor *up;
   Tensor *gate_up;  // [batch_size * experts_per_toeken, inter_dim]
   Tensor *e_agg;    // [batch_size, hidden_dim]
   Tensor *e_agg_buf;
   Tensor *qkv;  // an additional buffer just for convenience (head_dim *
                 // (n_attn_heads + 2 * n_kv_heads), )
   Tensor *tmp_qkv;
-  Tensor *q;           // query (n_attn_heads * head_dim,)
-  Tensor *k;           // key (n_kv_heads * head_dim,)
-  Tensor *v;           // value (n_kv_heads * head_dim,)
-  Tensor *att;         // buffer for scores/attention values (n_heads, seq_len)
+  Tensor *q;  // query (n_attn_heads * head_dim,)
+  // Tensor *k;           // key (n_kv_heads * head_dim,)
+  // Tensor *v;           // value (n_kv_heads * head_dim,)
+  // Tensor *att;         // buffer for scores/attention values (n_heads, seq_len)
   Tensor *logits;      // output logits
   Tensor *tmp_logits;  // (batch_size, shard_vocab)
   // kv cache
@@ -111,6 +112,11 @@ typedef struct {
   // Multi-GPU related
   TensorI32 *tokens_buf;
   PipelineEach *pipeline_each;
+
+  // Flash-attention
+  Tensor *g_fa_pmax;  // [batch_size, n_attn_heads, c_max]
+  Tensor *g_fa_psum;  // [batch_size, n_attn_heads, c_max]
+  Tensor *g_fa_pnum;  // [batch_size, n_attn_heads, c_max, head_dim]
 } OurRunState;
 
 typedef struct {

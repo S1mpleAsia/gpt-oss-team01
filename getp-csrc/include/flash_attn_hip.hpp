@@ -12,7 +12,8 @@ void single_query_attn_flash_batched(Tensor *q,        // [B, n_q*hd] (float32)
                                      Tensor *V_cache,  // [B, L, S, kv_dim] (float32 or bf16)
                                      Tensor *mask,  // [B, S, S] or nullptr (float32; additive mask)
                                      Tensor *attn_sinks,  // [L, n_q]  (float32)
-                                     Tensor *tb,          // [B, n_q*hd] (float32)
+                                     Tensor *tb,          // [B, n_q*hd] (float32),
+                                     Tensor *g_fa_pmax, Tensor *g_fa_psum, Tensor *g_fa_pnum,
                                      int cur_batch_size, int head_dim, int num_query_heads,
                                      int kv_mul, int kv_dim, int seq_len,
                                      int sliding_window,  // 0 means disabled

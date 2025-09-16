@@ -77,8 +77,6 @@ __global__ void residual_rmsnorm_f32_kernel(const float *input, float *residual,
   __syncthreads();
   s_norm = s_shared;
 
-  // const int vecN = hidden_dim >> 2;
-  // const float4 *rs4 = reinterpret_cast<const float4 *>(res_row);
   const float4 *g4 = reinterpret_cast<const float4 *>(g_row);
   float4 *o4 = reinterpret_cast<float4 *>(out_row);
 
@@ -152,20 +150,6 @@ void embedding_lookup_batched(Tensor *embedding,      // Shape: [vocab_size, hid
 
   embedding_lookup_kernel<<<grid_size, block_size, 0, stream>>>(
     embedding_ptr, x_ptr, tokens_buf->d_buf, hidden_dim, cur_batch_size);
-
-  // for (int i = 0; i < cur_batch_size; i++) {
-  //   if (x->dtype == DType::BF16) {
-  //     bf16 *src = (bf16 *)embedding->d_buf + (size_t)tokens[i] * hidden_dim;
-  //     bf16 *dst = (bf16 *)x->d_buf + 1ll * i * hidden_dim;
-  //     CHECK_HIP(
-  //       hipMemcpyAsync(dst, src, hidden_dim * sizeof(bf16), hipMemcpyDeviceToDevice, stream));
-  //   } else {
-  //     float *src = (float *)embedding->d_buf + (size_t)tokens[i] * hidden_dim;
-  //     float *dst = (float *)x->d_buf + 1ll * i * hidden_dim;
-  //     CHECK_HIP(
-  //       hipMemcpyAsync(dst, src, hidden_dim * sizeof(float), hipMemcpyDeviceToDevice, stream));
-  //   }
-  // }
 
   if (x_from_device) {
     x->from_device(stream);
@@ -591,7 +575,6 @@ __global__ void qkv_split_rope_store_kernel(
     q_b[i1] = y1;
   }
 
-  // -------- 2) K: RoPE in pairs, write directly into K_cache --------
   // K section starts at offset qdim
   for (int p = lane; p < n_kv * h2; p += gridDim.x * blockDim.x) {
     int h = p / h2;  // kv-head
@@ -609,26 +592,22 @@ __global__ void qkv_split_rope_store_kernel(
     float r1 = k0 * s + k1 * c;
 
     size_t dst = t_base + (size_t)h * hd + j;  // destination index for j
-    // write two elements (j and j+h2)
+                                               // write two elements (j and j+h2)
     if constexpr (KV_BF16) {
-      ((bf16 *)Kb)[dst] =
-        (bf16)((__float_as_uint(r0) + 0x00007FFFu + (((__float_as_uint(r0) >> 16) & 1u))) >> 16);
-      ((bf16 *)Kb)[dst + h2] =
-        (bf16)((__float_as_uint(r1) + 0x00007FFFu + (((__float_as_uint(r1) >> 16) & 1u))) >> 16);
+      ((bf16 *)Kb)[dst] = (bf16)r0;
+      ((bf16 *)Kb)[dst + h2] = (bf16)r1;
     } else {
       ((float *)Kb)[dst] = r0;
       ((float *)Kb)[dst + h2] = r1;
     }
   }
 
-  // -------- 3) V: simple copy to V_cache (vector-ish) --------
   // V section starts at qdim + kdim ; write contiguous kv_dim elements
   for (int d = lane; d < kdim; d += gridDim.x * blockDim.x) {
     float v = qkv_b[qdim + kdim + d];
     size_t dst = t_base + d;
     if constexpr (KV_BF16) {
-      ((bf16 *)Vb)[dst] =
-        (bf16)((__float_as_uint(v) + 0x00007FFFu + (((__float_as_uint(v) >> 16) & 1u))) >> 16);
+      ((bf16 *)Vb)[dst] = (bf16)v;
     } else {
       ((float *)Vb)[dst] = v;
     }
@@ -648,10 +627,12 @@ void qkv_split_rope_fused(Tensor *qkv_out,  // Shape: [batch_size, (n_q + 2*n_kv
   const int kv_dim = n_kv * head_dim;
 
   // pre-offset caches to the current layer (BY ELEMENTS)
+
+  const size_t elem_bytes = (K_cache->dtype == DType::BF16) ? sizeof(bf16) : sizeof(float);
   void *k_ptr = (char *)K_cache->d_buf +
-                (size_t)layer_offset * (size_t)(K_cache->shape[2] * kv_dim) * sizeof(float);
+                (size_t)layer_offset * (size_t)(K_cache->shape[2] * kv_dim) * elem_bytes;
   void *v_ptr = (char *)V_cache->d_buf +
-                (size_t)layer_offset * (size_t)(V_cache->shape[2] * kv_dim) * sizeof(float);
+                (size_t)layer_offset * (size_t)(V_cache->shape[2] * kv_dim) * elem_bytes;
 
   const int h2 = head_dim >> 1;
   const int total_pairs = n_kv > n_q ? n_kv * h2 : n_q * h2;
@@ -1591,7 +1572,6 @@ void classifier_gemm_batched(const Tensor *W_out,  // Shape: [vocab_size, hidden
                              Tensor *logits,       // Shape: [batch_size, vocab_size]
                              int cur_batch_size, bool x_to_device, bool logits_from_device,
                              hipStream_t stream) {
-  // GpuTimer timer("classifier_batched", stream);
   if (x_to_device) {
     x->to_device(stream);
   }
@@ -1612,25 +1592,15 @@ void classifier_gemm_batched(const Tensor *W_out,  // Shape: [vocab_size, hidden
 
   // Each block has `warpSize` x `WARPS_PER_BLOCK` threads
   dim3 block_dim(warpSize, WARPS_PER_BLOCK);
-
-  // The grid is 2D:
-  // - The x-dimension covers the vocabulary size.
-  // - The y-dimension covers the batch size.
-  // This maps each matrix-vector multiplication in the batch to a row of blocks.
   dim3 grid_dim((vocab_size + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, cur_batch_size);
 
-  // Shared memory is likely used by the kernel to cache the input vector `x` for faster access.
   size_t shmem_bytes = TILE * sizeof(float);
 
-  // Launch the batched GEMM kernel
   gemm_kernel_batched<WARPS_PER_BLOCK, TILE><<<grid_dim, block_dim, shmem_bytes, stream>>>(
-    W_out_ptr, x_ptr,
-    nullptr,  // No bias is used in this operation
-    logits_ptr, vocab_size, hidden_dim, cur_batch_size);
+    W_out_ptr, x_ptr, nullptr, logits_ptr, vocab_size, hidden_dim, cur_batch_size);
 
   if (logits_from_device) {
     logits->from_device(stream);
-    // Block until the kernel and data transfer are complete
     CHECK_HIP(hipStreamSynchronize(stream));
   }
 }
@@ -1676,24 +1646,6 @@ void classifier_gemm_batched_v2(const Tensor *W_out,  // Shape: [hidden_dim, voc
     gemm_mfma<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
       x_ptr, w_out_ptr, logits_buf, nullptr, cur_batch_size, vocab_size, hidden_dim);
   }
-
-  // {
-  //   constexpr int BM = 16;
-  //   constexpr int BN = 256;
-  //   constexpr int BK = 16;
-  //   constexpr int TM = 2;
-  //   constexpr int TN = 8;
-
-  //   const int BLOCK_SIZE_X = BN / TN;
-  //   const int BLOCK_SIZE_Y = BM / TM;
-  //   dim3 block_size(BLOCK_SIZE_X, BLOCK_SIZE_Y);
-  //   dim3 grid_size((vocab_size + BN - 1) / BN, (batch_size + BM - 1) / BM);
-
-  //   matmul_kernel_bf16<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
-  //     x_ptr, w_out_ptr, logits_buf, nullptr, batch_size, vocab_size, hidden_dim);
-  //   CHECK_HIP(hipGetLastError());
-  // }
-
   if (logits_from_device) {
     logits->from_device(stream);
   }

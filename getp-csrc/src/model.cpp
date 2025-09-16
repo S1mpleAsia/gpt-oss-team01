@@ -47,8 +47,9 @@ float *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flo
     // FIX single_query_attn_batched later
     single_query_attn_flash_batched(
       rs_now->q, rs_now->key_cache, rs_now->value_cache, rs_now->mask, weights_now->attn_sinks,
-      rs_now->tb, cur_batch_size, p->head_dim, p->n_attn_heads, kv_mul, kv_dim, p->seq_len,
-      p->sliding_window, pos, 1ll * l, false, false, false, false, false, stream);
+      rs_now->tb, rs_now->g_fa_pmax, rs_now->g_fa_psum, rs_now->g_fa_pnum, cur_batch_size,
+      p->head_dim, p->n_attn_heads, kv_mul, kv_dim, p->seq_len, p->sliding_window, pos, 1ll * l,
+      false, false, false, false, false, stream);
 
     // final matmul to get the output of the attention
     attn_out_project_batched_v2(rs_now->tb, weights_now->w_o, weights_now->b_o, rs_now->tb2, true,
@@ -603,8 +604,9 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
     // FIX single_query_attn_batched later
     single_query_attn_flash_batched(
       rs_now->q, rs_now->key_cache, rs_now->value_cache, rs_now->mask, weights_now->attn_sinks,
-      rs_now->tb, cur_batch_size, p->head_dim, p->n_attn_heads / TP, kv_mul, kv_dim / TP,
-      p->seq_len, p->sliding_window, pos, 1ll * l, false, false, false, false, false, stream);
+      rs_now->tb, rs->g_fa_pmax, rs->g_fa_psum, rs->g_fa_pnum, cur_batch_size, p->head_dim,
+      p->n_attn_heads / TP, kv_mul, kv_dim / TP, p->seq_len, p->sliding_window, pos, 1ll * l, false,
+      false, false, false, false, stream);
 
     // all_gather_tb(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream,
     //               tp_ready, tp_finish);
