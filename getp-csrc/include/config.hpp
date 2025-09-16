@@ -8,19 +8,19 @@
 // #include "config_run.hpp"
 #include "pipeline.hpp"
 
-#define BATCH_SIZE 128
+#define BATCH_SIZE 110
 // #define PRINT_LOGITS
 // #define TIME_GPU
 // #define DEBUG
 // #define RUN_20B
-// #define RUN_EP
+#define RUN_EP
 
 #ifdef RUN_20B
 #define DP 8
 #define PP 1
 #define TP 1
 #else
-#define DP 1
+#define DP 2
 #define PP 1
 #define TP 4
 #endif

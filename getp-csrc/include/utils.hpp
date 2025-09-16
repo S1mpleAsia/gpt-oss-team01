@@ -8,6 +8,7 @@ void memcpy_tensor(Tensor *to, const Tensor *from, long long to_offset, long lon
                    size_t num_elem, bool copy_host, bool copy_device, hipStream_t stream = 0);
 void memset_tensor(Tensor *in, int value, bool set_host, bool set_device, hipStream_t stream = 0);
 void printDebugFloat(bf16 *d_buf, const std::string &descr);
+void check_gpu_memory();
 
 struct GpuTimer {
   hipEvent_t start_event, stop_event;
