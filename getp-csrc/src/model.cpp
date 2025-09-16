@@ -390,72 +390,126 @@ void all_gather_qkv_v2(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank,
   pthread_barrier_wait(tp_barrier);
 }
 
-// void all_gather_tb(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
-//                    int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream,
-//                    hipEvent_t tp_ready, hipEvent_t tp_finish) {
-//   /************************* PHASE 1: GATHER TO LEADER *************************/
-//   size_t shard_tb_size = rs_now->tb_buf->shape[1];
-//   size_t full_tb_size = shard_tb_size * TP;
+void all_gather_tb3(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
+                    Config *p, pthread_barrier_t *tp_barrier, hipStream_t stream,
+                    hipEvent_t tp_ready, hipEvent_t tp_finish) {
+  int experts_per_gpu = p->n_experts / TP;
+  int hidden_dim = p->hidden_dim;
 
-//   size_t width_bytes = shard_tb_size * sizeof(float);
-//   size_t height = cur_batch_size;
+  size_t start_offset = rs_now->expert_offsets->buf[tp_rank * experts_per_gpu];
+  size_t end_offset = rs_now->expert_offsets->buf[(tp_rank + 1) * experts_per_gpu];
+  size_t local_num_tokens = end_offset - start_offset;
+  size_t local_num_bytes = local_num_tokens * hidden_dim * sizeof(float);
 
-//   const void *src_buf = rs_now->tb_buf->d_buf;
-//   size_t src_pitch = width_bytes;
+  void *leader_buf = rs_leader->tb3->d_buf;
+  void *dst_ptr = (char *)leader_buf + start_offset * hidden_dim * sizeof(float);
 
-//   float *dst_base_buf = (float *)rs_leader->tb->d_buf;
-//   size_t dst_pitch = full_tb_size * sizeof(float);
+  if (local_num_tokens > 0) {
+    if (tp_rank == 0) {
+      CHECK_HIP(hipMemcpyAsync(dst_ptr, rs_now->tb3->d_buf, local_num_bytes,
+                               hipMemcpyDeviceToDevice, stream));
+    } else {
+      CHECK_HIP(hipMemcpyPeerAsync(dst_ptr, cur_device - tp_rank, rs_now->tb3->d_buf, cur_device,
+                                   local_num_bytes, stream));
 
-//   void *dst_buf = (void *)(dst_base_buf + tp_rank * shard_tb_size);
+      CHECK_HIP(hipEventRecord(tp_ready, stream));
+    }
+  }
 
-//   CHECK_HIP(hipMemcpy2DAsync(dst_buf, dst_pitch, src_buf, src_pitch, width_bytes, height,
-//                              hipMemcpyDeviceToDevice, stream));
+  pthread_barrier_wait(tp_barrier);
 
-//   if (tp_rank > 0) {
-//     CHECK_HIP(hipEventRecord(tp_ready, stream));
-//   }
+  if (tp_rank == 0) {
+    for (int i = 1; i < TP; i++) {
+      size_t worker_start_offset = rs_leader[i].expert_offsets->buf[i * experts_per_gpu];
+      size_t worker_end_offset = rs_leader[i].expert_offsets->buf[(i + 1) * experts_per_gpu];
 
-// #ifdef DEBUG
-//   bool flag = true;
-//   if (flag)
-//     rs_now->tb_buf->printDebug("rs_now->tb_buf after copy to leader", tp_rank, 0, stream);
-// #endif
-//   pthread_barrier_wait(tp_barrier);
+      if (worker_end_offset > worker_start_offset) {
+        hipEvent_t worker_event = total_events->tp_ready[cur_device + i];
+        CHECK_HIP(hipStreamWaitEvent(stream, worker_event));
+      }
+    }
 
-//   if (tp_rank == 0) {
-//     for (int i = 1; i < TP; i++) {
-//       hipEvent_t worker_event = total_events->tp_ready[cur_device + i];
-//       CHECK_HIP(hipStreamWaitEvent(stream, worker_event, 0));
-//     }
+    CHECK_HIP(hipEventRecord(tp_ready, stream));
+  }
 
-//     CHECK_HIP(hipEventRecord(tp_ready, stream));
-//   }
-//   pthread_barrier_wait(tp_barrier);
+  pthread_barrier_wait(tp_barrier);
 
-// #ifdef DEBUG
-//   if (flag)
-//     rs_now->tb->printDebug("rs_now->tb after aggregate", tp_rank, 0, stream);
-// #endif
+  size_t total_tokens = rs_now->expert_offsets->buf[p->n_experts];
+  size_t total_bytes = total_tokens * hidden_dim * sizeof(float);
 
-//   if (tp_rank > 0) {
-//     hipEvent_t leader_tp_ready = total_events->tp_ready[cur_device - tp_rank];
-//     CHECK_HIP(hipStreamWaitEvent(stream, leader_tp_ready));
+  if (tp_rank > 0) {
+    hipEvent_t leader_tp_ready = total_events->tp_ready[cur_device - tp_rank];
+    CHECK_HIP(hipStreamWaitEvent(stream, leader_tp_ready));
 
-//     size_t tb_bytes = rs_now->tb->num_elem() * rs_now->tb->get_dtype_size();
-//     void *dst_buf = rs_now->tb->d_buf;
-//     const void *src_buf = rs_leader->tb->d_buf;
+    const void *src_ptr = rs_leader->tb3->d_buf;
+    void *dst_ptr = rs_now->tb3->d_buf;
 
-//     CHECK_HIP(
-//       hipMemcpyPeerAsync(dst_buf, cur_device, src_buf, cur_device - tp_rank, tb_bytes, stream));
-//     CHECK_HIP(hipEventRecord(tp_finish, stream));
-//   } else {
-//     for (int i = 1; i < TP; i++) {
-//       hipEvent_t worker_finish = total_events->tp_finish[cur_device + i];
-//       CHECK_HIP(hipStreamWaitEvent(stream, worker_finish, 0));
-//     }
-//   }
-//   pthread_barrier_wait(tp_barrier);
-// }
+    CHECK_HIP(
+      hipMemcpyPeerAsync(dst_ptr, cur_device, src_ptr, cur_device - tp_rank, total_bytes, stream));
+
+    CHECK_HIP(hipEventRecord(tp_finish, stream));
+  }
+
+  pthread_barrier_wait(tp_barrier);
+
+  if (tp_rank == 0) {
+    for (int i = 1; i < TP; i++) {
+      hipEvent_t worker_tp_finish = total_events->tp_finish[cur_device + i];
+      CHECK_HIP(hipStreamWaitEvent(stream, worker_tp_finish));
+    }
+  }
+
+  pthread_barrier_wait(tp_barrier);
+}
+
+__global__ void extract_local_tokens_kernel(const float *x_packed, float *x_packed_local,
+                                            size_t local_num_tokens, size_t start_offset,
+                                            size_t hidden_dim) {
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t total_elems = local_num_tokens * hidden_dim;
+
+  if (idx < total_elems) {
+    size_t global_idx = start_offset * hidden_dim + idx;
+    x_packed_local[idx] = x_packed[global_idx];
+  }
+}
+
+__global__ void build_local_expert_offsets_kernel(const int *expert_offsets, int *local_offsets,
+                                                  int tp_rank, int experts_per_gpu) {
+  int i = threadIdx.x;
+  if (i > experts_per_gpu)
+    return;
+
+  int global_expert_id = tp_rank * experts_per_gpu;
+  int base_offset = expert_offsets[global_expert_id];
+
+  local_offsets[i] = expert_offsets[global_expert_id + i] - base_offset;
+}
+
+void moe_build_local_ep_data(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, Config *p,
+                             pthread_barrier_t *tp_barrier, hipStream_t stream) {
+  size_t experts_per_gpu = p->n_experts / TP;
+  size_t start_offset = rs_now->expert_offsets->buf[tp_rank * experts_per_gpu];
+  size_t end_offset = rs_now->expert_offsets->buf[(tp_rank + 1) * experts_per_gpu];
+  size_t local_num_tokens = end_offset - start_offset;
+
+  if (local_num_tokens > 0) {
+    dim3 block_size(256);
+    dim3 grid_size((local_num_tokens * p->hidden_dim + 255) / 256);
+    extract_local_tokens_kernel<<<grid_size, block_size, 0, stream>>>(
+      (const float *)rs_now->x_packed->d_buf, (float *)rs_now->x_packed_local->d_buf,
+      local_num_tokens, start_offset, p->hidden_dim);
+  }
+
+  {
+    dim3 block_size(experts_per_gpu + 1);
+    dim3 grid_size(1);
+
+    build_local_expert_offsets_kernel<<<grid_size, block_size, 0, stream>>>(
+      (const int *)rs_now->expert_offsets->d_buf, (int *)rs_now->expert_offsets_local->d_buf,
+      tp_rank, experts_per_gpu);
+  }
+}
 
 // two events are needed
 float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow_id, int tp_rank,
@@ -646,11 +700,27 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
     moe_pack_inputs_hip(rs_now->t, rs_now->sorted_pair_ids, rs_now->x_packed, cur_batch_size,
                         p->hidden_dim, p->experts_per_token, stream);
 
+#ifdef RUN_EP
+    rs_now->expert_offsets->from_device(stream);
+    moe_build_local_ep_data(rs_now, rs_leader, tp_rank, p, tp_barrier, stream);
+#endif
+
 #ifdef DEBUG
     if (flag)
       rs_now->x_packed->printDebug("rs_now->x_packed", tp_rank, 0, stream);
 #endif
 
+#ifdef RUN_EP
+    int max_rows = moe_get_max_rows_per_expert_hip(rs_now->expert_offsets_local, rs_now->max_rows,
+                                                   p->n_experts / TP, stream);
+    moe_mlp1_forward_hip(rs_now->x_packed_local, weights_now->w_mlp1, weights_now->b_mlp1,
+                         rs_now->expert_offsets_local, rs_now->mlp1_out, 1ll * l, p->n_experts / TP,
+                         p->hidden_dim, p->intermediate_dim, max_rows, total_pairs, stream);
+
+    moe_swiglu_hip(rs_now->mlp1_out, rs_now->gate_up, cur_batch_size, p->experts_per_token,
+                   p->intermediate_dim, p->swiglu_limit, stream);
+
+#else
     int max_rows = moe_get_max_rows_per_expert_hip(rs_now->expert_offsets, rs_now->max_rows,
                                                    p->n_experts, stream);
     moe_mlp1_forward_hip(rs_now->x_packed, weights_now->w_mlp1, weights_now->b_mlp1,
@@ -659,28 +729,45 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
 
     moe_swiglu_hip(rs_now->mlp1_out, rs_now->gate_up, cur_batch_size, p->experts_per_token,
                    p->intermediate_dim / TP, p->swiglu_limit, stream);
+#endif
 
 #ifdef DEBUG
     if (flag)
       rs_now->gate_up->printDebug("rs_now->gate_up", tp_rank, 0, stream);
 #endif
 
+#ifdef RUN_EP
+    moe_mlp2_forward_hip(rs_now->gate_up, weights_now->w_mlp2, weights_now->b_mlp2,
+                         rs_now->expert_offsets_local, rs_now->tb3, true, 1ll * l,
+                         p->n_experts / TP, p->intermediate_dim, p->hidden_dim, max_rows,
+                         total_pairs, stream);
+#else
     moe_mlp2_forward_hip(rs_now->gate_up, weights_now->w_mlp2, weights_now->b_mlp2,
                          rs_now->expert_offsets, rs_now->tb3, tp_rank == 0, 1ll * l, p->n_experts,
                          p->intermediate_dim / TP, p->hidden_dim, max_rows, total_pairs, stream);
+#endif
 
 #ifdef DEBUG
     if (flag)
       rs_now->tb3->printDebug("rs_now->tb3", tp_rank, 0, stream);
 #endif
 
+#ifdef RUN_EP
+    all_gather_tb3(rs_now, rs_leader, tp_rank, cur_device, p, tp_barrier, stream, tp_ready,
+                   tp_finish);
+#else
     reduce_tb3(rs_now, rs_leader, tp_rank, cur_device, tp_barrier, stream, tp_ready, tp_finish);
+#endif
 
 #ifdef DEBUG
     if (flag)
       rs_now->tb3->printDebug("rs_now->tb3 after", tp_rank, 0, stream);
 #endif
 
+#ifdef RUN_EP
+    max_rows = moe_get_max_rows_per_expert_hip(rs_now->expert_offsets, rs_now->max_rows,
+                                               p->n_experts, stream);
+#endif
     moe_scatter_aggregate_hip(rs_now->tb3, rs_now->sorted_pair_ids, rs_now->topk_v, rs_now->e_agg,
                               rs_now->expert_offsets, p->hidden_dim, p->experts_per_token,
                               p->n_experts, max_rows, stream);

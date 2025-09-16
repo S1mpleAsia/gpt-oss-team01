@@ -250,6 +250,7 @@ void alloc_w_mlp1_ep(OurTransformerWeights *weights_total, float *__restrict__ w
   }
 
   for (size_t l = 0; l < layers_per_stage; l++) {
+    CPUTimer each_exp_timer("each_exp_timer");
     for (size_t e = 0; e < experts_per_gpu; e += BATCH_MLP1) {
       int le_id = (l * experts_per_gpu + e) / (BUFFER_MLP1 * BATCH_MLP1);
       int le_slot_id = ((l * experts_per_gpu + e) / BATCH_MLP1) % BUFFER_MLP1;
@@ -343,36 +344,30 @@ void alloc_w_mlp1_ep(OurTransformerWeights *weights_total, float *__restrict__ w
   delete[] copy_streams;
   delete[] copy_dones;
 
-  printf("End alloc mlp1 for PP+EP\n");
+  printf("End alloc mlp1 for EP\n");
   fflush(stdout);
 }
 
-// Hàm load trọng số w_mlp2 cho PP + EP
-void alloc_w_mlp2_ep(OurTransformerWeights *weights_total,
-                     float *__restrict__ w_mlp2_ptr,  // <-- Con trỏ tới trọng số w_mlp2
-                     Config *p) {
+void alloc_w_mlp2_ep(OurTransformerWeights *weights_total, float *__restrict__ w_mlp2_ptr,
+                     Config *p, hipStream_t *total_streams) {
   CPUTimer timer("alloc_w_mlp2_ep");
   printf("Starting alloc mlp2 EP\n");
   fflush(stdout);
 
-  // --- 1. Khai báo các tham số ---
   size_t layers_per_stage = p->n_layers / PP;
   size_t total_experts = p->n_experts;
   size_t hidden_dim = p->hidden_dim;
   size_t inter_dim = p->intermediate_dim;
   size_t experts_per_gpu = total_experts / TP;
 
-  // --- 2. Cấp phát Tensor đích trên mỗi GPU ---
-  // Shape của Tensor cho w_mlp2 là (..., inter_dim, hidden_dim)
   for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
     CHECK_HIP(hipSetDevice(i));
-    (&(weights_total[i]))->w_mlp2 = new Tensor(
-      {layers_per_stage, experts_per_gpu, inter_dim, hidden_dim}, nullptr, 0, DType::BF16, false);
+    (&(weights_total[i]))->w_mlp2 =
+      new Tensor({layers_per_stage, experts_per_gpu, inter_dim, hidden_dim}, w_mlp2_ptr,
+                 total_streams[i], DType::BF16, false);
   }
 
-  // --- 3. Thiết lập Pipeline: Circular Buffers, Streams, Events ---
-  // Kích thước của MỘT expert w_mlp2 (chưa chuyển vị)
-  size_t single_expert_elems = inter_dim * hidden_dim;  // <-- THAY ĐỔI
+  size_t single_expert_elems = inter_dim * hidden_dim;
   size_t single_expert_bytes = single_expert_elems * sizeof(bf16);
 
   size_t batch_tmp_elems = BATCH_MLP2 * single_expert_elems;
@@ -390,7 +385,7 @@ void alloc_w_mlp2_ep(OurTransformerWeights *weights_total,
 
   bf16 **d_final_dest_array = new bf16 *[TOTAL_GPUS_NEEDED];
   for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
-    d_final_dest_array[i] = (bf16 *)((&(weights_total[i]))->w_mlp2->d_buf);  // <-- THAY ĐỔI
+    d_final_dest_array[i] = (bf16 *)((&(weights_total[i]))->w_mlp2->d_buf);
   }
 
   hipStream_t *copy_streams = new hipStream_t[TOTAL_GPUS_NEEDED * BUFFER_MLP2];
@@ -402,8 +397,8 @@ void alloc_w_mlp2_ep(OurTransformerWeights *weights_total,
     CHECK_HIP(hipEventCreate(&copy_dones[i]));
   }
 
-  // --- 4. Vòng lặp chính xử lý theo Pipeline ---
   for (size_t l = 0; l < layers_per_stage; l++) {
+    CPUTimer each_exp_timer("each_exp_timer");
     for (size_t e_group_start = 0; e_group_start < experts_per_gpu; e_group_start += BATCH_MLP2) {
       int le_id = (l * experts_per_gpu + e_group_start) / (BUFFER_MLP2 * BATCH_MLP2);
       int le_slot_id = ((l * experts_per_gpu + e_group_start) / BATCH_MLP2) % BUFFER_MLP2;
@@ -425,7 +420,6 @@ void alloc_w_mlp2_ep(OurTransformerWeights *weights_total,
           int pp_rank = gpu_id / TP;
           int tp_rank = gpu_id % TP;
 
-          // Con trỏ tới expert w_mlp2 cụ thể trong file trọng số gốc
           size_t expert_id_in_layer = tp_rank * experts_per_gpu + e_group_start + e_in_batch;
           float *src_ptr = w_mlp2_ptr +
                            1ll * pp_rank * layers_per_stage * total_experts * single_expert_elems +
@@ -473,8 +467,6 @@ void alloc_w_mlp2_ep(OurTransformerWeights *weights_total,
     }
   }
 
-  // --- 5. Dọn dẹp ---
-  // ... (logic dọn dẹp giữ nguyên như cũ)
   for (int i = 0; i < TOTAL_GPUS_NEEDED * BUFFER_MLP2; i++) {
     CHECK_HIP(hipEventSynchronize(copy_dones[i]));
   }

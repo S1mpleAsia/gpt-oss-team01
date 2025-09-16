@@ -1,6 +1,7 @@
 #include "../include/alloc.hpp"
 #include <cmath>
 #include <cstring>
+#include "../include/utils.hpp"
 
 #ifdef RUN_20B
 void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *weights,
@@ -485,11 +486,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
   float *w_mlp1_ptr = w->w_mlp1 + 1ll * pp_offset * (size_t)p->n_experts * 2 *
                                     (size_t)p->intermediate_dim * (size_t)p->hidden_dim;
-  /** w_mlp1
-    weights->w_mlp1 = new Tensor(
-      {layers_per_stage, experts_per_gpu, 2 * (size_t)p->intermediate_dim, (size_t)p->hidden_dim}, w_mlp1_ptr, device_id, DType::BF16
-    );
-  */
+  /* Tensor parallelism w_mlp1*/
   // {
   //   printf("Starting alloc mlp1\n");
   //   fflush(stdout);
@@ -539,15 +536,56 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   //   fflush(stdout);
   // }
 
+  /* Expert parallelism */
+  // {
+  //   printf("Starting alloc mlp1\n");
+  //   fflush(stdout);
+
+  //   size_t hidden_dim = p->hidden_dim;
+  //   size_t total_experts = p->n_experts;
+  //   size_t experts_per_gpu = total_experts / TP;
+  //   size_t inter_dim = p->intermediate_dim;
+
+  //   weights->w_mlp1 = new Tensor({layers_per_stage, experts_per_gpu, hidden_dim, 2 * inter_dim},
+  //                                stream, DType::BF16);
+  //   bf16 *d_buf = (bf16 *)(weights->w_mlp1->d_buf);
+
+  //   size_t tmp_elems = hidden_dim * 2 * inter_dim;
+  //   bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
+
+  //   for (size_t l = 0; l < layers_per_stage; l++) {
+  //     for (size_t e = 0; e < experts_per_gpu; e++) {
+  //       float *src_ptr = w_mlp1_ptr + l * total_experts * 2 * inter_dim * hidden_dim +
+  //                        tp_rank * experts_per_gpu * 2 * inter_dim * hidden_dim +
+  //                        e * 2 * inter_dim * hidden_dim;
+  //       for (size_t h = 0; h < hidden_dim; h++) {
+  //         for (size_t i = 0; i < 2 * inter_dim; i++) {
+  //           float value = src_ptr[i * hidden_dim + h];
+  //           tmp[h * 2 * inter_dim + i] = bf16(value);
+  //         }
+  //       }
+
+  //       size_t d_offset =
+  //         l * experts_per_gpu * hidden_dim * 2 * inter_dim + e * hidden_dim * 2 * inter_dim;
+
+  //       CHECK_HIP(
+  //         hipMemcpy(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16), hipMemcpyHostToDevice));
+  //     }
+  //   }
+
+  //   //   CHECK_HIP(hipStreamSynchronize(stream));
+  //   //   free(tmp);
+
+  //   printf("End alloc mlp1\n");
+  //   fflush(stdout);
+  // }
+
   // Initialize pointer with pipeline parallelism (pp) offset
   float *b_mlp1_ptr =
     w->b_mlp1 + 1ll * pp_offset * (size_t)p->n_experts * 2 * (size_t)p->intermediate_dim;
-  /** w->b_mlp1
-    weights->b_mlp1 = new Tensor(
-      {layers_per_stage, experts_per_gpu, 2 * (size_t)p->intermediate_dim},
-      b_mlp1_ptr, device_id, DType::BF16
-    );
-  */
+
+#ifndef RUN_EP
+  /* Tensor parallelism b_mlp1 */
   {
     printf("Starting alloc b_mlp1\n");
     fflush(stdout);
@@ -591,15 +629,53 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     printf("End alloc b_mlp1\n");
     fflush(stdout);
   }
+#else
+
+  /* Expert parallelism b_mlp1 */
+  {
+    printf("Starting alloc b_mlp1\n");
+    fflush(stdout);
+
+    size_t hidden_dim = p->hidden_dim;
+    size_t total_experts = p->n_experts;
+    size_t experts_per_gpu = total_experts / TP;
+    size_t inter_dim = p->intermediate_dim;
+
+    weights->b_mlp1 =
+      new Tensor({layers_per_stage, experts_per_gpu, 2 * inter_dim}, stream, DType::BF16);
+    bf16 *d_buf = (bf16 *)(weights->b_mlp1->d_buf);
+
+    size_t tmp_elems = 2 * inter_dim;
+    bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
+
+    for (size_t l = 0; l < layers_per_stage; l++) {
+      for (size_t e = 0; e < experts_per_gpu; e++) {
+        float *src_ptr = b_mlp1_ptr + l * total_experts * 2 * inter_dim +
+                         tp_rank * experts_per_gpu * 2 * inter_dim + e * 2 * inter_dim;
+
+        for (size_t i = 0; i < 2 * inter_dim; i++) {
+          float value = src_ptr[i];
+          tmp[i] = bf16(value);
+        }
+        size_t d_offset = l * experts_per_gpu * 2 * inter_dim + e * 2 * inter_dim;
+
+        CHECK_HIP(
+          hipMemcpy(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16), hipMemcpyHostToDevice));
+      }
+    }
+
+    CHECK_HIP(hipStreamSynchronize(stream));
+    free(tmp);
+    printf("End alloc b_mlp1\n");
+    fflush(stdout);
+  }
+#endif
 
   // Initialize pointer with pipeline parallelism (pp) offset
   float *w_mlp2_ptr = w->w_mlp2 + 1ll * pp_offset * (size_t)p->n_experts * (size_t)p->hidden_dim *
                                     (size_t)p->intermediate_dim;
-  /** w_mlp2
-    weights->w_mlp2 = new Tensor(
-      {layers_per_stage, experts_per_gpu, (size_t)p->hidden_dim, (size_t)p->intermediate_dim}, w_mlp2_ptr, device_id, DType::BF16
-    );
-  */
+
+  /* Tensor parallelism w_mlp2*/
   // {
   //   printf("Starting alloc mlp2\n");
   //   fflush(stdout);
@@ -648,10 +724,96 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   //   fflush(stdout);
   // }
 
+  /* Expert parallelism for w_mlp2 */
+  // {
+  //   printf("Starting alloc mlp2\n");
+  //   fflush(stdout);
+
+  //   size_t hidden_dim = p->hidden_dim;
+  //   size_t inter_dim = p->intermediate_dim;
+  //   size_t total_experts = p->n_experts;
+  //   size_t experts_per_gpu = total_experts / TP;
+
+  //   weights->w_mlp2 =
+  //     new Tensor({layers_per_stage, experts_per_gpu, inter_dim, hidden_dim}, stream, DType::BF16);
+  //   bf16 *d_buf = (bf16 *)weights->w_mlp2->d_buf;
+
+  //   size_t tmp_elems = inter_dim * hidden_dim;
+  //   bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
+
+  //   for (size_t l = 0; l < layers_per_stage; l++) {
+  //     for (size_t e = 0; e < experts_per_gpu; e++) {
+  //       float *src_ptr = w_mlp2_ptr + l * total_experts * hidden_dim * inter_dim +
+  //                        tp_rank * experts_per_gpu * hidden_dim * inter_dim +
+  //                        e * hidden_dim * inter_dim;
+
+  //       for (size_t i = 0; i < inter_dim; i++) {
+  //         for (size_t h = 0; h < hidden_dim; h++) {
+  //           float value = src_ptr[h * inter_dim + i];
+  //           tmp[i * hidden_dim + h] = bf16(value);
+  //         }
+  //       }
+
+  //       size_t d_offset = l * experts_per_gpu * inter_dim * hidden_dim + e * inter_dim * hidden_dim;
+  //       CHECK_HIP(
+  //         hipMemcpy(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16), hipMemcpyHostToDevice));
+  //     }
+  //   }
+
+  //   //   CHECK_HIP(hipStreamSynchronize(stream));
+  //   //   free(tmp);
+
+  //   printf("End alloc mlp2\n");
+  //   fflush(stdout);
+  // }
+
   // Initialize pointer with pipeline parallelism (pp) offset
   float *b_mlp2_ptr = w->b_mlp2 + 1ll * pp_offset * (size_t)p->n_experts * (size_t)p->hidden_dim;
+
+#ifndef RUN_EP
   weights->b_mlp2 = new Tensor({layers_per_stage, experts_per_gpu, (size_t)p->hidden_dim},
                                b_mlp2_ptr, stream, DType::BF16);
+
+#else
+  /* Expert parallelism b_mlp2*/
+  {
+    printf("Starting alloc b_mlp2\n");
+    fflush(stdout);
+
+    size_t hidden_dim = p->hidden_dim;
+    size_t total_experts = p->n_experts;
+    size_t experts_per_gpu = total_experts / TP;
+
+    weights->b_mlp2 =
+      new Tensor({layers_per_stage, experts_per_gpu, hidden_dim}, stream, DType::BF16);
+    bf16 *d_buf = (bf16 *)weights->b_mlp2->d_buf;
+
+    size_t tmp_elems = hidden_dim;
+    bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
+
+    for (size_t l = 0; l < layers_per_stage; l++) {
+      for (size_t e = 0; e < experts_per_gpu; e++) {
+        float *src_ptr = b_mlp2_ptr + l * total_experts * hidden_dim +
+                         tp_rank * experts_per_gpu * hidden_dim + e * hidden_dim;
+
+        for (size_t h = 0; h < hidden_dim; h++) {
+          float value = src_ptr[h];
+          tmp[h] = bf16(value);
+        }
+
+        size_t d_offset = l * experts_per_gpu * hidden_dim + e * hidden_dim;
+        CHECK_HIP(
+          hipMemcpy(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16), hipMemcpyHostToDevice));
+      }
+    }
+
+    CHECK_HIP(hipStreamSynchronize(stream));
+    free(tmp);
+
+    printf("End alloc b_mlp2\n");
+    fflush(stdout);
+  }
+#endif
 
   if (pp_rank + 1 == PP) {
     weights->rms_out_w = new Tensor({(size_t)p->hidden_dim}, w->rms_out_w, stream, DType::BF16);
@@ -785,6 +947,12 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->x_packed =
     new Tensor({(size_t)BATCH_SIZE * p->experts_per_token, (size_t)p->hidden_dim}, stream);
 
+#ifdef RUN_EP
+  rs->x_packed_local =
+    new Tensor({(size_t)BATCH_SIZE * p->experts_per_token, (size_t)p->hidden_dim}, stream);
+  rs->expert_offsets_local = new TensorI32({(size_t)(p->n_experts / TP + 1)}, stream);
+#endif
+
   rs->tokens_buf = new TensorI32({(size_t)BATCH_SIZE}, stream);
   CHECK_HIP(hipMalloc(&rs->max_rows, sizeof(int)));
 
@@ -813,8 +981,13 @@ void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunSt
   total_events->pp_sync = new hipEvent_t[TOTAL_GPUS_NEEDED];
 
 #ifndef RUN_20B
+#ifndef RUN_EP
   alloc_w_mlp1_final(weights, w->w_mlp1, p, total_streams);
   alloc_w_mlp2_final(weights, w->w_mlp2, p, total_streams);
+#else
+  alloc_w_mlp1_ep(weights, w->w_mlp1, p, total_streams);
+  alloc_w_mlp2_ep(weights, w->w_mlp2, p, total_streams);
+#endif
 #endif
 
 #pragma omp parallel for num_threads(TOTAL_GPUS_NEEDED)
