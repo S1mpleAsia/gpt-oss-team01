@@ -13,7 +13,8 @@ Tensor::Tensor(const vector<size_t> &shape_, hipStream_t stream, DType::Type dty
   CHECK_HIP(hipMemsetAsync(d_buf, 0, d_size, stream));
 }
 
-Tensor::Tensor(const vector<size_t> &shape_, float *buf_, hipStream_t stream, DType::Type dtype)
+Tensor::Tensor(const vector<size_t> &shape_, float *buf_, hipStream_t stream, DType::Type dtype,
+               bool to_device_init)
     : shape(shape_), buf(buf_), dtype(dtype), owns_host_buf(false) {
   ndim = shape_.size();
   size_t N_ = num_elem();
@@ -21,7 +22,39 @@ Tensor::Tensor(const vector<size_t> &shape_, float *buf_, hipStream_t stream, DT
   size_t d_size = (dtype == DType::FP32) ? N_ * sizeof(float) : N_ * sizeof(bf16);
   CHECK_HIP(hipMalloc(&d_buf, d_size));
 
-  to_device(stream);  // Copy to device with default stream
+  if (to_device_init)
+    to_device(stream);  // Copy to device with default stream
+}
+
+Tensor::Tensor(const vector<size_t> &shape_, float *buf_, bool batch_alloc, hipStream_t stream,
+               DType::Type dtype)
+    : shape(shape_), dtype(dtype) {
+  ndim = shape_.size();
+  size_t N_ = num_elem();
+
+  if (batch_alloc) {
+    this->buf = (float *)malloc(N_ * sizeof(float));
+    if (!this->buf) {
+      fprintf(stderr, "Failed to allocate host memory for batched tensor.\n");
+      std::abort();
+    }
+
+    // Calculate the number of elements for a single item in the batch.
+    size_t single_item_elements = N_ / shape[0];
+    size_t single_item_bytes = single_item_elements * sizeof(float);
+
+    // Copy the single item's data into each batch slot.
+    for (size_t i = 0; i < shape[0]; ++i) {
+      float *destination_pointer = this->buf + (i * single_item_elements);
+      memcpy(destination_pointer, buf_, single_item_bytes);
+    }
+  } else {
+    this->buf = buf_;
+  }
+
+  size_t d_size = (dtype == DType::FP32) ? N_ * sizeof(float) : N_ * sizeof(bf16);
+  CHECK_HIP(hipMalloc(&d_buf, d_size));
+  to_device(stream);
 }
 
 Tensor::~Tensor() {

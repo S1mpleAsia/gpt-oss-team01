@@ -6,12 +6,14 @@
 
 #include "tensor.hpp"
 // #include "config_run.hpp"
+#include "pipeline.hpp"
 
 #define BATCH_SIZE 128
 // #define PRINT_LOGITS
 // #define TIME_GPU
 // #define DEBUG
-#define RUN_20B
+// #define RUN_20B
+// #define RUN_EP
 
 #ifdef RUN_20B
 #define DP 8
@@ -20,7 +22,7 @@
 #else
 #define DP 1
 #define PP 1
-#define TP 2
+#define TP 4
 #endif
 #define TOTAL_GPUS_NEEDED ((DP) * (PP) * (TP))
 #define TOTAL_PIPELINES ((PP) * (TP))
@@ -70,10 +72,10 @@ typedef struct {
   Tensor *x;   // activation at current time stamp (hidden_dim, )
   Tensor *t;   // same, but inside a residual branch (hidden_dim, )
   Tensor *tb;  // (head_dim * n_attn_heads, )
-  Tensor *tb_buf;
+  // Tensor *tb_buf;
   Tensor *tb2;  // (hidden_dim, )
   Tensor *tb2_buf;
-  Tensor *tb3;  // (n_experts, hidden_dim)
+  Tensor *tb3;  // (BATCH_SIZE, experts_per_token)
   Tensor *tb3_buf;
   Tensor *router_score;  // router score (n_experts, )
   Tensor *topk_v;        // topk expert weights (experts_per_token, )
@@ -102,10 +104,13 @@ typedef struct {
   TensorI32 *sorted_pair_ids;  // [batch_size * experts_per_token]
   TensorI32 *expert_offsets;   // [n_experts + 1]
   Tensor *x_packed;            // [batch_size * experts_per_token, hidden_dim]
+  Tensor *x_packed_local;
+  TensorI32 *expert_offsets_local;
   int *max_rows;
 
   // Multi-GPU related
   TensorI32 *tokens_buf;
+  PipelineEach *pipeline_each;
 } OurRunState;
 
 typedef struct {
@@ -113,7 +118,7 @@ typedef struct {
   long long *local_token_ptr;
   int start_idx;
   int end_idx;
-  pthread_barrier_t tp_barrier;
+  pthread_barrier_t *tp_barrier;
 } OnePathArgs;
 
 typedef struct {
