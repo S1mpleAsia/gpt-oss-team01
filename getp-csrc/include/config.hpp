@@ -13,17 +13,17 @@
 // #define PRINT_LOGITS
 // #define TIME_GPU
 // #define DEBUG
-#define RUN_20B
+// #define RUN_20B
 // #define RUN_EP
 
 #ifdef RUN_20B
-#define DP 8
+#define DP 1
 #define PP 1
 #define TP 1
 #else
 #define DP 1
 #define PP 1
-#define TP 2
+#define TP 4
 #endif
 #define TOTAL_GPUS_NEEDED ((DP) * (PP) * (TP))
 #define TOTAL_PIPELINES ((PP) * (TP))
