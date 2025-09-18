@@ -369,18 +369,32 @@ void qkv_gemm_batched_v2(Tensor *x,            // Shape: [batch_size, hidden_dim
   const bf16 *b_qkv_ptr = (const bf16 *)b_qkv->d_buf + 1ll * layer_offset * out_features;
   float *qkv_ptr = (float *)qkv->d_buf;
   {
+#ifdef RUN_20B
+    constexpr int BM = 32;
+    constexpr int BN = 128;
+    constexpr int BK = 32;
+    constexpr int TM = 32;
+    constexpr int TN = 32;
+    constexpr int blockDim = 256;  // = 64 * (BM / TM) * (BN / TN)
+#else
     constexpr int BM = 16;
     constexpr int BN = 128;
     constexpr int BK = 32;
     constexpr int TM = 16;
     constexpr int TN = 16;
     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
+#endif
 
     dim3 block_size(blockDim);
     dim3 grid_size((out_features + BN - 1) / BN, ((cur_batch_size + BM - 1) / BM));
 
+#ifdef RUN_20B
+    gemm_mfma_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+      x_ptr, w_qkv_ptr, qkv_ptr, b_qkv_ptr, cur_batch_size, out_features, in_features);
+#else
     gemm_mfma<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
       x_ptr, w_qkv_ptr, qkv_ptr, b_qkv_ptr, cur_batch_size, out_features, in_features);
+#endif
   }
 
   // {
@@ -945,18 +959,32 @@ void attn_out_project_batched_v2(Tensor *tb,         // Shape: [batch_size, n_at
   float *y_ptr = (float *)y->d_buf;
 
   {
+#ifdef RUN_20B
+    constexpr int BM = 32;
+    constexpr int BN = 128;
+    constexpr int BK = 32;
+    constexpr int TM = 32;
+    constexpr int TN = 32;
+    constexpr int blockDim = 256;  // = 64 * (BM / TM) * (BN / TN)
+#else
     constexpr int BM = 16;
     constexpr int BN = 128;
     constexpr int BK = 32;
     constexpr int TM = 16;
     constexpr int TN = 16;
     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
+#endif
 
     dim3 block_size(blockDim);
     dim3 grid_size((out_features + BN - 1) / BN, ((cur_batch_size + BM - 1) / BM));
 
+#ifdef RUN_20B
+    gemm_mfma_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+      tb_ptr, w_o_ptr, y_ptr, b_o_ptr, cur_batch_size, out_features, in_features);
+#else
     gemm_mfma<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
       tb_ptr, w_o_ptr, y_ptr, b_o_ptr, cur_batch_size, out_features, in_features);
+#endif
   }
 
   // {
