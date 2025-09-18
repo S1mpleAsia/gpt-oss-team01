@@ -155,6 +155,43 @@ float *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flo
 
 #else
 
+void all_gather_x(
+  OurRunState *rs_now, OurRunState *rs_leader, int tp_rank,
+  int cur_device, int cur_batch_size, pthread_barrier_t *tp_barrier,
+  hipStream_t stream, hipEvent_t tp_ready, hipEvent_t tp_finish
+) {
+  float *d_embed_buf[TP];
+  float *d_buf_ptr = (float *)rs_now->x->d_buf;
+  int leader_device = cur_device - tp_rank;
+
+  size_t offset_buf = 1ll * rs_now->x->shape[1];
+  size_t offset_d_buf = 1ll * rs_now->x_embed_buf->shape[1];
+  size_t elems = 1ll * offset_d_buf * sizeof(float);
+
+  for (int i = 0; i < TP; i++) {
+    d_embed_buf[i] = (float *)(rs_leader + i)->x_embed_buf->d_buf;
+  }
+
+  CHECK_HIP(hipEventRecord(tp_ready));
+
+  pthread_barrier_wait(tp_barrier);
+
+  for (int i = 0; i < TP; i++) {
+    hipEvent_t tp_ready_each = total_events->tp_ready[leader_device + i];
+    CHECK_HIP(hipStreamWaitEvent(stream, tp_ready_each));
+  }
+
+  for (int b = 0; b < cur_batch_size; b++) {
+    for (int i = 0; i < TP; i++) {
+      CHECK_HIP(hipMemcpyPeerAsync(
+        d_buf_ptr, cur_device, d_embed_buf[i], leader_device + i, elems, stream
+      ));
+      d_embed_buf[i] += offset_d_buf;
+      d_buf_ptr += offset_d_buf;
+    }
+  }
+}
+
 void reduce_tb3(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
                 int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream,
                 hipEvent_t tp_ready, hipEvent_t tp_finish) {
@@ -542,7 +579,8 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
 
   if (pp_rank == 0) {
     embedding_lookup_batched(weights_now->token_embedding_table, tokens, rs_now->tokens_buf,
-                             rs_now->x, cur_batch_size, false, stream);
+                             rs_now->x_embed_buf, cur_batch_size, false, stream);
+    all_gather_x(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready, tp_finish);
   } else {
     rs_now->pipeline_each->dequeue(rs_now->x, stream);
   }

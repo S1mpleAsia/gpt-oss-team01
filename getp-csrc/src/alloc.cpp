@@ -179,6 +179,8 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
                         hipStream_t stream) {
   CHECK_HIP(hipSetDevice(device_id));
 
+  rs->x_embed_buf = nullptr;
+
   rs->x = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
 
   rs->t = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
@@ -270,8 +272,57 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
   // Create Tensor wrappers for weight matrices
   if (pp_rank == 0) {
-    weights->token_embedding_table = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim},
-                                                w->token_embedding_table, stream, DType::BF16);
+    {
+      printf("Starting alloc token_embedding_table...\n");
+      fflush(stdout);
+
+      size_t vocab_size = p->vocab_size;
+      size_t hidden_dim = p->hidden_dim;
+      size_t hidden_shard = hidden_dim / TP;
+      weights->token_embedding_table = new Tensor(
+        {vocab_size, hidden_shard},
+        w->token_embedding_table, stream, DType::BF16, false
+      );
+
+      size_t offset_orig = 1ll * hidden_dim;
+      size_t offset_d = 1ll * hidden_shard;
+
+      float *w_embed_ptr = (float *)w->token_embedding_table + tp_rank * offset_d;
+      bf16 *w_embed_d_ptr = (bf16 *)weights->token_embedding_table->d_buf;
+
+      bf16 *tmp = (bf16 *)malloc(hidden_shard * sizeof(bf16));
+
+      hipEvent_t finish_env;
+      CHECK_HIP(hipEventCreate(&finish_env));
+
+      for (int v_id = 0; v_id < vocab_size; v_id++) {
+        if (v_id > 0) {
+          CHECK_HIP(hipEventSynchronize(finish_env));
+        }
+        
+        #pragma omp simd
+        for (int h = 0; h < hidden_shard; h++) {
+          tmp[h] = w_embed_ptr[h];
+        }
+
+        CHECK_HIP(hipMemcpyAsync(
+          w_embed_d_ptr, tmp, hidden_shard * sizeof(bf16),
+          hipMemcpyHostToDevice, stream
+        ));
+        CHECK_HIP(hipEventRecord(finish_env, stream));
+
+        w_embed_ptr += offset_orig;
+        w_embed_d_ptr += offset_d;
+      }
+
+      CHECK_HIP(hipEventSynchronize(finish_env));
+
+      free(tmp);
+      CHECK_HIP(hipEventDestroy(finish_env));
+      
+      printf("Finish alloc token_embedding_table\n");
+      fflush(stdout);
+    }
   } else {
     weights->token_embedding_table = nullptr;
   }
@@ -416,6 +467,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
 #ifndef RUN_EP
   /* Tensor parallelism w_mlp1*/
+  /*
   {
     printf("Starting alloc mlp1\n");
     fflush(stdout);
@@ -464,8 +516,10 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     printf("End alloc mlp1\n");
     fflush(stdout);
   }
+  */
 #else
   /* Expert parallelism */
+  /*
   {
     printf("Starting alloc mlp1\n");
     fflush(stdout);
@@ -508,6 +562,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     printf("End alloc mlp1\n");
     fflush(stdout);
   }
+  */
 #endif
 
   // Initialize pointer with pipeline parallelism (pp) offset
@@ -606,6 +661,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
 #ifndef RUN_EP
   /* Tensor parallelism w_mlp2*/
+  /*
   {
     printf("Starting alloc mlp2\n");
     fflush(stdout);
@@ -653,8 +709,10 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     printf("End alloc mlp2\n");
     fflush(stdout);
   }
+  */
 #else
   /* Expert parallelism for w_mlp2 */
+  /*
   {
     printf("Starting alloc mlp2\n");
     fflush(stdout);
@@ -696,6 +754,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     printf("End alloc mlp2\n");
     fflush(stdout);
   }
+  */
 #endif
 
   // Initialize pointer with pipeline parallelism (pp) offset
@@ -797,6 +856,10 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   CHECK_HIP(hipSetDevice(device_id));
   int pp_rank = (device_id % TOTAL_PIPELINES) / TP;
   int tp_rank = device_id % TP;
+
+  // x_embed_buf
+  rs->x_embed_buf = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / TP}, stream);
+
   // Create Tensor wrappers for state buffers
   rs->x = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
 
@@ -824,7 +887,7 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->topk_i = new TensorI32({BATCH_SIZE, (size_t)p->experts_per_token}, stream);
 
   rs->mlp1_out =
-    new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, 2 * (size_t)p->intermediate_dim}, stream);
+    new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, 2 * (size_t)p->intermediate_dim / TP}, stream);
 
   // rs->gate =
   //   new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
@@ -832,7 +895,7 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   //   new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
 
   rs->gate_up =
-    new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
+    new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim / TP}, stream);
 
   rs->e_agg = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
   if (device_id % TP == 0) {
@@ -924,15 +987,15 @@ void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunSt
   total_events->tp_finish = new hipEvent_t[TOTAL_GPUS_NEEDED];
   total_events->pp_sync = new hipEvent_t[TOTAL_GPUS_NEEDED];
 
-  // #ifndef RUN_20B
-  // #ifndef RUN_EP
-  //   alloc_w_mlp1_final(weights, w->w_mlp1, p, total_streams);
-  //   alloc_w_mlp2_final(weights, w->w_mlp2, p, total_streams);
-  // #else
-  //   alloc_w_mlp1_ep(weights, w->w_mlp1, p, total_streams);
-  //   alloc_w_mlp2_ep(weights, w->w_mlp2, p, total_streams);
-  // #endif
-  // #endif
+  #ifndef RUN_20B
+  #ifndef RUN_EP
+    alloc_w_mlp1_final(weights, w->w_mlp1, p, total_streams);
+    alloc_w_mlp2_final(weights, w->w_mlp2, p, total_streams);
+  #else
+    alloc_w_mlp1_ep(weights, w->w_mlp1, p, total_streams);
+    alloc_w_mlp2_ep(weights, w->w_mlp2, p, total_streams);
+  #endif
+  #endif
 
 #pragma omp parallel for num_threads(TOTAL_GPUS_NEEDED)
   for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
@@ -942,16 +1005,18 @@ void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunSt
     CHECK_HIP(hipStreamCreate(&total_streams[i]));
     CHECK_HIP(hipEventCreate(&(total_events->tp_ready[i])));
     CHECK_HIP(hipEventCreate(&(total_events->tp_finish[i])));
-    CHECK_HIP(hipEventCreate(&(total_events->pp_sync[i])));
     our_init_weights(w, p, &weights[i], i, total_streams[i]);
     our_init_run_state(s, p, &rs[i], i, total_streams[i]);
 #else
     CHECK_HIP(hipStreamCreate(&total_streams[i]));
     CHECK_HIP(hipEventCreate(&(total_events->tp_ready[i])));
     CHECK_HIP(hipEventCreate(&(total_events->tp_finish[i])));
-    CHECK_HIP(hipEventCreate(&(total_events->pp_sync[i])));
+    if (PP > 1) {
+      CHECK_HIP(hipEventCreate(&(total_events->pp_sync[i])));
+    }
     our_init_weights(w, p, &weights[i], i, total_streams[i]);
     our_init_run_state(s, p, &rs[i], i, total_streams[i]);
+    check_gpu_memory();
 #endif
   }
 }
@@ -991,6 +1056,8 @@ void our_free_each(OurTransformerWeights *weights, OurRunState *rs) {
     delete weights->out;
 
   // delete rs
+  if (rs->x_embed_buf)
+    delete rs->x_embed_buf;
   if (rs->x)
     delete rs->x;
   if (rs->t)
@@ -1068,7 +1135,9 @@ void our_free(OurTransformerWeights *weights, OurRunState *rs, hipStream_t *tota
     CHECK_HIP(hipStreamDestroy(total_streams[i]));
     CHECK_HIP(hipEventDestroy(total_events->tp_ready[i]));
     CHECK_HIP(hipEventDestroy(total_events->tp_finish[i]));
-    CHECK_HIP(hipEventDestroy(total_events->pp_sync[i]));
+    if (PP > 1) {
+      CHECK_HIP(hipEventDestroy(total_events->pp_sync[i]));
+    }
 
     our_free_each(&weights[i], &rs[i]);
 

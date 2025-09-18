@@ -8,8 +8,8 @@
 // #include "config_run.hpp"
 #include "pipeline.hpp"
 
-#define BATCH_SIZE 256
-#define KV16
+#define BATCH_SIZE 32
+// #define KV16
 // #define PRINT_LOGITS
 // #define TIME_GPU
 // #define DEBUG
@@ -70,6 +70,7 @@ typedef struct {
   Tensor *sin_tensor;
 
   // current wave of activations
+  Tensor *x_embed_buf; // (hidden_dim / TP)
   Tensor *x;   // activation at current time stamp (hidden_dim, )
   Tensor *t;   // same, but inside a residual branch (hidden_dim, )
   Tensor *tb;  // (head_dim * n_attn_heads, )

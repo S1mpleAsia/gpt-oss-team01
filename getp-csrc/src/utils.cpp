@@ -60,10 +60,13 @@ void check_gpu_memory() {
   double total_gb = (double)total_bytes / (1024.0 * 1024.0 * 1024.0);
   double used_gb = total_gb - free_gb;
 
-  printf("GPU Memory Info:\n");
-  printf(" - Total: %lf GB\n", total_gb);
-  printf(" - Used: %lf GB\n", used_gb);
-  printf(" - Free: %lf GB\n", free_gb);
+  #pragma omp critical
+  {
+    printf("GPU Memory Info:\n");
+    printf(" - Total: %lf GB\n", total_gb);
+    printf(" - Used: %lf GB\n", used_gb);
+    printf(" - Free: %lf GB\n", free_gb);
+  }
 }
 
 double get_time_kernel() {
