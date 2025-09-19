@@ -219,8 +219,7 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
                         cur_batch_size, 1ll * l, false, false,
                         stream);  // This kernel diverges the most
 
-    // all_gather_qkv_v2(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream,
-    //                   tp_ready, tp_finish);
+    // all_gather_qkv_v2(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready, tp_finish);
 
 #ifdef DEBUG
     if (flag)
@@ -262,7 +261,7 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
     attn_out_project_batched_v2(rs_now->tb, weights_now->w_o, weights_now->b_o, rs_now->tb2,
                                 tp_rank == 0, cur_batch_size, 1ll * l, false, false, stream);
 
-    reduce_tb2(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready,
+    reduce_tb2_new(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready,
                tp_finish);
 
 #ifdef DEBUG
@@ -403,7 +402,7 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
     all_gather_tb3(rs_now, rs_leader, tp_rank, cur_device, p, tp_barrier, stream, tp_ready,
                    tp_finish);
 #else
-    reduce_tb3(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready,
+    reduce_tb3_new(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready,
                tp_finish);
 #endif
 

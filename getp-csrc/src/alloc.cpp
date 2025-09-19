@@ -870,16 +870,16 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   // rs->tb_buf = new Tensor({BATCH_SIZE, (size_t)p->head_dim * p->n_attn_heads / TP}, stream);
 
   rs->tb2 = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
-  if (device_id % TP == 0) {
-    rs->tb2_buf = new Tensor({(TP - 1), BATCH_SIZE, (size_t)p->hidden_dim}, stream);
+  if (tp_rank % 2 == 0 && TP > 1) {
+    rs->tb2_buf = new Tensor({TP / 2, BATCH_SIZE, (size_t)p->hidden_dim}, stream);
   } else {
     rs->tb2_buf = nullptr;
   }
 
   rs->tb3 = new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
-  if (device_id % TP == 0) {
+  if (tp_rank % 2 == 0 && TP > 1) {
     rs->tb3_buf = new Tensor(
-      {(TP - 1), BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
+      {TP / 2, BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
   } else {
     rs->tb3_buf = nullptr;
   }
