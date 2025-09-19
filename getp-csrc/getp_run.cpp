@@ -8,6 +8,7 @@
 #include "src/alloc_utils.cpp"
 #include "src/utils.cpp"
 #include "src/pipeline.cpp"
+#include "src/parallelism.cpp"
 #include "src/kernel.cpp"
 #include "src/flash_attn_hip.cpp"
 

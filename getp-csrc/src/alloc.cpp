@@ -998,8 +998,8 @@ void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunSt
 
   #ifndef RUN_20B
   #ifndef RUN_EP
-    // alloc_w_mlp1_final(weights, w->w_mlp1, p, total_streams);
-    // alloc_w_mlp2_final(weights, w->w_mlp2, p, total_streams);
+    alloc_w_mlp1_final(weights, w->w_mlp1, p, total_streams);
+    alloc_w_mlp2_final(weights, w->w_mlp2, p, total_streams);
   #else
     alloc_w_mlp1_ep(weights, w->w_mlp1, p, total_streams);
     alloc_w_mlp2_ep(weights, w->w_mlp2, p, total_streams);
