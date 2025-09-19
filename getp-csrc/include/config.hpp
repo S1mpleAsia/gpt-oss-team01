@@ -118,6 +118,8 @@ typedef struct {
   Tensor *g_fa_pmax;  // [batch_size, n_attn_heads, c_max]
   Tensor *g_fa_psum;  // [batch_size, n_attn_heads, c_max]
   Tensor *g_fa_pnum;  // [batch_size, n_attn_heads, c_max, head_dim]
+
+  float *logits_out;
 } OurRunState;
 
 typedef struct {

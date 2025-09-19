@@ -251,6 +251,8 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->g_fa_pmax = new Tensor({BATCH_SIZE, shard_attn_heads, c_max}, stream);
   rs->g_fa_psum = new Tensor({BATCH_SIZE, shard_attn_heads, c_max}, stream);
   rs->g_fa_pnum = new Tensor({BATCH_SIZE, shard_attn_heads, c_max, head_dim}, stream);
+
+  rs->logits_out = nullptr;
 }
 
 #else
@@ -912,7 +914,7 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   // rs->v = new Tensor({BATCH_SIZE, (size_t)p->n_kv_heads * p->head_dim / TP}, stream);
 
   // rs->att = new Tensor({BATCH_SIZE, (size_t)p->n_attn_heads, (size_t)p->seq_len}, stream);
-  rs->logits = new Tensor({BATCH_SIZE, (size_t)p->vocab_size}, stream);
+  rs->logits = nullptr; // new Tensor({BATCH_SIZE, (size_t)p->vocab_size}, stream);
   rs->tmp_logits = new Tensor({BATCH_SIZE, (size_t)p->vocab_size / TP}, stream);
 
 #ifdef KV16
@@ -972,6 +974,13 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->g_fa_pmax = new Tensor({BATCH_SIZE, shard_attn_heads, c_max}, stream);
   rs->g_fa_psum = new Tensor({BATCH_SIZE, shard_attn_heads, c_max}, stream);
   rs->g_fa_pnum = new Tensor({BATCH_SIZE, shard_attn_heads, c_max, head_dim}, stream);
+
+  rs->logits_out = nullptr;
+  if (tp_rank == 0 && pp_rank == PP - 1) {
+    CHECK_HIP(hipHostMalloc((void**)&rs->logits_out,
+                        BATCH_SIZE * (size_t)p->vocab_size * sizeof(float),
+                        hipHostMallocMapped));
+  }
 }
 
 #endif
@@ -989,8 +998,8 @@ void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunSt
 
   #ifndef RUN_20B
   #ifndef RUN_EP
-    alloc_w_mlp1_final(weights, w->w_mlp1, p, total_streams);
-    alloc_w_mlp2_final(weights, w->w_mlp2, p, total_streams);
+    // alloc_w_mlp1_final(weights, w->w_mlp1, p, total_streams);
+    // alloc_w_mlp2_final(weights, w->w_mlp2, p, total_streams);
   #else
     alloc_w_mlp1_ep(weights, w->w_mlp1, p, total_streams);
     alloc_w_mlp2_ep(weights, w->w_mlp2, p, total_streams);
@@ -1123,6 +1132,10 @@ void our_free_each(OurTransformerWeights *weights, OurRunState *rs) {
   }
   if (rs->g_fa_pnum) {
     delete rs->g_fa_pnum;
+  }
+
+  if (rs->logits_out) {
+    CHECK_HIP(hipHostFree(rs->logits_out));
   }
 }
 

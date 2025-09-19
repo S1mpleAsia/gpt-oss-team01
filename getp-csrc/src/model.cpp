@@ -371,6 +371,31 @@ void all_gather_classifier_v2(OurRunState *rs_now, OurRunState *rs_leader, int t
   pthread_barrier_wait(tp_barrier);
 }
 
+void all_gather_classifier_final(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank,
+                              int cur_device, int cur_batch_size, pthread_barrier_t *tp_barrier,
+                              hipStream_t stream, hipEvent_t tp_ready, hipEvent_t tp_finish) {
+  size_t shard_vocab_size = rs_now->tmp_logits->shape[1];
+  size_t vocab_size = shard_vocab_size * TP;
+
+  size_t width_bytes = shard_vocab_size * sizeof(float);
+  size_t height = cur_batch_size;
+
+  const void *src_buf = rs_now->tmp_logits->d_buf;
+  size_t src_pitch = width_bytes;
+
+  float *dst_base_buf = (float *)rs_leader->logits_out;
+  size_t dst_pitch = vocab_size * sizeof(float);
+
+  void *dst_buf = (void *)(dst_base_buf + tp_rank * shard_vocab_size);
+
+  CHECK_HIP(hipMemcpy2DAsync(dst_buf, dst_pitch, src_buf, src_pitch, width_bytes, height,
+                             hipMemcpyDeviceToHost, stream));
+  
+  CHECK_HIP(hipStreamSynchronize(stream));
+                             
+  pthread_barrier_wait(tp_barrier);
+}
+
 void all_gather_qkv_v2(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
                        int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream,
                        hipEvent_t tp_ready, hipEvent_t tp_finish) {
@@ -840,27 +865,11 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
     classifier_gemm_batched_v2(weights_now->out_buffer, rs_now->x, rs_now->tmp_logits,
                                cur_batch_size, false, false, stream);
 
-    {
-      // GpuTimer timer("gather_classifier");
-      all_gather_classifier_v2(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier,
+    all_gather_classifier_final(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier,
                                stream, tp_ready, tp_finish);
-    }
+                      
 
-    if (tp_rank == 0) {
-      CHECK_HIP(hipSetDevice(cur_device));
-      rs_now->logits->from_device(stream);
-      return rs_now->logits->buf;
-    }
-
-#ifdef DEBUG
-    if (flag) {
-      printf("Finish DEBUG\n");
-      fflush(stdout);
-      exit(1);
-    }
-#endif
-
-    return rs_now->logits->buf;
+    return rs_leader->logits_out;
   } else {
     CHECK_HIP(hipEventRecord(pp_sync, stream));
     OurRunState *rs_new = &rs[cur_device + TP];
