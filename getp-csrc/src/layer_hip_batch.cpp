@@ -677,6 +677,17 @@ __global__ void add_vector_kernel_batched(float *y, const float *b, int len) {
   }
 }
 
+__global__ void add_vector_2d_kernel(float *__restrict__ dst, const float *__restrict__ src,
+                                     int height, int width, int dst_stride) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= height * width)
+    return;
+
+  int r = i / width;
+  int c = i % width;
+  dst[r * dst_stride + c] += src[r * width + c];
+}
+
 void add_vector_batched(Tensor *y,  // Shape: [batch_size, hidden_dim]
                         Tensor *b,  // Shape: [batch_size, hidden_dim]
                         int cur_batch_size, bool y_to_device, bool b_to_device, bool y_from_device,

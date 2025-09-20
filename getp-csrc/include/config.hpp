@@ -8,16 +8,16 @@
 // #include "config_run.hpp"
 #include "pipeline.hpp"
 
-#define BATCH_SIZE 512
-#define KV16
+#define BATCH_SIZE 32
+// #define KV16
 // #define PRINT_LOGITS
 // #define TIME_GPU
 // #define DEBUG
-#define RUN_20B
+// #define RUN_20B
 // #define RUN_EP
 
 #ifdef RUN_20B
-#define DP 8
+#define DP 1
 #define PP 1
 #define TP 1
 #else
@@ -76,6 +76,7 @@ typedef struct {
   // Tensor *tb_buf;
   Tensor *tb2;  // (hidden_dim, )
   Tensor *tb2_buf;
+  Tensor *tb2_recv;
   Tensor *tb3;  // (BATCH_SIZE, experts_per_token)
   Tensor *tb3_buf;
   Tensor *router_score;  // router score (n_experts, )
@@ -136,6 +137,11 @@ typedef struct {
   int id;
   float *logits;
   pthread_barrier_t *tp_barrier;
+
+  int *pos_ptr;
+  bool *finished_ptr;
+  pthread_barrier_t *start_barrier;
+  pthread_barrier_t *end_barrier;
 } OnePathInsideArgs;
 
 typedef struct {

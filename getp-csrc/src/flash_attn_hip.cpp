@@ -263,6 +263,279 @@ void single_query_attn_flash_batched(Tensor *q, Tensor *K_cache, Tensor *V_cache
     CHECK_HIP(hipStreamSynchronize(stream));
   }
 }
+
+__device__ __forceinline__ double warp_reduce_sum64(double v) {
+  for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+    v += __shfl_down(v, offset);
+  }
+
+  return v;
+}
+
+__device__ __forceinline__ double warp_reduce_max64(double v) {
+  for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+    v = fmax(v, __shfl_down(v, offset));
+  }
+
+  return v;
+}
+
+template <int tile_num_queries, int tile_num_kv, int head_dim = 64>
+__global__ void flash_attn_2d_kernel(const float *__restrict__ q,
+                                     const bf16 *__restrict__ key_cache,
+                                     const bf16 *__restrict__ value_cache,
+                                     const float *__restrict__ attn_sinks, float *__restrict__ tb,
+                                     int batch_size, int n_attn_heads, int kv_mul, int kv_dim,
+                                     int seq_len, int n_layers, int pos_begin, int pos_end) {
+  const int b = blockIdx.y;
+  if (b >= batch_size)
+    return;
+
+  const int head_group = blockIdx.x;
+  const int base_head = head_group * tile_num_queries;
+
+  const int lane = threadIdx.x % 64;
+  const int row = threadIdx.x >> 6;  // For each query head tile
+  if (row >= tile_num_queries)
+    return;
+
+  const int h = base_head + row;
+  if (h >= n_attn_heads)
+    return;
+
+  const int kv_head = h / kv_mul;
+  const size_t kv_head_offset = kv_head * head_dim;
+  const float *q_ptr = q + b * n_attn_heads * head_dim;
+  float *tb_ptr = tb + b * n_attn_heads * head_dim;
+  const float *q_head_ptr = q_ptr + h * head_dim;
+  float *out_head_ptr = tb_ptr + h * head_dim;
+
+  const bf16 *k_cache_ptr = key_cache + (size_t)b * n_layers * seq_len * kv_dim;
+  const bf16 *v_cache_ptr = value_cache + (size_t)b * n_layers * seq_len * kv_dim;
+
+  const int active_len = (pos_end - pos_begin > 0) ? (pos_end - pos_begin) : 0;
+  if (active_len == 0) {
+    for (int i = lane; i < head_dim; i += 64)
+      out_head_ptr[i] = 0.f;
+    return;
+  }
+
+  extern __shared__ unsigned char shmem[];
+
+  // Initalize for local compute
+  float *local_q = reinterpret_cast<float *>(shmem);
+  bf16 *local_k = reinterpret_cast<bf16 *>(local_q + tile_num_queries * head_dim);
+  bf16 *local_v = local_k + 2 * tile_num_kv * head_dim;
+
+  float *local_out = reinterpret_cast<float *>(local_v + 2 * tile_num_kv * head_dim);
+
+  for (int i = lane; i < head_dim; i += WARP_SIZE) {
+    local_q[row * head_dim + i] = q_head_ptr[i];
+  }
+
+  double m_i = -DBL_MAX;
+  double l_i = 0.0;
+  for (int i = lane; i < head_dim; i += WARP_SIZE) {
+    local_out[row * head_dim + i] = 0.f;
+  }
+  __syncthreads();
+
+  const int num_kv_tiles = (active_len + tile_num_kv - 1) / tile_num_kv;
+  int cur = 0, next = 1;
+
+  // Prefetch tile 0
+  {
+    const int t0 = 0;
+    const int t1 = (tile_num_kv > active_len) ? active_len : tile_num_kv;
+
+    for (int pos = threadIdx.x; pos < (t1 - t0) * head_dim; pos += blockDim.x) {
+      size_t local_pos = pos / head_dim;
+      size_t d = pos % head_dim;
+      size_t global_pos = pos_begin + t0 + local_pos;
+      size_t base = global_pos * kv_dim + kv_head_offset + d;
+
+      local_k[cur * tile_num_kv * head_dim + local_pos * head_dim + d] = k_cache_ptr[base];
+      local_v[cur * tile_num_kv * head_dim + local_pos * head_dim + d] = v_cache_ptr[base];
+    }
+  }
+  __syncthreads();
+
+  const float inv_sqrt_d = rsqrtf((float)head_dim);
+
+  for (int kv_tile = 0; kv_tile < num_kv_tiles; kv_tile++) {
+    const int t0 = kv_tile * tile_num_kv;
+    const int t1 = (t0 + tile_num_kv > active_len) ? active_len : (t0 + tile_num_kv);
+    const int tile_len = t1 - t0;
+
+    if (kv_tile + 1 < num_kv_tiles) {
+      const int u0 = (kv_tile + 1) * tile_num_kv;
+      const int u1 = (u0 + tile_num_kv > active_len) ? active_len : (u0 + tile_num_kv);
+
+      for (int pos = threadIdx.x; pos < (u1 - u0) * head_dim; pos += blockDim.x) {
+        size_t local_pos = pos / head_dim;
+        size_t d = pos % head_dim;
+        size_t global_pos = pos_begin + u0 + local_pos;
+        size_t base = global_pos * kv_dim + kv_head_offset + d;
+        local_k[next * tile_num_kv * head_dim + local_pos * head_dim + d] = k_cache_ptr[base];
+        local_v[next * tile_num_kv * head_dim + local_pos * head_dim + d] = v_cache_ptr[base];
+      }
+    }
+
+    __syncthreads();
+
+    double local_max = -DBL_MAX;
+    for (int tt = 0; tt < tile_len; tt++) {
+      const bf16 *k_vec = &local_k[cur * tile_num_kv * head_dim + tt * head_dim];
+      double part = 0.0;
+
+      // Compute element wise of Q.K
+      for (int d = lane * 2; d < head_dim; d += WARP_SIZE * 2) {
+        const uint32_t pk = ld_u32(reinterpret_cast<const uint32_t *>(k_vec + d));
+        const uint16_t u0 = (uint16_t)(pk & 0xFFFF);
+        const uint16_t u1 = (uint16_t)(pk >> 16);
+
+        float q0 = local_q[row * head_dim + d];
+        float q1 = (d + 1 < head_dim) ? local_q[row * head_dim + d + 1] : 0.0f;
+
+        part = fmaf(q0, bf16_to_f32_bits(u0), part);
+        part = fmaf(q1, bf16_to_f32_bits(u1), part);
+      }
+
+      double score = warp_reduce_sum64(part);
+      if (lane == 0) {
+        score *= (double)inv_sqrt_d;
+      }
+
+      score = __shfl(score, 0);
+      local_max = fmax(local_max, score);
+    }
+
+    // Max score of tile
+    double m_tile_row = warp_reduce_max64(local_max);
+
+    const double m_new = fmax(m_i, m_tile_row);
+    const double alpha = isfinite(m_i) ? exp(m_i - m_new) : 0.0;
+    const double beta = exp(m_tile_row - m_new);
+
+    if (lane == 0) {
+      l_i *= alpha;
+    }
+
+    for (int i = lane; i < head_dim; i += WARP_SIZE) {
+      local_out[row * head_dim + i] = (float)((double)local_out[row * head_dim + i] * alpha);
+    }
+
+    double l_tile_sum = 0.0;
+    for (int out_col = lane * 2; out_col < head_dim; out_col += WARP_SIZE * 2) {
+      double acc0 = 0.0, acc1 = 0.0;
+
+      for (int tt = 0; tt < tile_len; tt++) {
+        const bf16 *k_vec = &local_k[cur * tile_num_kv * head_dim + tt * head_dim];
+
+        double part = 0.0;
+        for (int d = 0; d < head_dim; d += 2) {
+          const uint32_t pk = ld_u32(reinterpret_cast<const uint32_t *>(k_vec + d));
+          const uint16_t u0 = (uint16_t)(pk & 0xFFFF);
+          const uint16_t u1 = (uint16_t)(pk >> 16);
+
+          float q0 = local_q[row * head_dim + d];
+          float q1 = local_q[row * head_dim + d + 1];
+          part = fmaf(q0, bf16_to_f32_bits(u0), part);
+          part = fmaf(q1, bf16_to_f32_bits(u1), part);
+        }
+
+        double score = part * (double)inv_sqrt_d;
+        const double w = exp(score - m_tile_row);
+
+        if (out_col == 0) {
+          l_tile_sum += w;
+        }
+
+        const bf16 *v_vec = &local_v[cur * tile_num_kv * head_dim + tt * head_dim];
+        const uint32_t pv = ld_u32(reinterpret_cast<const uint32_t *>(v_vec + out_col));
+        const uint16_t v0 = (uint16_t)(pv & 0xFFFF);
+        const uint16_t v1 = (uint16_t)(pv >> 16);
+
+        acc0 += w * (double)bf16_to_f32_bits(v0);
+        if (out_col + 1 < head_dim) {
+          acc1 += w * (double)bf16_to_f32_bits(v1);
+        }
+      }
+
+      float *out_row = &local_out[row * head_dim];
+      out_row[out_col] = (float)((double)out_row[out_col] + beta * acc0);
+      if (out_col + 1 < head_dim) {
+        out_row[out_col + 1] = (float)((double)out_row[out_col + 1] + beta * acc1);
+      }
+    }
+
+    l_tile_sum = warp_reduce_sum64(l_tile_sum);
+    if (lane == 0) {
+      l_i += beta * l_tile_sum;
+      m_i = m_new;
+    }
+
+    __syncthreads();
+
+    int tmp = cur;
+    cur = next;
+    next = tmp;
+  }
+
+  const double sink_logit = (double)attn_sinks[h];
+  const double m_final = fmax(m_i, sink_logit);
+  const double alpha_f = exp(m_i - m_final);
+
+  // Mẫu số cuối cùng
+  double denom_final = l_i * alpha_f + exp(sink_logit - m_final);
+
+  for (int i = lane; i < head_dim; i += WARP_SIZE) {
+    double num_i = (double)local_out[row * head_dim + i];
+    double num_final = num_i * alpha_f;
+    out_head_ptr[i] = (float)(num_final / denom_final);
+  }
+}
+
+void flash_attn_batched_v2(Tensor *q,           /* (batch_size, n_attn_heads * head_dim) */
+                           Tensor *key_cache,   /* (batch_size, n_layers, seq_len, kv_dim)*/
+                           Tensor *value_cache, /* (batch_size, n_layers, seq_len, kv_dim)*/
+                           Tensor *mask,        /* (batch_size, seq_len, seq_len)*/
+                           Tensor *attn_sinks,  /* (n_layers, n_attn_heads) */
+                           Tensor *tb,          /* (batch_size, n_attn_heads * head_dim)*/
+                           int cur_batch_size, int head_dim, int n_attn_heads, int kv_mul,
+                           int kv_dim, int seq_len, int sliding_window, int pos,
+                           long long layer_offset, hipStream_t stream) {
+  const size_t layer_span = (size_t)seq_len * kv_dim;
+  const size_t n_layers = key_cache->shape[1];
+  const bf16 *k_ptr = (const bf16 *)key_cache->d_buf + layer_offset * layer_span;
+  const bf16 *v_ptr = (const bf16 *)value_cache->d_buf + layer_offset * layer_span;
+  const float *s_ptr = (const float *)attn_sinks->d_buf + layer_offset * n_attn_heads;
+
+  const int attn_len = pos + 1;
+  const bool use_window = (sliding_window > 0) && ((layer_offset & 1ll) == 0);
+  const int active_len = use_window ? std::min(attn_len, sliding_window) : attn_len;
+  const int pos_end = attn_len;
+  const int pos_begin = pos_end - active_len;
+
+  constexpr int tile_num_queries = 8;  // Br
+  constexpr int tile_num_kv = 128;     // Bc - pos * kv_dim
+
+  const int head_groups = (n_attn_heads + tile_num_queries - 1) / tile_num_queries;
+
+  dim3 block_size(tile_num_queries * WARP_SIZE);
+  dim3 grid_size(head_groups, cur_batch_size);
+
+  size_t shmem_bytes = 1ll * tile_num_queries * head_dim * sizeof(float) +
+                       1ll * 2 * tile_num_kv * head_dim * sizeof(bf16) +
+                       1ll * 2 * tile_num_kv * head_dim * sizeof(bf16) +
+                       1ll * tile_num_queries * head_dim * sizeof(float);
+
+  flash_attn_2d_kernel<tile_num_queries, tile_num_kv, 64>
+    <<<grid_size, block_size, shmem_bytes, stream>>>(
+      (const float *)q->d_buf, k_ptr, v_ptr, s_ptr, (float *)tb->d_buf, cur_batch_size,
+      n_attn_heads, kv_mul, kv_dim, seq_len, n_layers, pos_begin, pos_end);
+}
+
 #else
 
 #ifndef WARP_SIZE

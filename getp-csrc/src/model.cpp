@@ -158,6 +158,8 @@ float *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flo
 void reduce_tb3(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
                 int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream,
                 hipEvent_t tp_ready, hipEvent_t tp_finish) {
+  // GpuTimer timer("reduce_tb3");
+
   size_t active_elems = (size_t)cur_batch_size * rs_now->tb3->shape[1] * rs_now->tb3->shape[2];
   size_t active_num_bytes = active_elems * rs_now->tb3->get_dtype_size();
 
@@ -236,9 +238,65 @@ void reduce_tb3(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cu
   pthread_barrier_wait(tp_barrier);
 }
 
+void ring_all_reduce_tb2(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
+                         int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream) {
+  // GpuTimer timer("ring_all_reduce_tb2");
+
+  float *d_buf_now = (float *)rs_now->tb2->d_buf;
+  size_t hidden_dim = rs_now->tb2->shape[1];
+  size_t chunk_size = hidden_dim / TP;
+  size_t width_bytes = chunk_size * rs_now->tb2->get_dtype_size();
+  size_t dst_pitch = width_bytes;
+  size_t src_pitch = hidden_dim * rs_now->tb2->get_dtype_size();
+
+  int left_peer_rank = (tp_rank - 1 + TP) % TP;
+  OurRunState *rs_left = &rs_leader[left_peer_rank];
+  int left_device = cur_device - tp_rank + left_peer_rank;
+
+  void *tmp_ptr = rs_now->tb2_recv->d_buf;
+
+  const int block_size = 256;
+  const int grid_size = (cur_batch_size * chunk_size + block_size - 1) / block_size;
+
+  CHECK_HIP(hipStreamSynchronize(stream));
+  pthread_barrier_wait(tp_barrier);
+
+  for (int i = 0; i < TP - 1; ++i) {
+    int chunk_idx = (tp_rank - i - 1 + TP) % TP;
+    size_t chunk_offset = chunk_idx * chunk_size;
+
+    const float *left_src_ptr = (const float *)rs_left->tb2->d_buf + chunk_offset;
+    float *dst_local_ptr = d_buf_now + chunk_offset;
+
+    CHECK_HIP(hipMemcpy2DAsync(tmp_ptr, dst_pitch, left_src_ptr, src_pitch, width_bytes,
+                               cur_batch_size, hipMemcpyDeviceToDevice, stream));
+
+    add_vector_2d_kernel<<<grid_size, block_size, 0, stream>>>(
+      dst_local_ptr, (const float *)tmp_ptr, cur_batch_size, chunk_size, hidden_dim);
+
+    CHECK_HIP(hipStreamSynchronize(stream));
+    pthread_barrier_wait(tp_barrier);
+  }
+
+  for (int i = 0; i < TP - 1; i++) {
+    int send_chunk_idx = (tp_rank - i + TP) % TP;
+    size_t chunk_offset = send_chunk_idx * chunk_size;
+
+    const float *left_src_ptr = (const float *)rs_left->tb2->d_buf + chunk_offset;
+    float *dst_local_ptr = d_buf_now + chunk_offset;
+
+    CHECK_HIP(hipMemcpy2DAsync(dst_local_ptr, src_pitch, left_src_ptr, src_pitch, width_bytes,
+                               cur_batch_size, hipMemcpyDeviceToDevice, stream));
+
+    CHECK_HIP(hipStreamSynchronize(stream));
+    pthread_barrier_wait(tp_barrier);
+  }
+}
+
 void reduce_tb2(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
                 int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream,
                 hipEvent_t tp_ready, hipEvent_t tp_finish) {
+  // GpuTimer timer("reduce_tb2");
   size_t active_elems = (size_t)cur_batch_size * rs_now->tb2->shape[1];
   size_t active_num_bytes = active_elems * rs_now->tb2->get_dtype_size();
   size_t num_elems = rs_now->tb2->num_elem();
@@ -301,6 +359,8 @@ void reduce_tb2(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cu
 void all_gather_classifier_v2(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank,
                               int cur_device, int cur_batch_size, pthread_barrier_t *tp_barrier,
                               hipStream_t stream, hipEvent_t tp_ready, hipEvent_t tp_finish) {
+  // GpuTimer timer("all_gather_classifier");
+
   size_t shard_vocab_size = rs_now->tmp_logits->shape[1];
   size_t vocab_size = shard_vocab_size * TP;
 
@@ -337,6 +397,8 @@ void all_gather_classifier_v2(OurRunState *rs_now, OurRunState *rs_leader, int t
 void all_gather_qkv_v2(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
                        int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream,
                        hipEvent_t tp_ready, hipEvent_t tp_finish) {
+  // GpuTimer timer("all_gather_qkv");
+
   size_t shard_qkv_size = rs_now->tmp_qkv->shape[1];
   size_t full_qkv_size = shard_qkv_size * TP;
 
@@ -396,6 +458,8 @@ void all_gather_qkv_v2(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank,
 void all_gather_tb3(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
                     Config *p, pthread_barrier_t *tp_barrier, hipStream_t stream,
                     hipEvent_t tp_ready, hipEvent_t tp_finish) {
+  // GpuTimer timer("all_gather_tb3");
+
   int experts_per_gpu = p->n_experts / TP;
   int hidden_dim = p->hidden_dim;
 
@@ -620,8 +684,10 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
     attn_out_project_batched_v2(rs_now->tb, weights_now->w_o, weights_now->b_o, rs_now->tb2,
                                 tp_rank == 0, cur_batch_size, 1ll * l, false, false, stream);
 
-    reduce_tb2(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready,
-               tp_finish);
+    // reduce_tb2(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready,
+    //            tp_finish);
+
+    ring_all_reduce_tb2(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream);
 
 #ifdef DEBUG
     if (flag)
