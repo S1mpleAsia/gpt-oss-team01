@@ -49,6 +49,13 @@ void all_gather_x(
   }
 }
 
+__global__ void add_vector_kernel_direct(float *c, const float *a, const float *b, int len) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < len) {
+        c[i] = a[i] + b[i];
+    }
+}
+
 void reduce_tb3(
     OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
     int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream,
@@ -154,77 +161,70 @@ void reduce_tb3_new(
     // Leader 1 waits for partner 0 (device -1). Leader 2 waits for partner 3 (device +1).
     hipEvent_t partner_ready = total_events->tp_ready[cur_device + 1];
     CHECK_HIP(hipStreamWaitEvent(stream, partner_ready));
+    int lead_offset = (tp_rank == 0) ? 2 : -2;
 
-    float *d_buf = (float *)rs_now->tb3->d_buf;
-    const float *d_buf_each = (const float *)rs_now->tb3_buf->d_buf;
+    const float *d_buf = (const float *)rs_now->tb3->d_buf;
+    float *d_buf_each = (float *)rs_now->tb3_buf->d_buf;
 
     const int block_size = 256;
     const int grid_size = (active_elems + block_size - 1) / block_size;
 
     add_vector_kernel_batched<<<grid_size, block_size, 0, stream>>>(
-        d_buf, d_buf_each, active_elems);
-
-    CHECK_HIP(hipEventRecord(tp_ready, stream));
-    pthread_barrier_wait(tp_barrier + 3);
-  }
-
-  // --- Phase 3: Leader-to-leader combine (Rank 1 aggregates from Rank 2)
-  if (tp_rank == 0) {
-    // Rank 1 is the final aggregator. It waits for rank 2's data.
-    hipEvent_t other_leader_ready = total_events->tp_ready[cur_device + 2];
-    CHECK_HIP(hipStreamWaitEvent(stream, other_leader_ready));
+        d_buf_each, d_buf, active_elems);
 
     // Copy rank 2's tb3 into rank 1's per-rank buf.
-    const void *src_buf = (rs_now + 2)->tb3->d_buf;
-    void *dst_buf = (void *)((float *)rs_now->tb3_buf->d_buf + active_elems);
+    const void *src_buf = rs_now->tb3_buf->d_buf;
+    void *dst_buf = (void *)((float *)(rs_now + lead_offset)->tb3_buf->d_buf + active_elems);
 
     CHECK_HIP(hipMemcpyPeerAsync(
-        dst_buf, cur_device, src_buf, cur_device + 2,
-        active_num_bytes, stream
+      dst_buf, cur_device + lead_offset, src_buf, cur_device,
+      active_num_bytes, stream
     ));
 
+    CHECK_HIP(hipEventRecord(tp_ready, stream));
+
+    pthread_barrier_wait(tp_barrier + 3);
+
+    // Rank 1 is the final aggregator. It waits for rank 2's data.
+    hipEvent_t other_leader_ready = total_events->tp_ready[cur_device + lead_offset];
+    CHECK_HIP(hipStreamWaitEvent(stream, other_leader_ready));
+
     // Add rank 2's data into rank 1's tb3.
-    float *d_buf = (float *)rs_now->tb3->d_buf;
-    const float *d_buf_each = (const float *)dst_buf;
+    float *d_buf_now = (float *)rs_now->tb3->d_buf;
+    const float *d_buf_1 = (const float *)rs_now->tb3_buf->d_buf;
+    const float *d_buf_2 = (const float *)(rs_now->tb3_buf->d_buf) + active_elems;
 
-    const int block_size = 256;
-    const int grid_size = (active_elems + block_size - 1) / block_size;
-
-    add_vector_kernel_batched<<<grid_size, block_size, 0, stream>>>(
-        d_buf, d_buf_each, active_elems);
+    add_vector_kernel_direct<<<grid_size, block_size, 0, stream>>>(
+      d_buf_now, d_buf_1, d_buf_2, active_elems);
 
     CHECK_HIP(hipEventRecord(tp_finish, stream));
   }
 
-  pthread_barrier_wait(tp_barrier);
+  pthread_barrier_wait(tp_barrier + reduce_rank + 1);
 
   // --- Phase 4: Final broadcast from Rank 1 to all other ranks
-  if (tp_rank != 0) {
+  if (is_partner) {
     // Rank 1 broadcasts the final aggregated data to all other ranks.
-    hipEvent_t tp_finish_leader = total_events->tp_finish[cur_device - tp_rank];
+    hipEvent_t tp_finish_leader = total_events->tp_finish[cur_device - 1];
 
     CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_leader));
 
     void *dst_buf = rs_now->tb3->d_buf;
-    const void *src_buf = rs_leader->tb3->d_buf; // rs_leader is now the rank 1 runstate
+    const void *src_buf = (rs_now - 1)->tb3->d_buf; // rs_leader is now the rank 1 runstate
 
     CHECK_HIP(hipMemcpyPeerAsync(
         dst_buf, cur_device,
-        src_buf, cur_device - tp_rank,
+        src_buf, cur_device - 1,
         active_num_bytes, stream
     ));
     CHECK_HIP(hipEventRecord(tp_finish, stream));
   } else {
     // All other ranks (0, 2, 3) wait for Rank 1's final result and copy it.
-    hipEvent_t tp_finish_each;
-
-    for (int i = 1; i < TP; i++) {
-        tp_finish_each = total_events->tp_finish[cur_device + i];
-        CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_each));
-    }
+    hipEvent_t tp_finish_each = total_events->tp_finish[cur_device + 1];
+    CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_each));
   }
 
-  pthread_barrier_wait(tp_barrier);
+  // pthread_barrier_wait(tp_barrier + reduce_rank + 1);
 }
 
 void reduce_tb2(
@@ -265,18 +265,18 @@ void reduce_tb2(
 
       d_buf_each += num_elems;
     }
-    CHECK_HIP(hipEventRecord(tp_ready, stream));
+    CHECK_HIP(hipEventRecord(tp_finish, stream));
   }
 
   pthread_barrier_wait(tp_barrier);
 
   if (tp_rank > 0) {
-    hipEvent_t leader_tp_ready = total_events->tp_ready[cur_device - tp_rank];
+    hipEvent_t leader_tp_finish = total_events->tp_finish[cur_device - tp_rank];
     void *dst_buf = rs_now->tb2->d_buf;
 
     const void *src_buf = rs_leader->tb2->d_buf;
 
-    CHECK_HIP(hipStreamWaitEvent(stream, leader_tp_ready));
+    CHECK_HIP(hipStreamWaitEvent(stream, leader_tp_finish));
     CHECK_HIP(hipMemcpyPeerAsync(dst_buf, cur_device, src_buf, cur_device - tp_rank,
                                  active_num_bytes, stream));
     CHECK_HIP(hipEventRecord(tp_finish, stream));
@@ -291,7 +291,7 @@ void reduce_tb2(
   pthread_barrier_wait(tp_barrier);
 }
 
-void reduce_tb2_new_old(
+void reduce_tb2_new(
   OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
   int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream,
   hipEvent_t tp_ready, hipEvent_t tp_finish
@@ -324,141 +324,70 @@ void reduce_tb2_new_old(
     // Leader 1 waits for partner 0 (device -1). Leader 2 waits for partner 3 (device +1).
     hipEvent_t partner_ready = total_events->tp_ready[cur_device + 1];
     CHECK_HIP(hipStreamWaitEvent(stream, partner_ready));
+    int lead_offset = (tp_rank == 0) ? 2 : -2;
 
-    float *d_buf = (float *)rs_now->tb2->d_buf;
-    const float *d_buf_each = (const float *)rs_now->tb2_buf->d_buf;
+    const float *d_buf = (const float *)rs_now->tb2->d_buf;
+    float *d_buf_each = (float *)rs_now->tb2_buf->d_buf;
 
     const int block_size = 256;
     const int grid_size = (active_elems + block_size - 1) / block_size;
 
     add_vector_kernel_batched<<<grid_size, block_size, 0, stream>>>(
-        d_buf, d_buf_each, active_elems);
-
-    CHECK_HIP(hipEventRecord(tp_ready, stream));
-    pthread_barrier_wait(tp_barrier + 3);
-  }
-
-  // --- Phase 3: Leader-to-leader combine (Rank 1 aggregates from Rank 2)
-  if (tp_rank == 0) {
-    // Rank 1 is the final aggregator. It waits for rank 2's data.
-    hipEvent_t other_leader_ready = total_events->tp_ready[cur_device + 2];
-    CHECK_HIP(hipStreamWaitEvent(stream, other_leader_ready));
+        d_buf_each, d_buf, active_elems);
 
     // Copy rank 2's tb2 into rank 1's per-rank buf.
-    const void *src_buf = (rs_now + 2)->tb2->d_buf;
-    void *dst_buf = (void *)((float *)rs_now->tb2_buf->d_buf + active_elems);
+    const void *src_buf = rs_now->tb2_buf->d_buf;
+    void *dst_buf = (void *)((float *)(rs_now + lead_offset)->tb2_buf->d_buf + active_elems);
 
     CHECK_HIP(hipMemcpyPeerAsync(
-        dst_buf, cur_device, src_buf, cur_device + 2,
-        active_num_bytes, stream
+      dst_buf, cur_device + lead_offset, src_buf, cur_device,
+      active_num_bytes, stream
     ));
 
+    CHECK_HIP(hipEventRecord(tp_ready, stream));
+
+    pthread_barrier_wait(tp_barrier + 3);
+
+    // Rank 1 is the final aggregator. It waits for rank 2's data.
+    hipEvent_t other_leader_ready = total_events->tp_ready[cur_device + lead_offset];
+    CHECK_HIP(hipStreamWaitEvent(stream, other_leader_ready));
+
     // Add rank 2's data into rank 1's tb2.
-    float *d_buf = (float *)rs_now->tb2->d_buf;
-    const float *d_buf_each = (const float *)dst_buf;
+    float *d_buf_now = (float *)rs_now->tb2->d_buf;
+    const float *d_buf_1 = (const float *)rs_now->tb2_buf->d_buf;
+    const float *d_buf_2 = (const float *)(rs_now->tb2_buf->d_buf) + active_elems;
 
-    const int block_size = 256;
-    const int grid_size = (active_elems + block_size - 1) / block_size;
-
-    add_vector_kernel_batched<<<grid_size, block_size, 0, stream>>>(
-        d_buf, d_buf_each, active_elems);
+    add_vector_kernel_direct<<<grid_size, block_size, 0, stream>>>(
+      d_buf_now, d_buf_1, d_buf_2, active_elems);
 
     CHECK_HIP(hipEventRecord(tp_finish, stream));
   }
 
-  pthread_barrier_wait(tp_barrier);
+  pthread_barrier_wait(tp_barrier + reduce_rank + 1);
 
   // --- Phase 4: Final broadcast from Rank 1 to all other ranks
-  if (tp_rank != 0) {
+  if (is_partner) {
     // Rank 1 broadcasts the final aggregated data to all other ranks.
-    hipEvent_t tp_finish_leader = total_events->tp_finish[cur_device - tp_rank];
+    hipEvent_t tp_finish_leader = total_events->tp_finish[cur_device - 1];
 
     CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_leader));
 
     void *dst_buf = rs_now->tb2->d_buf;
-    const void *src_buf = rs_leader->tb2->d_buf; // rs_leader is now the rank 1 runstate
+    const void *src_buf = (rs_now - 1)->tb2->d_buf; // rs_leader is now the rank 1 runstate
 
     CHECK_HIP(hipMemcpyPeerAsync(
         dst_buf, cur_device,
-        src_buf, cur_device - tp_rank,
+        src_buf, cur_device - 1,
         active_num_bytes, stream
     ));
     CHECK_HIP(hipEventRecord(tp_finish, stream));
   } else {
     // All other ranks (0, 2, 3) wait for Rank 1's final result and copy it.
-    hipEvent_t tp_finish_each;
-
-    for (int i = 1; i < TP; i++) {
-        tp_finish_each = total_events->tp_finish[cur_device + i];
-        CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_each));
-    }
+    hipEvent_t tp_finish_each = total_events->tp_finish[cur_device + 1];
+    CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_each));
   }
 
-  pthread_barrier_wait(tp_barrier);
-}
-
-void reduce_tb2_new(
-    OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
-    int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream,
-    hipEvent_t tp_ready, hipEvent_t tp_finish
-) {
-  size_t active_elems = (size_t)cur_batch_size * rs_now->tb2->shape[1];
-  size_t active_num_bytes = active_elems * rs_now->tb2->get_dtype_size();
-  size_t num_elems = rs_now->tb2->num_elem();
-  size_t num_bytes = num_elems * rs_now->tb2->get_dtype_size();
-
-  if (tp_rank > 0) {
-    void *dst_buf = (void *)((float *)rs_leader->tb2_buf->d_buf + (tp_rank - 1) * num_elems);
-    const void *src_buf = rs_now->tb2->d_buf;
-
-    CHECK_HIP(hipMemcpyPeerAsync(dst_buf, cur_device - tp_rank, src_buf, cur_device,
-                                 active_num_bytes, stream));
-    CHECK_HIP(hipEventRecord(tp_ready, stream));
-  }
-
-  pthread_barrier_wait(tp_barrier);
-
-  if (tp_rank == 0) {
-    hipEvent_t tp_ready_each;
-    float *d_buf = (float *)rs_now->tb2->d_buf;
-    float *d_buf_each = (float *)rs_leader->tb2_buf->d_buf;
-
-    const int block_size = 256;
-    const int grid_size = (active_elems + block_size - 1) / block_size;
-
-    for (int i = 1; i < TP; i++) {
-      tp_ready_each = total_events->tp_ready[cur_device + i];
-      CHECK_HIP(hipStreamWaitEvent(stream, tp_ready_each));
-
-      add_vector_kernel_batched<<<grid_size, block_size, 0, stream>>>(
-        d_buf, (const float *)d_buf_each, active_elems);
-
-      d_buf_each += num_elems;
-    }
-    CHECK_HIP(hipEventRecord(tp_ready, stream));
-  }
-
-  pthread_barrier_wait(tp_barrier);
-
-  if (tp_rank > 0) {
-    hipEvent_t leader_tp_ready = total_events->tp_ready[cur_device - tp_rank];
-    void *dst_buf = rs_now->tb2->d_buf;
-
-    const void *src_buf = rs_leader->tb2->d_buf;
-
-    CHECK_HIP(hipStreamWaitEvent(stream, leader_tp_ready));
-    CHECK_HIP(hipMemcpyPeerAsync(dst_buf, cur_device, src_buf, cur_device - tp_rank,
-                                 active_num_bytes, stream));
-    CHECK_HIP(hipEventRecord(tp_finish, stream));
-  } else {
-    hipEvent_t tp_finish_each;
-    for (int i = 1; i < TP; i++) {
-      tp_finish_each = total_events->tp_finish[cur_device + i];
-      CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_each));
-    }
-  }
-
-  pthread_barrier_wait(tp_barrier);
+  // pthread_barrier_wait(tp_barrier + reduce_rank + 1);
 }
 
 void all_gather_classifier_v2(

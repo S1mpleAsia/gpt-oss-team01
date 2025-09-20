@@ -9,6 +9,7 @@
 #include "pipeline.hpp"
 
 #define BATCH_SIZE 512
+#define PP_SLOT 1
 #define KV16
 // #define PRINT_LOGITS
 #define TIME_GPU

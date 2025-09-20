@@ -919,10 +919,10 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
 
 #ifdef KV16
   printf("using BF16 KV cache\n");
-  rs->key_cache = new Tensor({BATCH_SIZE, ((size_t)p->n_layers / PP), (size_t)p->seq_len,
+  rs->key_cache = new Tensor({BATCH_SIZE * PP_SLOT, ((size_t)p->n_layers / PP), (size_t)p->seq_len,
                               (size_t)p->n_kv_heads * p->head_dim / TP},
                              stream, DType::BF16);
-  rs->value_cache = new Tensor({BATCH_SIZE, ((size_t)p->n_layers / PP), (size_t)p->seq_len,
+  rs->value_cache = new Tensor({BATCH_SIZE * PP_SLOT, ((size_t)p->n_layers / PP), (size_t)p->seq_len,
                                 (size_t)p->n_kv_heads * p->head_dim / TP},
                                stream, DType::BF16);
 #else
