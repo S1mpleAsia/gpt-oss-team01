@@ -182,21 +182,25 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
   CHECK_HIP(hipSetDevice(cur_device));
 
   if (pp_rank == 0) {
-    embedding_lookup_batched(weights_now->token_embedding_table, tokens, rs_now->tokens_buf,
-                             rs_now->x_embed_buf, cur_batch_size, false, stream);
-    /*
+    // embedding_lookup_batched(weights_now->token_embedding_table, tokens, rs_now->tokens_buf, rs_now->x_embed_buf, cur_batch_size, false, stream);
+    embedding_lookup_shard_batched(
+      weights_now->token_embedding_table, tokens, rs_now->tokens_buf,
+      rs_now->x, cur_batch_size, tp_rank, false, stream
+    );
+
     {
       std::string timer_label = "all_gather_x_tp" + std::to_string(tp_rank);
       GpuTimer timer(timer_label.c_str(), stream);
       all_gather_x(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready, tp_finish);
     }
-    */
 
+    /*
     {
       std::string timer_label = "all_gather_x_new_tp" + std::to_string(tp_rank);
       // GpuTimer timer(timer_label.c_str(), stream);
       all_gather_x_new(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready, tp_finish);
     }
+    */
   } else {
     rs_now->pipeline_each->dequeue(rs_now->x, stream);
   }

@@ -157,6 +157,59 @@ void embedding_lookup_batched(Tensor *embedding,      // Shape: [vocab_size, hid
   }
 }
 
+__global__ void embedding_lookup_kernel_shard(
+  const bf16 *__restrict__ embedding_table,
+  float *__restrict__ output, const int *__restrict__ tokens,
+  const size_t shard_dim, const size_t hidden_dim, const int batch_size
+) {
+  int batch_idx = blockIdx.y * blockDim.y + threadIdx.y;
+  int shard_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (batch_idx >= batch_size || shard_idx >= shard_dim) {
+    return;
+  }
+
+  int token_idx = tokens[batch_idx];
+  const bf16 *src_ptr = embedding_table + (size_t)token_idx * shard_dim + shard_idx;
+  float *dst_ptr = output + (size_t)batch_idx * hidden_dim + shard_idx;
+
+  *dst_ptr = (float)(*src_ptr);
+}
+
+void embedding_lookup_shard_batched(
+  Tensor *embedding,      // Shape: [vocab_size, hidden_dim]
+  int *tokens,            // Shape: [batch_size]
+  TensorI32 *tokens_buf,  // Shape: [batch_size]
+  Tensor *x,              // Shape: [batch_size, hidden_dim]
+  int cur_batch_size, int tp_rank,
+  bool x_from_device, hipStream_t stream
+) {
+  // GpuTimer timer("embedding_lookup", stream);
+
+  // const int batch_size = x->shape[0];
+  const size_t hidden_dim = x->shape[1];
+  const size_t shard_dim = hidden_dim / TP;
+  const bf16 *embedding_ptr = (const bf16 *)embedding->d_buf;
+  float *x_ptr = (float *)x->d_buf + tp_rank * shard_dim;
+
+  CHECK_HIP(hipMemcpyAsync(tokens_buf->d_buf, tokens, tokens_buf->num_elem() * sizeof(int),
+                           hipMemcpyHostToDevice, stream));
+
+  dim3 block_size(32, 16);
+  dim3 grid_size((shard_dim + block_size.x - 1) / block_size.x,
+                 (cur_batch_size + block_size.y - 1) / block_size.y);
+
+  embedding_lookup_kernel_shard<<<grid_size, block_size, 0, stream>>>(
+    embedding_ptr, x_ptr, tokens_buf->d_buf,
+    shard_dim, hidden_dim, cur_batch_size
+  );
+
+  if (x_from_device) {
+    x->from_device(stream);
+    CHECK_HIP(hipStreamSynchronize(stream));
+  }
+}
+
 __global__ void rmsnorm_kernel(const float *x, const bf16 *w, float *out, int hidden_dim,
                                float eps) {
   const int batch_idx = blockIdx.x;

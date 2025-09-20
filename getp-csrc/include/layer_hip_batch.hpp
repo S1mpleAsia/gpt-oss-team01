@@ -12,6 +12,15 @@ void embedding_lookup_batched(Tensor *embedding,      // Shape: [vocab_size, hid
                               Tensor *x,              // Shape: [batch_size, hidden_dim]
                               int cur_batch_size, bool x_from_device, hipStream_t stream = 0);
 
+void embedding_lookup_shard_batched(
+  Tensor *embedding,      // Shape: [vocab_size, hidden_dim]
+  int *tokens,            // Shape: [batch_size]
+  TensorI32 *tokens_buf,  // Shape: [batch_size]
+  Tensor *x,              // Shape: [batch_size, hidden_dim]
+  int cur_batch_size, int tp_rank,
+  bool x_from_device, hipStream_t stream
+);
+
 // ---------- RMSNorm ----------
 void rmsnorm_batched(Tensor *x,    // Shape: [batch_size, hidden_dim]
                      Tensor *w,    // Shape: [hidden_dim]

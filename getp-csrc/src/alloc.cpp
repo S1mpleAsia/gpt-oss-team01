@@ -860,7 +860,7 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   int tp_rank = device_id % TP;
 
   // x_embed_buf
-  rs->x_embed_buf = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / TP}, stream);
+  rs->x_embed_buf = nullptr;
 
   // Create Tensor wrappers for state buffers
   rs->x = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
