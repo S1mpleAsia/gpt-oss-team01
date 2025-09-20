@@ -8,10 +8,10 @@
 // #include "config_run.hpp"
 #include "pipeline.hpp"
 
-#define BATCH_SIZE 32
-// #define KV16
+#define BATCH_SIZE 512
+#define KV16
 // #define PRINT_LOGITS
-// #define TIME_GPU
+#define TIME_GPU
 // #define DEBUG
 // #define RUN_20B
 // #define RUN_EP

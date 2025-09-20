@@ -870,16 +870,16 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   // rs->tb_buf = new Tensor({BATCH_SIZE, (size_t)p->head_dim * p->n_attn_heads / TP}, stream);
 
   rs->tb2 = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
-  if (tp_rank % 2 == 0 && TP > 1) {
-    rs->tb2_buf = new Tensor({TP / 2, BATCH_SIZE, (size_t)p->hidden_dim}, stream);
+  if (tp_rank < 3 && TP > 1) {
+    rs->tb2_buf = new Tensor({TP - 1, BATCH_SIZE, (size_t)p->hidden_dim}, stream);
   } else {
     rs->tb2_buf = nullptr;
   }
 
   rs->tb3 = new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
-  if (tp_rank % 2 == 0 && TP > 1) {
+  if (tp_rank < 3 && TP > 1) {
     rs->tb3_buf = new Tensor(
-      {TP / 2, BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
+      {TP - 1, BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
   } else {
     rs->tb3_buf = nullptr;
   }
@@ -1006,6 +1006,8 @@ void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunSt
   #endif
   #endif
 
+  check_gpu_memory();
+
 #pragma omp parallel for num_threads(TOTAL_GPUS_NEEDED)
   for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
     CHECK_HIP(hipSetDevice(i));
@@ -1023,7 +1025,9 @@ void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunSt
     if (PP > 1) {
       CHECK_HIP(hipEventCreate(&(total_events->pp_sync[i])));
     }
+    check_gpu_memory();
     our_init_weights(w, p, &weights[i], i, total_streams[i]);
+    check_gpu_memory();
     our_init_run_state(s, p, &rs[i], i, total_streams[i]);
     check_gpu_memory();
 #endif

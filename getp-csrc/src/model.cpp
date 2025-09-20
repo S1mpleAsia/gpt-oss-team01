@@ -261,8 +261,21 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
     attn_out_project_batched_v2(rs_now->tb, weights_now->w_o, weights_now->b_o, rs_now->tb2,
                                 tp_rank == 0, cur_batch_size, 1ll * l, false, false, stream);
 
-    reduce_tb2_new(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready,
+    /*
+    {
+      std::string timer_label = "reduce_tb2_new_tp" + std::to_string(tp_rank);
+      GpuTimer timer(timer_label.c_str(), stream);
+      reduce_tb2_new(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready,
                tp_finish);
+    }
+    */
+
+    {
+      std::string timer_label = "reduce_tb2_tp" + std::to_string(tp_rank);
+      GpuTimer timer(timer_label.c_str(), stream);
+      reduce_tb2(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready,
+               tp_finish);
+    }
 
 #ifdef DEBUG
     if (flag)
@@ -402,8 +415,22 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
     all_gather_tb3(rs_now, rs_leader, tp_rank, cur_device, p, tp_barrier, stream, tp_ready,
                    tp_finish);
 #else
-    reduce_tb3_new(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready,
+    /*
+    {
+      std::string timer_label = "reduce_tb3_new_tp" + std::to_string(tp_rank);
+      GpuTimer timer(timer_label.c_str(), stream);
+      reduce_tb3_new(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready,
                tp_finish);
+    }
+    */
+
+    {
+      std::string timer_label = "reduce_tb3_tp" + std::to_string(tp_rank);
+      GpuTimer timer(timer_label.c_str(), stream);
+      reduce_tb3(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready,
+                tp_finish);
+    }
+
 #endif
 
 #ifdef DEBUG
