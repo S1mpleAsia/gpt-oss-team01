@@ -732,12 +732,12 @@ static inline void moe_mlp1_forward(Tensor *x_packed,  // [total_pairs, hidden_d
 
   {
 #if defined(RUN_20B) || defined(RUN_EP)
-    constexpr int BM = 32;
+    constexpr int BM = 64;
     constexpr int BN = 128;
     constexpr int BK = 32;
     constexpr int TM = 32;
     constexpr int TN = 32;
-    constexpr int blockDim = 256;  // = 64 * (BM / TM) * (BN / TN)
+    constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 
 #else
     constexpr int BM = 16;
@@ -803,12 +803,12 @@ static inline void moe_mlp2_forward(Tensor *gate_up,  // [total_pairs, inter_dim
 
   {
 #if defined(RUN_20B) || defined(RUN_EP)
-    constexpr int BM = 32;
+    constexpr int BM = 64;
     constexpr int BN = 128;
     constexpr int BK = 32;
     constexpr int TM = 32;
     constexpr int TN = 32;
-    constexpr int blockDim = 256;  // = 64 * (BM / TM) * (BN / TN)
+    constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 
 #else
     constexpr int BM = 16;
