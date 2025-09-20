@@ -8,8 +8,8 @@
 // #include "config_run.hpp"
 #include "pipeline.hpp"
 
-#define BATCH_SIZE 32
-// #define KV16
+#define BATCH_SIZE 440
+#define KV16
 // #define PRINT_LOGITS
 // #define TIME_GPU
 // #define DEBUG
@@ -79,6 +79,7 @@ typedef struct {
   Tensor *tb2_recv;
   Tensor *tb3;  // (BATCH_SIZE, experts_per_token)
   Tensor *tb3_buf;
+  Tensor *tb3_recv;
   Tensor *router_score;  // router score (n_experts, )
   Tensor *topk_v;        // topk expert weights (experts_per_token, )
   TensorI32 *topk_i;     // topk expert indices (experts_per_token, )
@@ -118,6 +119,8 @@ typedef struct {
   Tensor *g_fa_pmax;  // [batch_size, n_attn_heads, c_max]
   Tensor *g_fa_psum;  // [batch_size, n_attn_heads, c_max]
   Tensor *g_fa_pnum;  // [batch_size, n_attn_heads, c_max, head_dim]
+
+  float *logits_out;
 } OurRunState;
 
 typedef struct {

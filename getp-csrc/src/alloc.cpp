@@ -806,19 +806,21 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
 
   rs->tb2 = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
   rs->tb2_recv = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / TP}, stream);
-  if (device_id % TP == 0) {
-    rs->tb2_buf = new Tensor({(TP - 1), BATCH_SIZE, (size_t)p->hidden_dim}, stream);
-  } else {
-    rs->tb2_buf = nullptr;
-  }
+  // if (device_id % TP == 0) {
+  //   rs->tb2_buf = new Tensor({(TP - 1), BATCH_SIZE, (size_t)p->hidden_dim}, stream);
+  // } else {
+  //   rs->tb2_buf = nullptr;
+  // }
 
   rs->tb3 = new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
-  if (device_id % TP == 0) {
-    rs->tb3_buf = new Tensor(
-      {(TP - 1), BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
-  } else {
-    rs->tb3_buf = nullptr;
-  }
+  rs->tb3_recv =
+    new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim / TP}, stream);
+  // if (device_id % TP == 0) {
+  //   rs->tb3_buf = new Tensor(
+  //     {(TP - 1), BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
+  // } else {
+  //   rs->tb3_buf = nullptr;
+  // }
 
   rs->router_score = new Tensor({BATCH_SIZE, (size_t)p->n_experts}, stream);
   rs->topk_v = new Tensor({BATCH_SIZE, (size_t)p->experts_per_token}, stream);
@@ -850,7 +852,7 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   // rs->v = new Tensor({BATCH_SIZE, (size_t)p->n_kv_heads * p->head_dim / TP}, stream);
 
   // rs->att = new Tensor({BATCH_SIZE, (size_t)p->n_attn_heads, (size_t)p->seq_len}, stream);
-  rs->logits = new Tensor({BATCH_SIZE, (size_t)p->vocab_size}, stream);
+  // rs->logits = new Tensor({BATCH_SIZE, (size_t)p->vocab_size}, stream);
   rs->tmp_logits = new Tensor({BATCH_SIZE, (size_t)p->vocab_size / TP}, stream);
 
 #ifdef KV16
@@ -910,6 +912,13 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->g_fa_pmax = new Tensor({BATCH_SIZE, shard_attn_heads, c_max}, stream);
   rs->g_fa_psum = new Tensor({BATCH_SIZE, shard_attn_heads, c_max}, stream);
   rs->g_fa_pnum = new Tensor({BATCH_SIZE, shard_attn_heads, c_max, head_dim}, stream);
+
+  rs->logits_out = nullptr;
+  if (tp_rank == 0 && pp_rank == PP - 1) {
+    CHECK_HIP(hipHostMalloc((void **)&rs->logits_out,
+                            BATCH_SIZE * (size_t)p->vocab_size * sizeof(float),
+                            hipHostMallocMapped));
+  }
 }
 
 #endif
