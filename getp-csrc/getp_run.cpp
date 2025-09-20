@@ -94,7 +94,7 @@ void *thread_handler(void *arg) {
   int id = args->id;
   int max_seq_len = public_requests->max_seq_len;
   int end_idx = args->end_idx;
-  args->tp_barrier = new pthread_barrier_t[PP * 4];
+  args->tp_barrier = new pthread_barrier_t[PP * 5];
 
 #ifdef RUN_20B
   CHECK_HIP(hipSetDevice(id));
@@ -104,17 +104,18 @@ void *thread_handler(void *arg) {
 
   // barrier for different pipeline stages
   for (int i = 0; i < PP; i++) {
-    int base_idx = i * 4;
+    int base_idx = i * 5;
     pthread_barrier_init(&(args->tp_barrier[base_idx]), NULL, TP);
     pthread_barrier_init(&(args->tp_barrier[base_idx + 1]), NULL, TP / 2);
     pthread_barrier_init(&(args->tp_barrier[base_idx + 2]), NULL, TP / 2);
     pthread_barrier_init(&(args->tp_barrier[base_idx + 3]), NULL, TP / 2);
+    pthread_barrier_init(&(args->tp_barrier[base_idx + 4]), NULL, TP / 2);
   }
 
   for (int i = 0; i < TOTAL_PIPELINES; i++) {
     inside_args[i].tp_rank = (i % TP);
     inside_args[i].pp_rank = (i % TOTAL_PIPELINES) / TP;
-    inside_args[i].tp_barrier = &(args->tp_barrier[inside_args[i].pp_rank * 4]);
+    inside_args[i].tp_barrier = &(args->tp_barrier[inside_args[i].pp_rank * 5]);
   }
 #endif
 
@@ -249,7 +250,7 @@ void *thread_handler(void *arg) {
   }
 
 #ifndef RUN_20B
-  for (int i = 0; i < PP * 4; i++) {
+  for (int i = 0; i < PP * 5; i++) {
     pthread_barrier_destroy(&(args->tp_barrier[i]));
   }
 #endif

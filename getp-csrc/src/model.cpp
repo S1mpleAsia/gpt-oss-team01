@@ -184,7 +184,19 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
   if (pp_rank == 0) {
     embedding_lookup_batched(weights_now->token_embedding_table, tokens, rs_now->tokens_buf,
                              rs_now->x_embed_buf, cur_batch_size, false, stream);
-    all_gather_x(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready, tp_finish);
+    /*
+    {
+      std::string timer_label = "all_gather_x_tp" + std::to_string(tp_rank);
+      GpuTimer timer(timer_label.c_str(), stream);
+      all_gather_x(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready, tp_finish);
+    }
+    */
+
+    {
+      std::string timer_label = "all_gather_x_new_tp" + std::to_string(tp_rank);
+      // GpuTimer timer(timer_label.c_str(), stream);
+      all_gather_x_new(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready, tp_finish);
+    }
   } else {
     rs_now->pipeline_each->dequeue(rs_now->x, stream);
   }
@@ -263,7 +275,7 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
 
     {
       std::string timer_label = "reduce_tb2_new_tp" + std::to_string(tp_rank);
-      GpuTimer timer(timer_label.c_str(), stream);
+      // GpuTimer timer(timer_label.c_str(), stream);
       reduce_tb2_new(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready,
                tp_finish);
     }
@@ -415,9 +427,10 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
     all_gather_tb3(rs_now, rs_leader, tp_rank, cur_device, p, tp_barrier, stream, tp_ready,
                    tp_finish);
 #else
+
     {
       std::string timer_label = "reduce_tb3_new_tp" + std::to_string(tp_rank);
-      GpuTimer timer(timer_label.c_str(), stream);
+      // GpuTimer timer(timer_label.c_str(), stream);
       reduce_tb3_new(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready,
                tp_finish);
     }

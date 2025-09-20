@@ -12,7 +12,7 @@
 #define PP_SLOT 1
 #define KV16
 // #define PRINT_LOGITS
-#define TIME_GPU
+// #define TIME_GPU
 // #define DEBUG
 // #define RUN_20B
 // #define RUN_EP

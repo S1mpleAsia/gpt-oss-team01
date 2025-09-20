@@ -49,6 +49,86 @@ void all_gather_x(
   }
 }
 
+void all_gather_x_new(
+  OurRunState *rs_now, OurRunState *rs_leader, int tp_rank,
+  int cur_device, int cur_batch_size, pthread_barrier_t *tp_barrier,
+  hipStream_t stream, hipEvent_t tp_ready, hipEvent_t tp_finish
+) {
+  int reduce_rank = tp_rank / 2;
+  int leader_rank = tp_rank % 2;
+  int partner_offset = (leader_rank == 0) ? 1 : -1;
+  int leader_offset = (reduce_rank == 0) ? 2 : -2;
+
+  float *d_buf_ptr = (float *)rs_now->x->d_buf;
+  float *d_tmp_buf = (float *)rs_now->x_embed_buf->d_buf;
+  float *d_tmp_buf_partner = (float *)(rs_now + partner_offset)->x_embed_buf->d_buf;
+  float *d_buf_leader = (float *)(rs_now + leader_offset)->x->d_buf;
+  int leader_device = cur_device - tp_rank;
+
+  size_t offset_buf = 1ll * rs_now->x->shape[1];
+  size_t offset_d_buf = 1ll * rs_now->x_embed_buf->shape[1];
+  size_t elems = 1ll * offset_d_buf * sizeof(float);
+
+  size_t src_pitch_in_bytes = 1ll * elems;
+  size_t width_in_bytes = 1ll * elems;
+  size_t dest_pitch_in_bytes = 1ll * elems * TP;
+  size_t height_in_elems = cur_batch_size;
+
+  // Perform the 2D asynchronous copy.
+  CHECK_HIP(hipMemcpy2DAsync(
+    d_buf_ptr + 1ll * tp_rank * offset_d_buf,
+    dest_pitch_in_bytes,
+    d_tmp_buf,
+    src_pitch_in_bytes,
+    width_in_bytes,
+    height_in_elems,
+    hipMemcpyDeviceToDevice,
+    stream
+  ));
+
+  CHECK_HIP(hipEventRecord(tp_ready, stream));
+
+  pthread_barrier_wait(tp_barrier + reduce_rank + 1);
+
+  hipEvent_t tp_ready_partner = total_events->tp_ready[cur_device + partner_offset];
+  CHECK_HIP(hipStreamWaitEvent(stream, tp_ready_partner));
+  
+  // Perform the 2D asynchronous copy.
+  CHECK_HIP(hipMemcpy2DAsync(
+    d_buf_ptr + 1ll * (tp_rank + partner_offset) * offset_d_buf,
+    dest_pitch_in_bytes,
+    d_tmp_buf_partner,
+    src_pitch_in_bytes,
+    width_in_bytes,
+    height_in_elems,
+    hipMemcpyDeviceToDevice,
+    stream
+  ));
+
+  CHECK_HIP(hipEventRecord(tp_finish, stream));
+
+  pthread_barrier_wait(tp_barrier + leader_rank + 3);
+
+  hipEvent_t tp_finish_leader = total_events->tp_finish[cur_device + leader_offset];
+  CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_leader));
+
+  size_t pos_offset = 1ll * (tp_rank - leader_rank + leader_offset) * offset_d_buf;
+  
+  // Perform the 2D asynchronous copy.
+  CHECK_HIP(hipMemcpy2DAsync(
+    d_buf_ptr + pos_offset,
+    dest_pitch_in_bytes,
+    d_buf_leader + pos_offset,
+    dest_pitch_in_bytes,
+    width_in_bytes * 2,
+    height_in_elems,
+    hipMemcpyDeviceToDevice, // Note: This copy is within the same device's perspective, but `hipMemcpyPeerAsync` is preferred for cross-device copies.
+    stream
+  ));
+
+  // pthread_barrier_wait(tp_barrier + leader_rank + 3);
+}
+
 __global__ void add_vector_kernel_direct(float *c, const float *a, const float *b, int len) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < len) {
