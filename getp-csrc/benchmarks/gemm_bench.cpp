@@ -26,19 +26,19 @@
   do {                                                                                             \
     hipError_t _err = (cmd);                                                                       \
     if (_err != hipSuccess) {                                                                      \
-      std::fprintf(stderr, "HIP error %s at %s:%d -> %s\n", #cmd, __FILE__, __LINE__,             \
-                    hipGetErrorString(_err));                                                      \
+      std::fprintf(stderr, "HIP error %s at %s:%d -> %s\n", #cmd, __FILE__, __LINE__,              \
+                   hipGetErrorString(_err));                                                       \
       std::exit(EXIT_FAILURE);                                                                     \
     }                                                                                              \
   } while (0)
 
 #if WITH_ROCBLAS
-#define CHECK_ROCBLAS(cmd)                                                                          \
+#define CHECK_ROCBLAS(cmd)                                                                         \
   do {                                                                                             \
     rocblas_status _st = (cmd);                                                                    \
     if (_st != rocblas_status_success) {                                                           \
       std::fprintf(stderr, "rocBLAS error %s at %s:%d -> status %d\n", #cmd, __FILE__, __LINE__,   \
-                    static_cast<int>(_st));                                                        \
+                   static_cast<int>(_st));                                                         \
       std::exit(EXIT_FAILURE);                                                                     \
     }                                                                                              \
   } while (0)
@@ -119,11 +119,10 @@ static float benchmark_rocblas(const float *dA, const bf16 *dB, float *dC, int M
   const float beta = 0.0f;
 
   for (int i = 0; i < 3; ++i) {
-    CHECK_ROCBLAS(rocblas_gemm_ex(handle, rocblas_operation_transpose, rocblas_operation_transpose,
-                                  N, M, K, &alpha, dB, rocblas_datatype_bf16_r, N, dA,
-                                  rocblas_datatype_f32_r, K, &beta, dC, rocblas_datatype_f32_r, N,
-                                  dC, rocblas_datatype_f32_r, N, rocblas_datatype_f32_r,
-                                  rocblas_gemm_algo_standard, 0, 0));
+    CHECK_ROCBLAS(rocblas_gemm_ex(
+      handle, rocblas_operation_transpose, rocblas_operation_transpose, N, M, K, &alpha, dB,
+      rocblas_datatype_bf16_r, N, dA, rocblas_datatype_f32_r, K, &beta, dC, rocblas_datatype_f32_r,
+      N, dC, rocblas_datatype_f32_r, N, rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0));
   }
   CHECK_HIP(hipStreamSynchronize(stream));
 
@@ -133,11 +132,10 @@ static float benchmark_rocblas(const float *dA, const bf16 *dB, float *dC, int M
 
   CHECK_HIP(hipEventRecord(start, stream));
   for (int i = 0; i < iters; ++i) {
-    CHECK_ROCBLAS(rocblas_gemm_ex(handle, rocblas_operation_transpose, rocblas_operation_transpose,
-                                  N, M, K, &alpha, dB, rocblas_datatype_bf16_r, N, dA,
-                                  rocblas_datatype_f32_r, K, &beta, dC, rocblas_datatype_f32_r, N,
-                                  dC, rocblas_datatype_f32_r, N, rocblas_datatype_f32_r,
-                                  rocblas_gemm_algo_standard, 0, 0));
+    CHECK_ROCBLAS(rocblas_gemm_ex(
+      handle, rocblas_operation_transpose, rocblas_operation_transpose, N, M, K, &alpha, dB,
+      rocblas_datatype_bf16_r, N, dA, rocblas_datatype_f32_r, K, &beta, dC, rocblas_datatype_f32_r,
+      N, dC, rocblas_datatype_f32_r, N, rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0));
   }
   CHECK_HIP(hipEventRecord(stop, stream));
   CHECK_HIP(hipEventSynchronize(stop));
@@ -248,11 +246,13 @@ int main(int argc, char **argv) {
     double custom_gflops = gflops_total / static_cast<double>(ms_custom);
 
     std::cout << "Problem M=" << M << ", N=" << N << ", K=" << K << '\n';
-    std::cout << "  gemm_mfma_v2  : " << ms_custom << " ms  (" << custom_gflops << " GFLOP/s)" << '\n';
+    std::cout << "  gemm_mfma_v2  : " << ms_custom << " ms  (" << custom_gflops << " GFLOP/s)"
+              << '\n';
 
 #if WITH_ROCBLAS
     double rocblas_gflops = gflops_total / static_cast<double>(ms_rocblas);
-    std::cout << "  rocBLAS       : " << ms_rocblas << " ms  (" << rocblas_gflops << " GFLOP/s)" << '\n';
+    std::cout << "  rocBLAS       : " << ms_rocblas << " ms  (" << rocblas_gflops << " GFLOP/s)"
+              << '\n';
     std::cout << "  max|diff|     : " << max_diff << '\n';
     std::cout << "  rel L2 error  : " << rel_l2 << '\n';
 #else
@@ -275,4 +275,3 @@ int main(int argc, char **argv) {
 
   return EXIT_SUCCESS;
 }
-

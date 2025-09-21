@@ -78,4 +78,3 @@ All HIP and rocBLAS calls are wrapped in macros that report the failing API call
 ## Customising the Kernel Launch
 
 `gemm_mfma_v2_kernel.hpp` exposes `launch_gemm_mfma_v2`, which is configured with the same tile/block setup that the main application uses (`BM=64`, `BN=128`, `BK=32`, `TM=TN=32`, `BLOCK_THREADS=512`). Adjust these constants if you need to explore alternative tilings; make sure the blockDim/launch configuration stays consistent across your application and benchmark.
-

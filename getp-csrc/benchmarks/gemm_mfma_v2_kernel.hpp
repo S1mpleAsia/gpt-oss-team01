@@ -3,34 +3,34 @@
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
 
-using bf16   = hip_bfloat16;
-using f32x4  = float __attribute__((ext_vector_type(4)));
+using bf16 = hip_bfloat16;
+using f32x4 = float __attribute__((ext_vector_type(4)));
 using bf16_isa = __bf16;
 using bf16x4 = bf16_isa __attribute__((__vector_size__(4 * sizeof(bf16_isa))));
 
 #if defined(__HIP_DEVICE_COMPILE__)
-  #if defined(__gfx90a__)
-    #if __has_builtin(__builtin_amdgcn_mfma_f32_16x16x16bf16)
-      #define BF16_MFMA_KSTEP 16
-      #define MFMA_BF16_16x16(a, b, c) __builtin_amdgcn_mfma_f32_16x16x16bf16((a), (b), (c), 0, 0, 0)
-    #elif __has_builtin(__builtin_amdgcn_mfma_f32_16x16x16bf16_1k)
-      #define BF16_MFMA_KSTEP 16
-      #define MFMA_BF16_16x16(a, b, c) __builtin_amdgcn_mfma_f32_16x16x16bf16_1k((a), (b), (c), 0, 0, 0)
-    #elif __has_builtin(__builtin_amdgcn_mfma_f32_16x16x8bf16)
-      #define BF16_MFMA_KSTEP 8
-      #define MFMA_BF16_16x16(a, b, c) __builtin_amdgcn_mfma_f32_16x16x8bf16((a), (b), (c), 0, 0, 0)
-    #elif __has_builtin(__builtin_amdgcn_mfma_f32_16x16x8bf16_1k)
-      #define BF16_MFMA_KSTEP 8
-      #define MFMA_BF16_16x16(a, b, c) __builtin_amdgcn_mfma_f32_16x16x8bf16_1k((a), (b), (c), 0, 0, 0)
-    #else
-      #error "gfx90a device compile without BF16 MFMA builtins"
-    #endif
-  #else
-    #error "This kernel targets gfx90a (MI250)."
-  #endif
+#if defined(__gfx90a__)
+#if __has_builtin(__builtin_amdgcn_mfma_f32_16x16x16bf16)
+#define BF16_MFMA_KSTEP 16
+#define MFMA_BF16_16x16(a, b, c) __builtin_amdgcn_mfma_f32_16x16x16bf16((a), (b), (c), 0, 0, 0)
+#elif __has_builtin(__builtin_amdgcn_mfma_f32_16x16x16bf16_1k)
+#define BF16_MFMA_KSTEP 16
+#define MFMA_BF16_16x16(a, b, c) __builtin_amdgcn_mfma_f32_16x16x16bf16_1k((a), (b), (c), 0, 0, 0)
+#elif __has_builtin(__builtin_amdgcn_mfma_f32_16x16x8bf16)
+#define BF16_MFMA_KSTEP 8
+#define MFMA_BF16_16x16(a, b, c) __builtin_amdgcn_mfma_f32_16x16x8bf16((a), (b), (c), 0, 0, 0)
+#elif __has_builtin(__builtin_amdgcn_mfma_f32_16x16x8bf16_1k)
+#define BF16_MFMA_KSTEP 8
+#define MFMA_BF16_16x16(a, b, c) __builtin_amdgcn_mfma_f32_16x16x8bf16_1k((a), (b), (c), 0, 0, 0)
 #else
-  #define BF16_MFMA_KSTEP 16
-  #define MFMA_BF16_16x16(a, b, c) (c)
+#error "gfx90a device compile without BF16 MFMA builtins"
+#endif
+#else
+#error "This kernel targets gfx90a (MI250)."
+#endif
+#else
+#define BF16_MFMA_KSTEP 16
+#define MFMA_BF16_16x16(a, b, c) (c)
 #endif
 
 __device__ __forceinline__ bf16x4 pack_f4_to_bf16x4(const float4 &v) {
@@ -43,18 +43,17 @@ __device__ __forceinline__ bf16x4 pack_f4_to_bf16x4(const float4 &v) {
 }
 
 template <int BM, int BN, int BK, int TM, int TN, int BLOCK_THREADS>
-__global__ __launch_bounds__(BLOCK_THREADS)
-void gemm_mfma_v2(const float *__restrict__ A,
-                  const bf16 *__restrict__ B,
-                  float *__restrict__ C,
-                  const bf16 *__restrict__ bias,
-                  int M, int N, int K) {
+__global__ __launch_bounds__(BLOCK_THREADS) void gemm_mfma_v2(const float *__restrict__ A,
+                                                              const bf16 *__restrict__ B,
+                                                              float *__restrict__ C,
+                                                              const bf16 *__restrict__ bias, int M,
+                                                              int N, int K) {
   static_assert(BK % BF16_MFMA_KSTEP == 0, "BK must be multiple of MFMA K-step");
   constexpr int WM = 16, WN = 16, WK = BF16_MFMA_KSTEP;
   constexpr int VEC_B_SIZE = 8;
   constexpr int VEC_A_SIZE = 4;
 
-  const int tid     = threadIdx.x;
+  const int tid = threadIdx.x;
   const int wave_id = tid >> 6;
   const int lane_id = tid & 63;
 
@@ -262,4 +261,3 @@ inline void launch_gemm_mfma_v2(const float *A, const bf16 *B, float *C, int M, 
   hipLaunchKernelGGL((gemm_mfma_v2<BM, BN, BK, TM, TN, BLOCK_THREADS>), grid_dim, block_dim, 0,
                      stream, A, B, C, bias, M, N, K);
 }
-

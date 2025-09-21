@@ -212,11 +212,6 @@ void single_query_attn_flash_batched(Tensor *q, Tensor *K_cache, Tensor *V_cache
   if (v_cache_to_device)
     V_cache->to_device(stream);
 
-#ifndef KV16
-  fprintf(stderr, "[FlashDec] ERROR: expects BF16 KV (KV16).\n");
-  abort();
-#endif
-
   const size_t n_layers = (size_t)K_cache->shape[1];
   const size_t layer_span = (size_t)seq_len * kv_dim;  // per-layer span
   const bf16 *K_ptr = ((const bf16 *)K_cache->d_buf) + layer_offset * layer_span;
