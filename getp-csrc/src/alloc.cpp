@@ -179,8 +179,6 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
                         hipStream_t stream) {
   CHECK_HIP(hipSetDevice(device_id));
 
-  rs->x_embed_buf = nullptr;
-
   rs->x = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
 
   rs->t = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
@@ -253,6 +251,11 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->g_fa_pnum = new Tensor({BATCH_SIZE, shard_attn_heads, c_max, head_dim}, stream);
 
   rs->logits_out = nullptr;
+
+  rs->logits_max = new Tensor({BATCH_SIZE}, stream);
+  rs->logits_max_total = nullptr;
+  rs->logits_id = new TensorI32({BATCH_SIZE}, stream);
+  rs->logits_id_total = nullptr;
 }
 
 #else
@@ -853,9 +856,6 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   int pp_rank = (device_id % TOTAL_PIPELINES) / TP;
   int tp_rank = device_id % TP;
 
-  // x_embed_buf
-  rs->x_embed_buf = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / TP}, stream);
-
   // Create Tensor wrappers for state buffers
   rs->x = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
 
@@ -978,6 +978,11 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
                             BATCH_SIZE * (size_t)p->vocab_size * sizeof(float),
                             hipHostMallocMapped));
   }
+
+  rs->logits_max = new Tensor({BATCH_SIZE}, stream);
+  rs->logits_max_total = new Tensor({TP, BATCH_SIZE}, stream);
+  rs->logits_id = new TensorI32({BATCH_SIZE}, stream);
+  rs->logits_id_total = new TensorI32({TP, BATCH_SIZE}, stream);
 }
 
 #endif
@@ -1061,8 +1066,6 @@ void our_free_each(OurTransformerWeights *weights, OurRunState *rs) {
     delete weights->out;
 
   // delete rs
-  if (rs->x_embed_buf)
-    delete rs->x_embed_buf;
   if (rs->x)
     delete rs->x;
   if (rs->t)
@@ -1132,6 +1135,18 @@ void our_free_each(OurTransformerWeights *weights, OurRunState *rs) {
 
   if (rs->logits_out) {
     CHECK_HIP(hipHostFree(rs->logits_out));
+  }
+  if (rs->logits_max) {
+    delete rs->logits_max;
+  }
+  if (rs->logits_max_total) {
+    delete rs->logits_max_total;
+  }
+  if (rs->logits_id) {
+    delete rs->logits_id;
+  }
+  if (rs->logits_id_total) {
+    delete rs->logits_id_total;
   }
 }
 

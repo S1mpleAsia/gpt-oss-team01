@@ -1,11 +1,11 @@
 #include "../include/model.hpp"
-#include "../include/comm.hpp"
+#include "../include/parallelism.hpp"
 #include <cmath>
 #include <cstring>
 
 #ifdef RUN_20B
 
-float *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flow_id) {
+int *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flow_id) {
   Config *p = public_config;
 
   OurTransformerWeights *weights_now = &weights[flow_id];
@@ -149,16 +149,19 @@ float *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flo
 
   // classifier into logits
   classifier_gemm_batched_v2(weights_now->out, rs_now->x, rs_now->logits, cur_batch_size, false,
-                             true, stream);
+                             false, stream);
 
-  return rs_now->logits->buf;
+  max_logits_batched(rs_now->logits, rs_now->logits_max, rs_now->logits_id, cur_batch_size, 0,
+                     false, false, true, stream);
+
+  return rs_now->logits_id->buf;
 }
 
 #else
 
 // two events are needed
-float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow_id, int tp_rank,
-                                int pp_rank, pthread_barrier_t *tp_barrier) {
+int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow_id, int tp_rank,
+                              int pp_rank, pthread_barrier_t *tp_barrier) {
   Config *p = public_config;
   int cur_device = flow_id * TOTAL_PIPELINES + pp_rank * TP + tp_rank;
 
@@ -183,11 +186,13 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
   CHECK_HIP(hipSetDevice(cur_device));
 
   if (pp_rank == 0) {
-    embedding_lookup_batched(weights_now->token_embedding_table, tokens, rs_now->tokens_buf,
-                             rs_now->x_embed_buf, cur_batch_size, false, stream);
+    // embedding_lookup_batched(weights_now->token_embedding_table, tokens, rs_now->tokens_buf, rs_now->x_embed_buf, cur_batch_size, false, stream);
+    embedding_lookup_shard_batched(weights_now->token_embedding_table, tokens, rs_now->tokens_buf,
+                                   rs_now->x, cur_batch_size, tp_rank, false, stream);
 
     all_gather_x_new(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream,
                      tp_ready, tp_finish);
+
   } else {
     rs_now->pipeline_each->dequeue(rs_now->x, stream);
   }
@@ -456,10 +461,36 @@ float *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int fl
     classifier_gemm_batched_v2(weights_now->out_buffer, rs_now->x, rs_now->tmp_logits,
                                cur_batch_size, false, false, stream);
 
-    all_gather_classifier_final(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier,
-                                stream, tp_ready, tp_finish);
+    // all_gather_classifier_final(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready, tp_finish);
 
-    return rs_leader->logits_out;
+    max_logits_batched(rs_now->tmp_logits, rs_now->logits_max, rs_now->logits_id, cur_batch_size,
+                       tp_rank, false, false, false, stream);
+
+    // printf("Before all gather logits\n");
+    // fflush(stdout);
+    // all reduce here
+    all_gather_logits_id(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream,
+                         tp_ready, tp_finish);
+
+    CHECK_HIP(hipStreamSynchronize(stream));
+    pthread_barrier_wait(tp_barrier);
+
+    if (tp_rank == 0) {
+      for (int i = 1; i < TP; i++) {
+        hipEvent_t tp_ready_each = total_events->tp_ready[cur_device + i];
+        CHECK_HIP(hipStreamWaitEvent(stream, tp_ready_each));
+      }
+      // max kernel here too
+
+      // printf("Before reduce logits\n");
+      // fflush(stdout);
+      reduce_logits_batched(rs_now->logits_max_total, rs_now->logits_id_total, rs_now->logits_max,
+                            rs_now->logits_id, cur_batch_size, false, false, false, true, stream);
+
+      return rs_now->logits_id->buf;
+    }
+
+    return nullptr;
   } else {
     CHECK_HIP(hipEventRecord(pp_sync, stream));
     OurRunState *rs_new = &rs[cur_device + TP];

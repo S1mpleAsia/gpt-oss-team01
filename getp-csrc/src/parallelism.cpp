@@ -1,4 +1,4 @@
-#include "../include/comm.hpp"
+#include "../include/parallelism.hpp"
 
 __global__ void extract_local_tokens_kernel(const float *x_packed, float *x_packed_local,
                                             size_t local_num_tokens, size_t start_offset,
@@ -41,11 +41,11 @@ void all_gather_x(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int 
   int leader_device = cur_device - tp_rank;
 
   size_t offset_buf = 1ll * rs_now->x->shape[1];
-  size_t offset_d_buf = 1ll * rs_now->x_embed_buf->shape[1];
+  size_t offset_d_buf = 1ll * (offset_buf / TP);
   size_t elems = 1ll * offset_d_buf * sizeof(float);
 
   for (int i = 0; i < TP; i++) {
-    d_embed_buf[i] = (float *)(rs_leader + i)->x_embed_buf->d_buf;
+    d_embed_buf[i] = (float *)(rs_leader + i)->x->d_buf;
   }
 
   size_t src_pitch_in_bytes = 1ll * elems;
@@ -61,13 +61,15 @@ void all_gather_x(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int 
   }
 
   for (int i = 0; i < TP; i++) {
+    if (i == tp_rank)
+      continue;
     size_t dest_offset = 1ll * i * offset_d_buf;
     float *dest_ptr = (float *)d_buf_ptr + dest_offset;
+    float *src_ptr = (float *)d_embed_buf[i] + dest_offset;
 
     // Perform the 2D asynchronous copy.
     CHECK_HIP(hipMemcpy2DAsync(
-      dest_ptr, dest_pitch_in_bytes, d_embed_buf[i], src_pitch_in_bytes, width_in_bytes,
-      height_in_elems,
+      dest_ptr, dest_pitch_in_bytes, src_ptr, dest_pitch_in_bytes, width_in_bytes, height_in_elems,
       hipMemcpyDeviceToDevice,  // Note: This copy is within the same device's perspective, but `hipMemcpyPeerAsync` is preferred for cross-device copies.
       stream));
   }
@@ -83,24 +85,18 @@ void all_gather_x_new(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, 
   int leader_offset = (reduce_rank == 0) ? 2 : -2;
 
   float *d_buf_ptr = (float *)rs_now->x->d_buf;
-  float *d_tmp_buf = (float *)rs_now->x_embed_buf->d_buf;
-  float *d_tmp_buf_partner = (float *)(rs_now + partner_offset)->x_embed_buf->d_buf;
+  float *d_tmp_buf_partner = (float *)(rs_now + partner_offset)->x->d_buf;
   float *d_buf_leader = (float *)(rs_now + leader_offset)->x->d_buf;
   int leader_device = cur_device - tp_rank;
 
   size_t offset_buf = 1ll * rs_now->x->shape[1];
-  size_t offset_d_buf = 1ll * rs_now->x_embed_buf->shape[1];
+  size_t offset_d_buf = 1ll * (offset_buf / TP);
   size_t elems = 1ll * offset_d_buf * sizeof(float);
 
   size_t src_pitch_in_bytes = 1ll * elems;
   size_t width_in_bytes = 1ll * elems;
   size_t dest_pitch_in_bytes = 1ll * elems * TP;
   size_t height_in_elems = cur_batch_size;
-
-  // Perform the 2D asynchronous copy.
-  CHECK_HIP(hipMemcpy2DAsync(d_buf_ptr + 1ll * tp_rank * offset_d_buf, dest_pitch_in_bytes,
-                             d_tmp_buf, src_pitch_in_bytes, width_in_bytes, height_in_elems,
-                             hipMemcpyDeviceToDevice, stream));
 
   CHECK_HIP(hipEventRecord(tp_ready, stream));
 
@@ -109,9 +105,11 @@ void all_gather_x_new(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, 
   hipEvent_t tp_ready_partner = total_events->tp_ready[cur_device + partner_offset];
   CHECK_HIP(hipStreamWaitEvent(stream, tp_ready_partner));
 
+  size_t partner_pos_offset = 1ll * (tp_rank + partner_offset) * offset_d_buf;
+
   // Perform the 2D asynchronous copy.
-  CHECK_HIP(hipMemcpy2DAsync(d_buf_ptr + 1ll * (tp_rank + partner_offset) * offset_d_buf,
-                             dest_pitch_in_bytes, d_tmp_buf_partner, src_pitch_in_bytes,
+  CHECK_HIP(hipMemcpy2DAsync(d_buf_ptr + partner_pos_offset, dest_pitch_in_bytes,
+                             d_tmp_buf_partner + partner_pos_offset, dest_pitch_in_bytes,
                              width_in_bytes, height_in_elems, hipMemcpyDeviceToDevice, stream));
 
   CHECK_HIP(hipEventRecord(tp_finish, stream));
@@ -634,6 +632,30 @@ void all_gather_classifier_v2(OurRunState *rs_now, OurRunState *rs_leader, int t
       CHECK_HIP(hipStreamWaitEvent(stream, worker_event, 0));
     }
   }
+
+  pthread_barrier_wait(tp_barrier);
+}
+
+void all_gather_logits_id(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
+                          int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream,
+                          hipEvent_t tp_ready, hipEvent_t tp_finish) {
+  const float *src_max_buf = (const float *)rs_now->logits_max->d_buf;
+  size_t dst_max_offset = 1ll * tp_rank * rs_leader->logits_max_total->shape[1];
+  float *dst_max_buf = (float *)rs_leader->logits_max_total->d_buf + dst_max_offset;
+  size_t bytes_max = 1ll * cur_batch_size * sizeof(float);
+
+  CHECK_HIP(hipMemcpyPeerAsync(dst_max_buf, cur_device - tp_rank, src_max_buf, cur_device,
+                               bytes_max, stream));
+
+  const int *src_id_buf = (const int *)rs_now->logits_id->d_buf;
+  size_t dst_id_offset = 1ll * tp_rank * rs_leader->logits_id_total->shape[1];
+  int *dst_id_buf = (int *)rs_leader->logits_id_total->d_buf + dst_id_offset;
+  size_t bytes_id = 1ll * cur_batch_size * sizeof(int);
+
+  CHECK_HIP(
+    hipMemcpyPeerAsync(dst_id_buf, cur_device - tp_rank, src_id_buf, cur_device, bytes_id, stream));
+
+  CHECK_HIP(hipEventRecord(tp_ready, stream));
 
   pthread_barrier_wait(tp_barrier);
 }

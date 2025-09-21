@@ -22,7 +22,7 @@
 #define PP 1
 #define TP 1
 #else
-#define DP 1
+#define DP 2
 #define PP 1
 #define TP 4
 #endif
@@ -71,10 +71,9 @@ typedef struct {
   Tensor *sin_tensor;
 
   // current wave of activations
-  Tensor *x_embed_buf;  // (hidden_dim / TP)
-  Tensor *x;            // activation at current time stamp (hidden_dim, )
-  Tensor *t;            // same, but inside a residual branch (hidden_dim, )
-  Tensor *tb;           // (head_dim * n_attn_heads, )
+  Tensor *x;   // activation at current time stamp (hidden_dim, )
+  Tensor *t;   // same, but inside a residual branch (hidden_dim, )
+  Tensor *tb;  // (head_dim * n_attn_heads, )
   // Tensor *tb_buf;
   Tensor *tb2;  // (hidden_dim, )
   Tensor *tb2_buf;
@@ -123,6 +122,10 @@ typedef struct {
   Tensor *g_fa_pnum;  // [batch_size, n_attn_heads, c_max, head_dim]
 
   float *logits_out;
+  Tensor *logits_max;
+  Tensor *logits_max_total;
+  TensorI32 *logits_id;
+  TensorI32 *logits_id_total;
 } OurRunState;
 
 typedef struct {
@@ -140,7 +143,7 @@ typedef struct {
   int pos;
   int current_size;
   int id;
-  float *logits;
+  int *tokens;
   pthread_barrier_t *tp_barrier;
 
   int *pos_ptr;
