@@ -643,6 +643,28 @@ __global__ void moe_agg_kernel(const float *__restrict__ tb3_ptr,   // [total_pa
   atomicAdd(&e_agg[(size_t)b * hidden_dim + h], val);
 }
 
+__global__ void moe_agg_kernel_120b(
+  const float *__restrict__ tb3_ptr,   // [total_pairs, hidden_dim]
+  const int *__restrict__ sorted_ids,  //[total_pair]
+  const float *__restrict__ topk_v,    // [batch_size, experts_per_token]
+  float *__restrict__ e_agg,           // [batch_size, hidden_dim]
+  int hidden_dim, int experts_per_token, int total_pairs) {
+  const int h = blockIdx.x * blockDim.x + threadIdx.x;
+  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+
+  if (h >= hidden_dim || row >= total_pairs)
+    return;
+
+  const int pair = sorted_ids[row];
+  const int b = pair / experts_per_token;
+  const int e = pair % experts_per_token;
+
+  const float w = topk_v[(size_t)b * experts_per_token + e];
+  const float val = tb3_ptr[(size_t)row * hidden_dim + h] * w;
+
+  atomicAdd(&e_agg[(size_t)b * hidden_dim + h], val);
+}
+
 static inline void moe_init_buffers(Tensor *e_agg, Tensor *mlp1_out, Tensor *gate_up, Tensor *tb3,
                                     TensorI32 *sorted_pair_ids, TensorI32 *expert_offsets,
                                     Tensor *x_packed, int batch_size, int hidden_dim,
@@ -855,129 +877,25 @@ static inline void moe_scatter_aggregate(
     expert_offsets->d_buf, hidden_dim, experts_per_token);
 }
 
-void moe_block_matmul_style(
-  Tensor *x_in,                // [batch_size, hidden_dim]
-  TensorI32 *topk_idx,         // [batch_size, experts_per_token]
-  Tensor *topk_v,              // [batch_size, experts_per_token]
-  Tensor *w_mlp1,              // [n_layers, n_experts, hidden_dim, 2*intermediate_dim]
-  Tensor *b_mlp1,              // [n_layers, n_experts, 2*intermediate_dim]
-  Tensor *w_mlp2,              // [n_layers, n_experts, intermediate_dim, hidden_dim]
-  Tensor *b_mlp2,              // [n_layers, n_experts, hidden_dim]
-  Tensor *e_agg,               // [batch_size, hidden_dim]
-  Tensor *mlp1_out,            // [batch_size * experts_per_token, 2 * inter_dim]
-  Tensor *gate_up,             // [batch_size * experts_per_token, inter_dim]
-  Tensor *tb3,                 // [batch_size * experts_per_token, hidden_dim]
+static inline void moe_scatter_aggregate_120b(
+  Tensor *tb3,                 // [total_pairs, hidden_dim]
   TensorI32 *sorted_pair_ids,  // [batch_size * experts_per_token]
-  TensorI32 *expert_offsets,   // [n_experts + 1]
-  Tensor *x_packed,            // [batch_size * experts_per_token, hidden_dim]
-  float clamp_limit, long long layer_offset, hipStream_t stream) {
-  // ====== Lấy kích thước ======
-  const int batch_size = (int)x_in->shape[0];
-  const int hidden_dim = (int)x_in->shape[1];
-  const int experts_per_token = (int)topk_idx->shape[1];
-  const int n_experts = (int)w_mlp1->shape[1];
-  const int inter_dim = (int)w_mlp1->shape[3] / 2;
-  const int total_pairs = batch_size * experts_per_token;
-
-  // ====== Con trỏ ======
-  const float *x_ptr = (const float *)x_in->d_buf;
-  const int *topk_idx_ptr = (const int *)topk_idx->d_buf;
+  Tensor *topk_v,              // [batch_size, experts_per_token]
+  Tensor *e_agg,               // [batch_size, hidden_dim]
+  TensorI32 *expert_offsets,   // [n_experts+1]
+  int hidden_dim, int experts_per_token, int n_experts, int max_rows_per_expert,
+  hipStream_t stream) {
+  const float *tb3_ptr = (const float *)tb3->d_buf;
+  const int *sorted_pair_ptr = (const int *)sorted_pair_ids->d_buf;
   const float *topk_v_ptr = (const float *)topk_v->d_buf;
-
-  const bf16 *w1_ptr =
-    (const bf16 *)w_mlp1->d_buf + (size_t)layer_offset * n_experts * hidden_dim * 2 * inter_dim;
-  const bf16 *b1_ptr =
-    (const bf16 *)b_mlp1->d_buf + (size_t)layer_offset * n_experts * 2 * inter_dim;
-  const bf16 *w2_ptr =
-    (const bf16 *)w_mlp2->d_buf + (size_t)layer_offset * n_experts * inter_dim * hidden_dim;
-  const bf16 *b2_ptr = (const bf16 *)b_mlp2->d_buf + (size_t)layer_offset * n_experts * hidden_dim;
-
   float *e_agg_ptr = (float *)e_agg->d_buf;
 
-  CHECK_HIP(hipMemsetAsync(e_agg_ptr, 0, (size_t)batch_size * hidden_dim * sizeof(float), stream));
-  //   CHECK_HIP(
-  //     hipMemsetAsync(mlp1_out->d_buf, 0, mlp1_out->num_elem() * mlp1_out->get_dtype_size(), stream));
-  //   CHECK_HIP(
-  //     hipMemsetAsync(gate_up->d_buf, 0, gate_up->num_elem() * gate_up->get_dtype_size(), stream));
-  //   CHECK_HIP(hipMemsetAsync(tb3->d_buf, 0, tb3->num_elem() * tb3->get_dtype_size(), stream));
+  const int total_pairs = sorted_pair_ids->shape[0];
 
-  //   CHECK_HIP(
-  //     hipMemsetAsync(sorted_pair_ids->d_buf, 0, sorted_pair_ids->num_elem() * sizeof(int), stream));
-  //   CHECK_HIP(
-  //     hipMemsetAsync(expert_offsets->d_buf, 0, expert_offsets->num_elem() * sizeof(int), stream));
-  //   CHECK_HIP(
-  //     hipMemsetAsync(x_packed->d_buf, 0, x_packed->num_elem() * x_packed->get_dtype_size(), stream));
+  dim3 block_size(64, 4, 1);
+  dim3 grid_size((hidden_dim + block_size.x - 1) / block_size.x,
+                 (total_pairs + block_size.y - 1) / block_size.y, 1);
 
-  // ====== 1) sort & offsets ======
-  {
-    const size_t shmem_bytes = (size_t)n_experts * sizeof(int);
-    dim3 block_size(256);
-    dim3 grid_size(1);
-
-    build_expert_offsets_kernel<<<grid_size, block_size, shmem_bytes, stream>>>(
-      topk_idx_ptr, sorted_pair_ids->d_buf, expert_offsets->d_buf, batch_size, experts_per_token,
-      n_experts);
-  }
-
-  // ====== 2) pack X theo sorted_ids ======
-  {
-    dim3 block_size(256, 1);
-    dim3 grid_size((hidden_dim + block_size.x - 1) / block_size.x, total_pairs);
-    gather_inputs_by_sorted_kernel<<<grid_size, block_size, 0, stream>>>(
-      x_ptr, sorted_pair_ids->d_buf, (float *)x_packed->d_buf, batch_size, hidden_dim,
-      experts_per_token);
-  }
-
-  int max_rows_per_expert = 0;
-  {
-    int *d_max_rows = nullptr;
-    CHECK_HIP(hipMalloc(&d_max_rows, sizeof(int)));
-    CHECK_HIP(hipMemsetAsync(d_max_rows, 0, sizeof(int), stream));
-    compute_max_rows_from_offsets_kernel<<<(n_experts + 255) / 256, 256, 0, stream>>>(
-      expert_offsets->d_buf, n_experts, d_max_rows);
-    CHECK_HIP(
-      hipMemcpyAsync(&max_rows_per_expert, d_max_rows, sizeof(int), hipMemcpyDeviceToHost, stream));
-    CHECK_HIP(hipStreamSynchronize(stream));
-    CHECK_HIP(hipFree(d_max_rows));
-  }
-
-  {
-    constexpr int BM = 16, BN = 128, BK = 16, TM = 2, TN = 8;
-    dim3 block_size(BN / TN, BM / TM);
-    dim3 grid_size((2 * inter_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
-    //printf("moe mlp1 gemm: %d %d %d\n", total_pairs, 2 * inter_dim, hidden_dim);
-    matmul_kernel_bf16_moe<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
-      (const float *)x_packed->d_buf, w1_ptr, (float *)mlp1_out->d_buf, b1_ptr,
-      expert_offsets->d_buf, total_pairs, 2 * inter_dim, hidden_dim);
-  }
-
-  {
-    size_t total = (size_t)batch_size * experts_per_token * inter_dim;
-    dim3 block_size(256);
-    dim3 grid_size((total + 255) / 256);
-    swiglu_interleaved_batched_fast_v2<<<grid_size, block_size, 0, stream>>>(
-      (const float *)mlp1_out->d_buf, (float *)gate_up->d_buf, inter_dim,
-      batch_size * experts_per_token, clamp_limit);
-  }
-
-  {
-    constexpr int BM = 16, BN = 128, BK = 16, TM = 2, TN = 8;
-    dim3 block_size(BN / TN, BM / TM);
-    dim3 grid_size((hidden_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
-    //printf("moe mlp2 gemm: %d %d %d \n", total_pairs, hidden_dim, inter_dim);
-    matmul_kernel_bf16_moe<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
-      (const float *)gate_up->d_buf, w2_ptr, (float *)tb3->d_buf, b2_ptr, expert_offsets->d_buf,
-      total_pairs, hidden_dim, inter_dim);
-  }
-
-  {
-    dim3 block_size(32, 8, 1);
-    dim3 grid_size((hidden_dim + block_size.x - 1) / block_size.x,
-                   (max_rows_per_expert + block_size.y - 1) / block_size.y, n_experts);
-    moe_agg_kernel<<<grid_size, block_size, 0, stream>>>(
-      (const float *)tb3->d_buf, (const int *)sorted_pair_ids->d_buf, topk_v_ptr, e_agg_ptr,
-      expert_offsets->d_buf, hidden_dim, experts_per_token);
-  }
-
-  CHECK_HIP(hipGetLastError());
+  moe_agg_kernel_120b<<<grid_size, block_size, 0, stream>>>(
+    tb3_ptr, sorted_pair_ptr, topk_v_ptr, e_agg_ptr, hidden_dim, experts_per_token, total_pairs);
 }

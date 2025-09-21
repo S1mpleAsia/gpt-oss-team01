@@ -179,6 +179,8 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
                         hipStream_t stream) {
   CHECK_HIP(hipSetDevice(device_id));
 
+  rs->x_embed_buf = nullptr;
+
   rs->x = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
 
   rs->t = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
@@ -249,6 +251,8 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->g_fa_pmax = new Tensor({BATCH_SIZE, shard_attn_heads, c_max}, stream);
   rs->g_fa_psum = new Tensor({BATCH_SIZE, shard_attn_heads, c_max}, stream);
   rs->g_fa_pnum = new Tensor({BATCH_SIZE, shard_attn_heads, c_max, head_dim}, stream);
+
+  rs->logits_out = nullptr;
 }
 
 #else
@@ -269,9 +273,60 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   int shard_inter_dim = p->intermediate_dim / TP;
 
   // Create Tensor wrappers for weight matrices
+  // if (pp_rank == 0) {
+  //   weights->token_embedding_table = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim},
+  //                                               w->token_embedding_table, stream, DType::BF16);
+  // } else {
+  //   weights->token_embedding_table = nullptr;
+  // }
   if (pp_rank == 0) {
-    weights->token_embedding_table = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim},
-                                                w->token_embedding_table, stream, DType::BF16);
+    {
+      printf("Starting alloc token_embedding_table...\n");
+      fflush(stdout);
+
+      size_t vocab_size = p->vocab_size;
+      size_t hidden_dim = p->hidden_dim;
+      size_t hidden_shard = hidden_dim / TP;
+      weights->token_embedding_table = new Tensor(
+        {vocab_size, hidden_shard}, w->token_embedding_table, stream, DType::BF16, false);
+
+      size_t offset_orig = 1ll * hidden_dim;
+      size_t offset_d = 1ll * hidden_shard;
+
+      float *w_embed_ptr = (float *)w->token_embedding_table + tp_rank * offset_d;
+      bf16 *w_embed_d_ptr = (bf16 *)weights->token_embedding_table->d_buf;
+
+      bf16 *tmp = (bf16 *)malloc(hidden_shard * sizeof(bf16));
+
+      hipEvent_t finish_env;
+      CHECK_HIP(hipEventCreate(&finish_env));
+
+      for (int v_id = 0; v_id < vocab_size; v_id++) {
+        if (v_id > 0) {
+          CHECK_HIP(hipEventSynchronize(finish_env));
+        }
+
+#pragma omp simd
+        for (int h = 0; h < hidden_shard; h++) {
+          tmp[h] = w_embed_ptr[h];
+        }
+
+        CHECK_HIP(hipMemcpyAsync(w_embed_d_ptr, tmp, hidden_shard * sizeof(bf16),
+                                 hipMemcpyHostToDevice, stream));
+        CHECK_HIP(hipEventRecord(finish_env, stream));
+
+        w_embed_ptr += offset_orig;
+        w_embed_d_ptr += offset_d;
+      }
+
+      CHECK_HIP(hipEventSynchronize(finish_env));
+
+      free(tmp);
+      CHECK_HIP(hipEventDestroy(finish_env));
+
+      printf("Finish alloc token_embedding_table\n");
+      fflush(stdout);
+    }
   } else {
     weights->token_embedding_table = nullptr;
   }
@@ -797,6 +852,10 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   CHECK_HIP(hipSetDevice(device_id));
   int pp_rank = (device_id % TOTAL_PIPELINES) / TP;
   int tp_rank = device_id % TP;
+
+  // x_embed_buf
+  rs->x_embed_buf = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / TP}, stream);
+
   // Create Tensor wrappers for state buffers
   rs->x = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
 
@@ -805,37 +864,37 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   // rs->tb_buf = new Tensor({BATCH_SIZE, (size_t)p->head_dim * p->n_attn_heads / TP}, stream);
 
   rs->tb2 = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
-  rs->tb2_recv = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / TP}, stream);
-  // if (device_id % TP == 0) {
-  //   rs->tb2_buf = new Tensor({(TP - 1), BATCH_SIZE, (size_t)p->hidden_dim}, stream);
-  // } else {
-  //   rs->tb2_buf = nullptr;
-  // }
+  // rs->tb2_recv = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / TP}, stream);
+  if (tp_rank < 3 && TP > 1) {
+    rs->tb2_buf = new Tensor({TP / 2, BATCH_SIZE, (size_t)p->hidden_dim}, stream);
+  } else {
+    rs->tb2_buf = nullptr;
+  }
 
   rs->tb3 = new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
-  rs->tb3_recv =
-    new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim / TP}, stream);
-  // if (device_id % TP == 0) {
-  //   rs->tb3_buf = new Tensor(
-  //     {(TP - 1), BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
-  // } else {
-  //   rs->tb3_buf = nullptr;
-  // }
+  // rs->tb3_recv =
+  //   new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim / TP}, stream);
+  if (tp_rank < 3 && TP > 1) {
+    rs->tb3_buf =
+      new Tensor({TP / 2, BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
+  } else {
+    rs->tb3_buf = nullptr;
+  }
 
   rs->router_score = new Tensor({BATCH_SIZE, (size_t)p->n_experts}, stream);
   rs->topk_v = new Tensor({BATCH_SIZE, (size_t)p->experts_per_token}, stream);
   rs->topk_i = new TensorI32({BATCH_SIZE, (size_t)p->experts_per_token}, stream);
 
-  rs->mlp1_out =
-    new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, 2 * (size_t)p->intermediate_dim}, stream);
+  rs->mlp1_out = new Tensor(
+    {BATCH_SIZE, (size_t)p->experts_per_token, 2 * (size_t)p->intermediate_dim / TP}, stream);
 
   // rs->gate =
   //   new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
   // rs->up =
   //   new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
 
-  rs->gate_up =
-    new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
+  rs->gate_up = new Tensor(
+    {BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim / TP}, stream);
 
   rs->e_agg = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
   if (device_id % TP == 0) {
@@ -857,11 +916,11 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
 
 #ifdef KV16
   printf("using BF16 KV cache\n");
-  rs->key_cache = new Tensor({BATCH_SIZE, ((size_t)p->n_layers / PP), (size_t)p->seq_len,
+  rs->key_cache = new Tensor({BATCH_SIZE * PP_SLOT, ((size_t)p->n_layers / PP), (size_t)p->seq_len,
                               (size_t)p->n_kv_heads * p->head_dim / TP},
                              stream, DType::BF16);
-  rs->value_cache = new Tensor({BATCH_SIZE, ((size_t)p->n_layers / PP), (size_t)p->seq_len,
-                                (size_t)p->n_kv_heads * p->head_dim / TP},
+  rs->value_cache = new Tensor({BATCH_SIZE * PP_SLOT, ((size_t)p->n_layers / PP),
+                                (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim / TP},
                                stream, DType::BF16);
 #else
   printf("using FP32 KV cache\n");
@@ -952,14 +1011,15 @@ void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunSt
     CHECK_HIP(hipStreamCreate(&total_streams[i]));
     CHECK_HIP(hipEventCreate(&(total_events->tp_ready[i])));
     CHECK_HIP(hipEventCreate(&(total_events->tp_finish[i])));
-    CHECK_HIP(hipEventCreate(&(total_events->pp_sync[i])));
     our_init_weights(w, p, &weights[i], i, total_streams[i]);
     our_init_run_state(s, p, &rs[i], i, total_streams[i]);
 #else
     CHECK_HIP(hipStreamCreate(&total_streams[i]));
     CHECK_HIP(hipEventCreate(&(total_events->tp_ready[i])));
     CHECK_HIP(hipEventCreate(&(total_events->tp_finish[i])));
-    CHECK_HIP(hipEventCreate(&(total_events->pp_sync[i])));
+    if (PP > 1) {
+      CHECK_HIP(hipEventCreate(&(total_events->pp_sync[i])));
+    }
     our_init_weights(w, p, &weights[i], i, total_streams[i]);
     our_init_run_state(s, p, &rs[i], i, total_streams[i]);
 #endif
@@ -1001,6 +1061,8 @@ void our_free_each(OurTransformerWeights *weights, OurRunState *rs) {
     delete weights->out;
 
   // delete rs
+  if (rs->x_embed_buf)
+    delete rs->x_embed_buf;
   if (rs->x)
     delete rs->x;
   if (rs->t)
@@ -1067,6 +1129,10 @@ void our_free_each(OurTransformerWeights *weights, OurRunState *rs) {
   if (rs->g_fa_pnum) {
     delete rs->g_fa_pnum;
   }
+
+  if (rs->logits_out) {
+    CHECK_HIP(hipHostFree(rs->logits_out));
+  }
 }
 
 void our_free(OurTransformerWeights *weights, OurRunState *rs, hipStream_t *total_streams,
@@ -1078,7 +1144,9 @@ void our_free(OurTransformerWeights *weights, OurRunState *rs, hipStream_t *tota
     CHECK_HIP(hipStreamDestroy(total_streams[i]));
     CHECK_HIP(hipEventDestroy(total_events->tp_ready[i]));
     CHECK_HIP(hipEventDestroy(total_events->tp_finish[i]));
-    CHECK_HIP(hipEventDestroy(total_events->pp_sync[i]));
+    if (PP > 1) {
+      CHECK_HIP(hipEventDestroy(total_events->pp_sync[i]));
+    }
 
     our_free_each(&weights[i], &rs[i]);
 

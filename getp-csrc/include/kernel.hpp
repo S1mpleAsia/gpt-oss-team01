@@ -72,19 +72,11 @@ static inline void moe_scatter_aggregate(
   int hidden_dim, int experts_per_token, int n_experts, int max_rows_per_expert,
   hipStream_t stream);
 
-void moe_block_matmul_style(
-  Tensor *x_in,                // [batch_size, hidden_dim]
-  TensorI32 *topk_idx,         // [batch_size, experts_per_token]
-  Tensor *topk_v,              // [batch_size, experts_per_token]
-  Tensor *w_mlp1,              // [n_layers, n_experts, hidden_dim, 2*intermediate_dim]
-  Tensor *b_mlp1,              // [n_layers, n_experts, 2*intermediate_dim]
-  Tensor *w_mlp2,              // [n_layers, n_experts, intermediate_dim, hidden_dim]
-  Tensor *b_mlp2,              // [n_layers, n_experts, hidden_dim]
-  Tensor *e_agg,               // [batch_size, hidden_dim]
-  Tensor *mlp1_out,            // [batch_size * experts_per_token, 2 * inter_dim]
-  Tensor *gate_up,             // [batch_size * experts_per_token, inter_dim]
-  Tensor *tb3,                 // [batch_size * experts_per_token, hidden_dim]
+static inline void moe_scatter_aggregate_120b(
+  Tensor *tb3,                 // [total_pairs, hidden_dim]
   TensorI32 *sorted_pair_ids,  // [batch_size * experts_per_token]
-  TensorI32 *expert_offsets,   // [n_experts + 1]
-  Tensor *x_packed,            // [batch_size * experts_per_token, hidden_dim]
-  float clamp_limit, long long layer_offset, hipStream_t stream);
+  Tensor *topk_v,              // [batch_size, experts_per_token]
+  Tensor *e_agg,               // [batch_size, hidden_dim]
+  TensorI32 *expert_offsets,   // [n_experts+1]
+  int hidden_dim, int experts_per_token, int n_experts, int max_rows_per_expert,
+  hipStream_t stream);
