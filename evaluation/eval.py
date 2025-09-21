@@ -244,6 +244,8 @@ def main():
 
     print("computing BERTScore (roberta-large-mnli)...", flush=True)
     models_root = os.environ.get("MODELS_ROOT")
+    if models_root is None:
+        models_root = "/nfs/gpu_trainee/final-project/models"
     bs_model_root = Path(models_root) / "bs_model" / "roberta-large-mnli"
     roberta_local = ensure_bs_model(bs_model_root)
     n_b, bsf1 = compute_bertscore(refs, subm, str(roberta_local))

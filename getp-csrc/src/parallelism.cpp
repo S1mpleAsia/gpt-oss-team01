@@ -526,6 +526,30 @@ void all_gather_classifier_final(
   pthread_barrier_wait(tp_barrier);
 }
 
+void all_gather_logits_id(
+    OurRunState *rs_now, OurRunState *rs_leader, int tp_rank,
+    int cur_device, int cur_batch_size, pthread_barrier_t *tp_barrier,
+    hipStream_t stream, hipEvent_t tp_ready, hipEvent_t tp_finish
+) {
+  const float *src_max_buf = (const float *)rs_now->logits_max->d_buf;
+  size_t dst_max_offset = 1ll * tp_rank * rs_leader->logits_max_total->shape[1];
+  float *dst_max_buf = (float *)rs_leader->logits_max_total->d_buf + dst_max_offset;
+  size_t bytes_max = 1ll * cur_batch_size * sizeof(float);
+
+  CHECK_HIP(hipMemcpyPeerAsync(dst_max_buf, cur_device - tp_rank, src_max_buf, cur_device, bytes_max, stream));
+
+  const int *src_id_buf = (const int *)rs_now->logits_id->d_buf;
+  size_t dst_id_offset = 1ll * tp_rank * rs_leader->logits_id_total->shape[1];
+  int *dst_id_buf = (int *)rs_leader->logits_id_total->d_buf + dst_id_offset;
+  size_t bytes_id = 1ll * cur_batch_size * sizeof(int);
+
+  CHECK_HIP(hipMemcpyPeerAsync(dst_id_buf, cur_device - tp_rank, src_id_buf, cur_device, bytes_id, stream));
+
+  CHECK_HIP(hipEventRecord(tp_ready, stream));
+                            
+  pthread_barrier_wait(tp_barrier);
+}
+
 void all_gather_qkv_v2(
     OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
     int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream,

@@ -8,9 +8,9 @@
 // #include "config_run.hpp"
 #include "pipeline.hpp"
 
-#define BATCH_SIZE 32
+#define BATCH_SIZE 512
 #define PP_SLOT 1
-// #define KV16
+#define KV16
 // #define PRINT_LOGITS
 // #define TIME_GPU
 // #define DEBUG
@@ -121,6 +121,10 @@ typedef struct {
   Tensor *g_fa_pnum;  // [batch_size, n_attn_heads, c_max, head_dim]
 
   float *logits_out;
+  Tensor *logits_max;
+  Tensor *logits_max_total;
+  TensorI32 *logits_id;
+  TensorI32 *logits_id_total;
 } OurRunState;
 
 typedef struct {
@@ -138,7 +142,7 @@ typedef struct {
   int pos;
   int current_size;
   int id;
-  float *logits;
+  int *tokens;
   pthread_barrier_t *tp_barrier;
 } OnePathInsideArgs;
 

@@ -1,0 +1,77 @@
+parsing args...
+loading tiktoken encoding: o200k_harmony
+reading submission: submission/output_20b_token_ids.txt
+decoding file: submission/output_20b_token_ids.txt
+decoded lines: 1536 from submission/output_20b_token_ids.txt
+reading references: references/output_20b_token_ids.txt
+decoding file: references/output_20b_token_ids.txt
+decoded lines: 1536 from references/output_20b_token_ids.txt
+computing METEOR...
+ensuring nltk resources...
+nltk resource available: punkt
+downloading nltk resource: wordnet
+downloaded: wordnet
+downloading nltk resource: omw-1.4
+downloaded: omw-1.4
+aligning by index, items: 1536
+computing METEOR in parallel with 96 workers...
+meteor	0.52346
+computing BERTScore (roberta-large-mnli)...
+found local BERTScore model at /nfs/gpu_trainee/final-project/models/bs_model/roberta-large-mnli
+loading BERTScore model: /nfs/gpu_trainee/final-project/models/bs_model/roberta-large-mnli...
+BERTScore device: GPU (2 device(s))
+calculating scores...
+computing bert embedding.
+computing greedy matching.
+done in 5.39 seconds, 23.76 sentences/sec
+calculating scores...
+computing bert embedding.
+computing greedy matching.
+done in 4.28 seconds, 29.89 sentences/sec
+calculating scores...
+computing bert embedding.
+computing greedy matching.
+done in 4.29 seconds, 29.80 sentences/sec
+calculating scores...
+computing bert embedding.
+computing greedy matching.
+done in 4.28 seconds, 29.91 sentences/sec
+calculating scores...
+computing bert embedding.
+computing greedy matching.
+done in 4.21 seconds, 30.43 sentences/sec
+calculating scores...
+computing bert embedding.
+computing greedy matching.
+done in 4.21 seconds, 30.37 sentences/sec
+calculating scores...
+computing bert embedding.
+computing greedy matching.
+done in 4.26 seconds, 30.06 sentences/sec
+calculating scores...
+computing bert embedding.
+computing greedy matching.
+done in 4.25 seconds, 30.15 sentences/sec
+calculating scores...
+computing bert embedding.
+computing greedy matching.
+done in 4.13 seconds, 30.97 sentences/sec
+calculating scores...
+computing bert embedding.
+computing greedy matching.
+done in 4.23 seconds, 30.26 sentences/sec
+calculating scores...
+computing bert embedding.
+computing greedy matching.
+done in 4.18 seconds, 30.63 sentences/sec
+calculating scores...
+computing bert embedding.
+computing greedy matching.
+done in 4.44 seconds, 28.80 sentences/sec
+bertscore_f1	0.98041
+========== 
+
+done.
+items	1536
+meteor	0.52346
+bertscore_f1	0.98041

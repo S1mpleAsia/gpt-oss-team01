@@ -79,7 +79,7 @@ void *inside_thread_handler(void *arg) {
   CHECK_HIP(hipSetDevice(cur_device));
   pthread_barrier_wait(args->tp_barrier);
 
-  args->logits =
+  args->tokens =
     forward_gpu_120b_batched(args->current_tokens->data(), args->pos, args->current_size, args->id,
                              args->tp_rank, args->pp_rank, args->tp_barrier);
 
@@ -174,7 +174,7 @@ void *thread_handler(void *arg) {
 
     for (int pos = 0; pos < max_seq_len - 1 && active_count > 0; ++pos) {
 #ifdef RUN_20B
-      float *batch_logits = forward_gpu_20b_batched(current_tokens.data(), pos, current_size, id);
+      int *batch_tokens = forward_gpu_20b_batched(current_tokens.data(), pos, current_size, id);
 #else
       for (int i = 0; i < TOTAL_PIPELINES; i++) {
         inside_args[i].pos = pos;
@@ -187,38 +187,30 @@ void *thread_handler(void *arg) {
       for (int i = 0; i < TOTAL_PIPELINES; i++) {
         pthread_join(inside_threads[i], NULL);
       }
-
-      float *batch_logits = inside_args[(PP - 1) * TP].logits;
+      int *batch_tokens = inside_args[(PP - 1) * TP].tokens;
 #endif
 
       for (int i = 0; i < current_size; i++) {
         if (!active[i])
           continue;
 
-        float *logits = batch_logits + 1ll * i * public_config->vocab_size;
-
-        int next_token;
+        int next_token = batch_tokens[i];
         if (current_pos[i] < num_prompt_tokens[i] - 1) {
           next_token = batch_prompt_tokens[i][current_pos[i] + 1];
         } else {
-          next_token = sample(public_sampler, logits);
           output_batch[i][current_pos[i] - (num_prompt_tokens[i] - 1)] = next_token;
         }
 
 // Print the logits in the desired format if the flag is enabled
 #ifdef PRINT_LOGITS
         // Decode the next token to get its string representation
-        const char *piece = decode_piece(tokenizer, current_tokens[i], next_token);
+        const char *piece = decode_piece(public_tokenizer, current_tokens[i], next_token);
 
         // Use a critical section for printing to prevent interleaved output
         // #pragma omp critical
         {
-          printf("batch id %d --> ", i);
+          printf("batch id %d --> next_token %d: ", i, next_token);
           safe_printf(piece);
-          printf("logits: ");
-          for (int j = 0; j < 5; j++) {
-            printf("%.6f ", logits[j]);
-          }
           printf("\n");
           fflush(stdout);
         }

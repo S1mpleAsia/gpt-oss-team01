@@ -185,12 +185,12 @@ TensorI32::~TensorI32() {
 
 void TensorI32::to_device(hipStream_t stream) {
   size_t N_ = num_elem();
-  CHECK_HIP(hipMemcpy(d_buf, buf, N_ * sizeof(int), hipMemcpyHostToDevice));
+  CHECK_HIP(hipMemcpyAsync(d_buf, buf, N_ * sizeof(int), hipMemcpyHostToDevice, stream));
 }
 
 void TensorI32::from_device(hipStream_t stream) {
   size_t N_ = num_elem();
-  CHECK_HIP(hipMemcpy(buf, d_buf, N_ * sizeof(int), hipMemcpyDeviceToHost));
+  CHECK_HIP(hipMemcpyAsync(buf, d_buf, N_ * sizeof(int), hipMemcpyDeviceToHost, stream));
 }
 
 // Keep the existing num_elem() and reshape() implementations unchanged

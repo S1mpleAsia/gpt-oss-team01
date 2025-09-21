@@ -1703,3 +1703,150 @@ void classifier_gemm_batched_v2(const Tensor *W_out,  // Shape: [hidden_dim, voc
     logits->from_device(stream);
   }
 }
+
+// The GPU kernel function. This is the code that will run in parallel on the GPU.
+// The __global__ specifier indicates that it's a kernel.
+__global__ void max_kernel_gpu(
+  const float* __restrict__ logits, float* __restrict__ logits_max,
+  int* __restrict__ id_max, int batch_size, int length, int tp_rank
+) {
+  // Determine the unique thread index within the grid.
+  // Each thread will be responsible for a single batch (row) of data.
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+  // We only need to process up to the total number of batches.
+  if (i < batch_size) {
+    float current_max = -FLT_MAX;
+    int current_id = -1;
+
+    // Loop through the elements of the current batch (row)
+    for (int j = 0; j < length; ++j) {
+      // Calculate the 1D index for the 2D data
+      float value = logits[i * length + j];
+
+      // If the current value is greater than the max found so far, update the max and its index.
+      if (value > current_max) {
+        current_max = value;
+        current_id = j;
+      }
+    }
+
+    // Store the result for this batch in the output arrays.
+    logits_max[i] = current_max;
+    id_max[i] = current_id + tp_rank * length;
+  }
+}
+
+void max_logits_batched(
+  Tensor *logits, Tensor *logits_max, TensorI32 *logits_id,
+  int cur_batch_size, int tp_rank, bool logits_to_device,
+  bool logits_max_from_device, bool logits_id_from_device, hipStream_t stream
+) {
+  if (logits_to_device) {
+    logits->to_device(stream);
+  }
+
+  const size_t num_elems = 1ll * logits->shape[1];
+
+  const float *logits_buf = (const float *)logits->d_buf;
+  float *logits_max_buf = (float *)logits_max->d_buf;
+  int *logits_id_buf = (int *)logits_id->d_buf;
+
+  const dim3 gridSize(cur_batch_size);
+  const dim3 blockSize(1);
+
+  max_kernel_gpu<<<gridSize, blockSize, 0, stream>>>(
+    logits_buf, logits_max_buf, logits_id_buf,
+    cur_batch_size, num_elems, tp_rank
+  );
+
+  if (logits_max_from_device) {
+    logits_max->from_device(stream);
+  }
+  if (logits_id_from_device) {
+    logits_id->from_device(stream);
+  }
+  if (logits_max_from_device || logits_id_from_device) {
+    CHECK_HIP(hipStreamSynchronize(stream));
+  }
+}
+
+__global__ void reduceLogitsKernel(
+  const float* __restrict__ logits_max_total,
+  const int* __restrict__ logits_id_total,
+  float* __restrict__ logits_max_final, int* __restrict__ logits_id_final,
+  int cur_batch_size, int batch_size_total, int tp_total
+) {
+  // Calculate the global thread index, which corresponds to the batch index.
+  int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  // Boundary check to ensure we don't access out-of-bounds memory.
+  if (batch_idx >= cur_batch_size) {
+    return;
+  }
+
+  // Initialize the maximum value to a very small number and the ID.
+  float max_val = -FLT_MAX;
+  int max_id = -1;
+
+  // Loop through the 'tp' dimension to find the maximum value and its ID.
+  for (int tp_idx = 0; tp_idx < tp_total; ++tp_idx) {
+    // Calculate the 1D index for the 2D array.
+    long long idx = 1ll * tp_idx * batch_size_total + 1ll * batch_idx;
+
+    float current_val = logits_max_total[idx];
+
+    // If the current value is greater than the current max, update.
+    if (current_val > max_val) {
+      max_val = current_val;
+      max_id = logits_id_total[idx];
+    }
+  }
+
+  // Store the final maximum value and ID in the output arrays.
+  logits_max_final[batch_idx] = max_val;
+  logits_id_final[batch_idx] = max_id;
+}
+
+void reduce_logits_batched(
+  Tensor *logits_max_total, TensorI32 *logits_id_total, Tensor *logits_max,
+  TensorI32 *logits_id, int cur_batch_size, bool logits_max_total_to_device,
+  bool logits_id_total_to_device, bool logits_max_from_device,
+  bool logits_id_from_device, hipStream_t stream
+) {
+  if (logits_max_total_to_device) {
+    logits_max_total->to_device(stream);
+  }
+  if (logits_id_total_to_device) {
+    logits_id_total->to_device(stream);
+  }
+
+  const size_t batch_size_total = 1ll * logits_max_total->shape[1];
+  const size_t tp_total = 1ll * logits_max_total->shape[0];
+
+  const float *logits_max_total_buf = (const float *)logits_max_total->d_buf;
+  const int *logits_id_total_buf = (const int *)logits_id_total->d_buf;
+  float *logits_max_buf = (float *)logits_max->d_buf;
+  int *logits_id_buf = (int *)logits_id->d_buf;
+
+  int blockSize = 1;
+  dim3 threads(blockSize);
+  dim3 blocks((cur_batch_size + blockSize - 1) / blockSize);
+
+  // --- Launch the Kernel ---
+  reduceLogitsKernel<<<blocks, threads, 0, stream>>>(
+    logits_max_total_buf, logits_id_total_buf, logits_max_buf,
+    logits_id_buf, cur_batch_size, batch_size_total, tp_total
+  );
+
+  if (logits_max_from_device) {
+    logits_max->from_device(stream);
+  }
+  if (logits_id_from_device) {
+    logits_id->from_device(stream);
+  }
+  if (logits_max_from_device || logits_id_from_device) {
+    CHECK_HIP(hipStreamSynchronize(stream));
+  }
+}
+

@@ -232,3 +232,17 @@ void classifier_gemm_batched_v2(const Tensor *W_out,  // Shape: [vocab_size, hid
                                 Tensor *logits,       // Shape: [batch_size, vocab_size]
                                 int cur_batch_size, bool x_to_device, bool logits_from_device,
                                 hipStream_t stream = 0);
+
+void max_logits_batched(
+  Tensor *logits, Tensor *logits_max, TensorI32 *logits_id,
+  int cur_batch_size, int tp_rank, bool logits_to_device,
+  bool logits_max_from_device, bool logits_id_from_device,
+  hipStream_t stream = 0
+);
+
+void reduce_logits_batched(
+  Tensor *logits_max_total, TensorI32 *logits_id_total, Tensor *logits_max,
+  TensorI32 *logits_id, int cur_batch_size, bool logits_max_total_to_device,
+  bool logits_id_total_to_device, bool logits_max_from_device,
+  bool logits_id_from_device, hipStream_t stream = 0
+);

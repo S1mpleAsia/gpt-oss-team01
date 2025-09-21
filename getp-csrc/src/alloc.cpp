@@ -253,6 +253,11 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->g_fa_pnum = new Tensor({BATCH_SIZE, shard_attn_heads, c_max, head_dim}, stream);
 
   rs->logits_out = nullptr;
+  
+  rs->logits_max = new Tensor({BATCH_SIZE}, stream);
+  rs->logits_max_total = nullptr;
+  rs->logits_id = new TensorI32({BATCH_SIZE}, stream);
+  rs->logits_id_total = nullptr;
 }
 
 #else
@@ -981,6 +986,11 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
                         BATCH_SIZE * (size_t)p->vocab_size * sizeof(float),
                         hipHostMallocMapped));
   }
+
+  rs->logits_max = new Tensor({BATCH_SIZE}, stream);
+  rs->logits_max_total = new Tensor({TP, BATCH_SIZE}, stream);
+  rs->logits_id = new TensorI32({BATCH_SIZE}, stream);
+  rs->logits_id_total = new TensorI32({TP, BATCH_SIZE}, stream);
 }
 
 #endif
@@ -1140,6 +1150,18 @@ void our_free_each(OurTransformerWeights *weights, OurRunState *rs) {
 
   if (rs->logits_out) {
     CHECK_HIP(hipHostFree(rs->logits_out));
+  }
+  if (rs->logits_max) {
+    delete rs->logits_max;
+  }
+  if (rs->logits_max_total) {
+    delete rs->logits_max_total;
+  }
+  if (rs->logits_id) {
+    delete rs->logits_id;
+  }
+  if (rs->logits_id_total) {
+    delete rs->logits_id_total;
   }
 }
 
