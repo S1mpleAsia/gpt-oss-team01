@@ -419,12 +419,12 @@ void qkv_gemm_batched_v2(Tensor *x,            // Shape: [batch_size, hidden_dim
   float *qkv_ptr = (float *)qkv->d_buf;
   {
 #ifdef RUN_20B
-    constexpr int BM = 32;
+    constexpr int BM = 64;
     constexpr int BN = 128;
     constexpr int BK = 32;
     constexpr int TM = 32;
     constexpr int TN = 32;
-    constexpr int blockDim = 256;  // = 64 * (BM / TM) * (BN / TN)
+    constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 #else
     constexpr int BM = 16;
     constexpr int BN = 128;
@@ -1020,12 +1020,12 @@ void attn_out_project_batched_v2(Tensor *tb,         // Shape: [batch_size, n_at
 
   {
 #ifdef RUN_20B
-    constexpr int BM = 32;
+    constexpr int BM = 64;
     constexpr int BN = 128;
     constexpr int BK = 32;
     constexpr int TM = 32;
     constexpr int TN = 32;
-    constexpr int blockDim = 256;  // = 64 * (BM / TM) * (BN / TN)
+    constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 #else
     constexpr int BM = 16;
     constexpr int BN = 128;
@@ -1480,7 +1480,7 @@ static inline void moe_mlp1_forward_hip(Tensor *x_packed,  // [total_pairs, hidd
                                         long long layer_offset, int n_experts, int hidden_dim,
                                         int inter_dim, int max_rows_per_expert, int total_pairs,
                                         hipStream_t stream) {
-  // GpuTimer timer("moe_mlp1", stream);
+  GpuTimer timer("moe_mlp1", stream);
   moe_mlp1_forward(x_packed, w_mlp1, b_mlp1, expert_offsets, mlp1_out, layer_offset, n_experts,
                    hidden_dim, inter_dim, max_rows_per_expert, total_pairs, stream);
 }
@@ -1500,7 +1500,7 @@ static inline void moe_mlp2_forward_hip(Tensor *gate_up,  // [total_pairs, inter
                                         bool has_bias, long long layer_offset, int n_experts,
                                         int inter_dim, int hidden_dim, int max_rows_per_expert,
                                         int total_pairs, hipStream_t stream) {
-  // GpuTimer timer("moe_mlp2", stream);
+  GpuTimer timer("moe_mlp2", stream);
   moe_mlp2_forward(gate_up, w_mlp2, b_mlp2, expert_offsets, tb3, has_bias, layer_offset, n_experts,
                    inter_dim, hidden_dim, max_rows_per_expert, total_pairs, stream);
 }
