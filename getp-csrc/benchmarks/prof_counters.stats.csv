@@ -1,0 +1,2 @@
+"Name","Calls","TotalDurationNs","AverageNs","Percentage"
+"gemm_mfma_v2",53,53537827,1010147,100.0

@@ -1,0 +1,11 @@
+pmc : VALUUtilization
+pmc : VALUBusy
+pmc : MeanOccupancyPerActiveCU
+pmc : GPUBusy
+pmc : L2CacheHit
+pmc : TCC_BUSY_sum
+pmc : TCC_BUSY_avr
+pmc : LDSBankConflict
+
+kernel: gemm_mfma_v2     # uncomment & set once you know the exact base name
+
