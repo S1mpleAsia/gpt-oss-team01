@@ -418,32 +418,59 @@ void qkv_gemm_batched_v2(Tensor *x,            // Shape: [batch_size, hidden_dim
   const bf16 *b_qkv_ptr = (const bf16 *)b_qkv->d_buf + 1ll * layer_offset * out_features;
   float *qkv_ptr = (float *)qkv->d_buf;
   {
-#ifdef RUN_20B
-    constexpr int BM = 64;
-    constexpr int BN = 128;
-    constexpr int BK = 32;
-    constexpr int TM = 32;
-    constexpr int TN = 32;
-    constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
-#else
-    constexpr int BM = 16;
-    constexpr int BN = 128;
-    constexpr int BK = 32;
-    constexpr int TM = 16;
-    constexpr int TN = 16;
-    constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
-#endif
+    if (RUN_MODEL_20B) {
+      constexpr int BM = 64;
+      constexpr int BN = 128;
+      constexpr int BK = 32;
+      constexpr int TM = 32;
+      constexpr int TN = 32;
+      constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 
-    dim3 block_size(blockDim);
-    dim3 grid_size((out_features + BN - 1) / BN, ((cur_batch_size + BM - 1) / BM));
+      dim3 block_size(blockDim);
+      dim3 grid_size((out_features + BN - 1) / BN, ((cur_batch_size + BM - 1) / BM));
 
-#ifdef RUN_20B
-    gemm_mfma_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
-      x_ptr, w_qkv_ptr, qkv_ptr, b_qkv_ptr, cur_batch_size, out_features, in_features);
-#else
-    gemm_mfma<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
-      x_ptr, w_qkv_ptr, qkv_ptr, b_qkv_ptr, cur_batch_size, out_features, in_features);
-#endif
+      gemm_mfma_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+        x_ptr, w_qkv_ptr, qkv_ptr, b_qkv_ptr, cur_batch_size, out_features, in_features);
+    } else {
+      constexpr int BM = 16;
+      constexpr int BN = 128;
+      constexpr int BK = 32;
+      constexpr int TM = 16;
+      constexpr int TN = 16;
+      constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
+
+      dim3 block_size(blockDim);
+      dim3 grid_size((out_features + BN - 1) / BN, ((cur_batch_size + BM - 1) / BM));
+
+      gemm_mfma<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+        x_ptr, w_qkv_ptr, qkv_ptr, b_qkv_ptr, cur_batch_size, out_features, in_features);
+    }
+    // #ifdef RUN_20B
+    //     constexpr int BM = 64;
+    //     constexpr int BN = 128;
+    //     constexpr int BK = 32;
+    //     constexpr int TM = 32;
+    //     constexpr int TN = 32;
+    //     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
+    // #else
+    //     constexpr int BM = 16;
+    //     constexpr int BN = 128;
+    //     constexpr int BK = 32;
+    //     constexpr int TM = 16;
+    //     constexpr int TN = 16;
+    //     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
+    // #endif
+
+    //     dim3 block_size(blockDim);
+    //     dim3 grid_size((out_features + BN - 1) / BN, ((cur_batch_size + BM - 1) / BM));
+
+    // #ifdef RUN_20B
+    //     gemm_mfma_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+    //       x_ptr, w_qkv_ptr, qkv_ptr, b_qkv_ptr, cur_batch_size, out_features, in_features);
+    // #else
+    //     gemm_mfma<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+    //       x_ptr, w_qkv_ptr, qkv_ptr, b_qkv_ptr, cur_batch_size, out_features, in_features);
+    // #endif
   }
 
   // {
@@ -1019,50 +1046,60 @@ void attn_out_project_batched_v2(Tensor *tb,         // Shape: [batch_size, n_at
   float *y_ptr = (float *)y->d_buf;
 
   {
-#ifdef RUN_20B
-    constexpr int BM = 64;
-    constexpr int BN = 128;
-    constexpr int BK = 32;
-    constexpr int TM = 32;
-    constexpr int TN = 32;
-    constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
-#else
-    constexpr int BM = 16;
-    constexpr int BN = 128;
-    constexpr int BK = 32;
-    constexpr int TM = 16;
-    constexpr int TN = 16;
-    constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
-#endif
+    if (RUN_MODEL_20B) {
+      constexpr int BM = 64;
+      constexpr int BN = 128;
+      constexpr int BK = 32;
+      constexpr int TM = 32;
+      constexpr int TN = 32;
+      constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 
-    dim3 block_size(blockDim);
-    dim3 grid_size((out_features + BN - 1) / BN, ((cur_batch_size + BM - 1) / BM));
+      dim3 block_size(blockDim);
+      dim3 grid_size((out_features + BN - 1) / BN, ((cur_batch_size + BM - 1) / BM));
 
-#ifdef RUN_20B
-    gemm_mfma_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
-      tb_ptr, w_o_ptr, y_ptr, b_o_ptr, cur_batch_size, out_features, in_features);
-#else
-    gemm_mfma<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
-      tb_ptr, w_o_ptr, y_ptr, b_o_ptr, cur_batch_size, out_features, in_features);
-#endif
+      gemm_mfma_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+        tb_ptr, w_o_ptr, y_ptr, b_o_ptr, cur_batch_size, out_features, in_features);
+    } else {
+      constexpr int BM = 16;
+      constexpr int BN = 128;
+      constexpr int BK = 32;
+      constexpr int TM = 16;
+      constexpr int TN = 16;
+      constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
+
+      dim3 block_size(blockDim);
+      dim3 grid_size((out_features + BN - 1) / BN, ((cur_batch_size + BM - 1) / BM));
+
+      gemm_mfma<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+        tb_ptr, w_o_ptr, y_ptr, b_o_ptr, cur_batch_size, out_features, in_features);
+    }
+    // #ifdef RUN_20B
+    //     constexpr int BM = 64;
+    //     constexpr int BN = 128;
+    //     constexpr int BK = 32;
+    //     constexpr int TM = 32;
+    //     constexpr int TN = 32;
+    //     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
+    // #else
+    //     constexpr int BM = 16;
+    //     constexpr int BN = 128;
+    //     constexpr int BK = 32;
+    //     constexpr int TM = 16;
+    //     constexpr int TN = 16;
+    //     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
+    // #endif
+
+    //     dim3 block_size(blockDim);
+    //     dim3 grid_size((out_features + BN - 1) / BN, ((cur_batch_size + BM - 1) / BM));
+
+    // #ifdef RUN_20B
+    //     gemm_mfma_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+    //       tb_ptr, w_o_ptr, y_ptr, b_o_ptr, cur_batch_size, out_features, in_features);
+    // #else
+    //     gemm_mfma<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+    //       tb_ptr, w_o_ptr, y_ptr, b_o_ptr, cur_batch_size, out_features, in_features);
+    // #endif
   }
-
-  // {
-  //   constexpr int BM = 16;
-  //   constexpr int BN = 128;
-  //   constexpr int BK = 16;
-  //   constexpr int TM = 1;
-  //   constexpr int TN = 4;
-
-  //   const int BLOCK_SIZE_X = BN / TN;
-  //   const int BLOCK_SIZE_Y = BM / TM;
-  //   dim3 block_size(BLOCK_SIZE_X, BLOCK_SIZE_Y);
-  //   dim3 grid_size((out_features + BN - 1) / BN, (cur_batch_size + BM - 1) / BM);
-
-  //   matmul_kernel<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
-  //     tb_ptr, w_o_ptr, y_ptr, b_o_ptr, cur_batch_size, out_features, in_features);
-  //   CHECK_HIP(hipGetLastError());
-  // }
 
   if (y_from_device) {
     y->from_device(stream);
@@ -1480,7 +1517,7 @@ static inline void moe_mlp1_forward_hip(Tensor *x_packed,  // [total_pairs, hidd
                                         long long layer_offset, int n_experts, int hidden_dim,
                                         int inter_dim, int max_rows_per_expert, int total_pairs,
                                         hipStream_t stream) {
-  GpuTimer timer("moe_mlp1", stream);
+  // GpuTimer timer("moe_mlp1", stream);
   moe_mlp1_forward(x_packed, w_mlp1, b_mlp1, expert_offsets, mlp1_out, layer_offset, n_experts,
                    hidden_dim, inter_dim, max_rows_per_expert, total_pairs, stream);
 }
@@ -1500,7 +1537,7 @@ static inline void moe_mlp2_forward_hip(Tensor *gate_up,  // [total_pairs, inter
                                         bool has_bias, long long layer_offset, int n_experts,
                                         int inter_dim, int hidden_dim, int max_rows_per_expert,
                                         int total_pairs, hipStream_t stream) {
-  GpuTimer timer("moe_mlp2", stream);
+  // GpuTimer timer("moe_mlp2", stream);
   moe_mlp2_forward(gate_up, w_mlp2, b_mlp2, expert_offsets, tb3, has_bias, layer_offset, n_experts,
                    inter_dim, hidden_dim, max_rows_per_expert, total_pairs, stream);
 }

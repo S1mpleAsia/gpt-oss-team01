@@ -2,11 +2,9 @@
 #include <cmath>
 #include <cstring>
 #include "../include/utils.hpp"
-#include "../submit/alloc_submit.cpp"
 
-#ifdef RUN_20B
-void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *weights,
-                      int device_id, hipStream_t stream) {
+void our_init_weights_20b(TransformerWeights *w, Config *p, OurTransformerWeights *weights,
+                          int device_id, hipStream_t stream) {
   CHECK_HIP(hipSetDevice(device_id));
 
   weights->token_embedding_table = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim},
@@ -176,8 +174,8 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   }
 }
 
-void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
-                        hipStream_t stream) {
+void our_init_run_state_20b(RunState *s, Config *p, OurRunState *rs, int device_id,
+                            hipStream_t stream) {
   CHECK_HIP(hipSetDevice(device_id));
 
   rs->x = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
@@ -206,7 +204,7 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->logits = new Tensor({BATCH_SIZE, (size_t)p->vocab_size}, stream);
 
 #ifdef KV16
-  printf("using BF16 KV cache\n");
+  // printf("using BF16 KV cache\n");
   rs->key_cache = new Tensor(
     {BATCH_SIZE, (size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
     stream, DType::BF16);
@@ -244,7 +242,7 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   // ---- Allocate flash-decoding scratch for this device ----
   constexpr int FLASH_ATTN_TILE = 128;
   const size_t head_dim = p->head_dim;
-  const size_t shard_attn_heads = p->n_attn_heads / TP;
+  const size_t shard_attn_heads = p->n_attn_heads / TP_20B;
   const size_t c_max = (p->seq_len + FLASH_ATTN_TILE - 1) / FLASH_ATTN_TILE;
 
   rs->g_fa_pmax = new Tensor({BATCH_SIZE, shard_attn_heads, c_max}, stream);
@@ -259,22 +257,21 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->logits_id_total = nullptr;
 }
 
-#else
-void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *weights,
-                      int device_id, hipStream_t stream) {
+void our_init_weights_120b(TransformerWeights *w, Config *p, OurTransformerWeights *weights,
+                           int device_id, hipStream_t stream) {
   CHECK_HIP(hipSetDevice(device_id));
-  size_t layers_per_stage = p->n_layers / PP;
+  size_t layers_per_stage = p->n_layers / PP_120B;
   size_t experts_per_gpu = p->n_experts / 1;
   size_t qkv_layer_size =
     ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * (size_t)p->head_dim;
 
-  int tp_rank = device_id % TP;
-  int pp_rank = (device_id % TOTAL_PIPELINES) / TP;
+  int tp_rank = device_id % TP_120B;
+  int pp_rank = (device_id % TOTAL_PIPELINES) / TP_120B;
 
   long long pp_offset = 1ll * pp_rank * layers_per_stage;
   long long tp_offset = 1ll * tp_rank * experts_per_gpu;
 
-  int shard_inter_dim = p->intermediate_dim / TP;
+  int shard_inter_dim = p->intermediate_dim / TP_120B;
 
   // Create Tensor wrappers for weight matrices
   // if (pp_rank == 0) {
@@ -285,12 +282,12 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   // }
   if (pp_rank == 0) {
     {
-      printf("Starting alloc token_embedding_table...\n");
-      fflush(stdout);
+      // printf("Starting alloc token_embedding_table...\n");
+      // fflush(stdout);
 
       size_t vocab_size = p->vocab_size;
       size_t hidden_dim = p->hidden_dim;
-      size_t hidden_shard = hidden_dim / TP;
+      size_t hidden_shard = hidden_dim / TP_120B;
       weights->token_embedding_table = new Tensor(
         {vocab_size, hidden_shard}, w->token_embedding_table, stream, DType::BF16, false);
 
@@ -328,8 +325,8 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
       free(tmp);
       CHECK_HIP(hipEventDestroy(finish_env));
 
-      printf("Finish alloc token_embedding_table\n");
-      fflush(stdout);
+      // printf("Finish alloc token_embedding_table\n");
+      // fflush(stdout);
     }
   } else {
     weights->token_embedding_table = nullptr;
@@ -342,12 +339,12 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
                                   w->rms_ffn_w + 1ll * pp_offset * p->hidden_dim, stream);
   {
     size_t hidden_dim = p->hidden_dim;
-    size_t shard_qkv_size = qkv_layer_size / TP;
+    size_t shard_qkv_size = qkv_layer_size / TP_120B;
     size_t q_size = p->n_attn_heads * p->head_dim;
     size_t kv_size = p->n_kv_heads * p->head_dim;
 
-    size_t q_shard_size = q_size / TP;
-    size_t kv_shard_size = kv_size / TP;
+    size_t q_shard_size = q_size / TP_120B;
+    size_t kv_shard_size = kv_size / TP_120B;
 
     weights->w_qkv =
       new Tensor({layers_per_stage, hidden_dim, shard_qkv_size}, stream, DType::BF16);
@@ -389,12 +386,12 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   }
 
   {
-    size_t shard_qkv_size = qkv_layer_size / TP;
+    size_t shard_qkv_size = qkv_layer_size / TP_120B;
     size_t q_size = p->n_attn_heads * p->head_dim;
     size_t kv_size = p->n_kv_heads * p->head_dim;
 
-    size_t q_shard_size = q_size / TP;
-    size_t kv_shard_size = kv_size / TP;
+    size_t q_shard_size = q_size / TP_120B;
+    size_t kv_shard_size = kv_size / TP_120B;
 
     weights->b_qkv = new Tensor({layers_per_stage, shard_qkv_size}, stream, DType::BF16);
 
@@ -425,7 +422,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     size_t n_attn_heads = p->n_attn_heads;
     size_t head_dim = p->head_dim;
     size_t head_size = n_attn_heads * head_dim;
-    size_t shard_head_size = head_size / TP;
+    size_t shard_head_size = head_size / TP_120B;
 
     weights->w_o = new Tensor({layers_per_stage, shard_head_size, hidden_dim}, stream, DType::BF16);
     float *w_o_ptr = w->w_o + 1ll * pp_offset * hidden_dim * head_size;
@@ -449,7 +446,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
   {
     size_t n_attn_heads = p->n_attn_heads;
-    size_t shard_attn_heads = n_attn_heads / TP;
+    size_t shard_attn_heads = n_attn_heads / TP_120B;
 
     weights->attn_sinks = new Tensor({layers_per_stage, (size_t)shard_attn_heads}, stream);
     float *attn_sinks_ptr = w->attn_sinks + 1ll * pp_offset * n_attn_heads;
@@ -531,7 +528,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
     size_t hidden_dim = p->hidden_dim;
     size_t total_experts = p->n_experts;
-    size_t experts_per_gpu = total_experts / TP;
+    size_t experts_per_gpu = total_experts / TP_120B;
     size_t inter_dim = p->intermediate_dim;
 
     weights->w_mlp1 = new Tensor({layers_per_stage, experts_per_gpu, hidden_dim, 2 * inter_dim},
@@ -626,7 +623,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
     size_t hidden_dim = p->hidden_dim;
     size_t total_experts = p->n_experts;
-    size_t experts_per_gpu = total_experts / TP;
+    size_t experts_per_gpu = total_experts / TP_120B;
     size_t inter_dim = p->intermediate_dim;
 
     weights->b_mlp1 =
@@ -721,7 +718,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     size_t hidden_dim = p->hidden_dim;
     size_t inter_dim = p->intermediate_dim;
     size_t total_experts = p->n_experts;
-    size_t experts_per_gpu = total_experts / TP;
+    size_t experts_per_gpu = total_experts / TP_120B;
 
     weights->w_mlp2 =
       new Tensor({layers_per_stage, experts_per_gpu, inter_dim, hidden_dim}, stream, DType::BF16);
@@ -772,7 +769,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
     size_t hidden_dim = p->hidden_dim;
     size_t total_experts = p->n_experts;
-    size_t experts_per_gpu = total_experts / TP;
+    size_t experts_per_gpu = total_experts / TP_120B;
 
     weights->b_mlp2 =
       new Tensor({layers_per_stage, experts_per_gpu, hidden_dim}, stream, DType::BF16);
@@ -805,7 +802,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   }
 #endif
 
-  if (pp_rank + 1 == PP) {
+  if (pp_rank + 1 == PP_120B) {
     weights->rms_out_w = new Tensor({(size_t)p->hidden_dim}, w->rms_out_w, stream, DType::BF16);
     /** w->out
       weights->out = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim}, w->out, device_id);
@@ -813,7 +810,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     {
       size_t vocab_size = p->vocab_size;
       size_t hidden_dim = p->hidden_dim;
-      size_t shard_vocab_size = vocab_size / TP;
+      size_t shard_vocab_size = vocab_size / TP_120B;
 
       weights->out_buffer = new Tensor({hidden_dim, shard_vocab_size}, stream, DType::BF16);
       float *w_out_ptr = w->out + 1ll * tp_rank * shard_vocab_size * hidden_dim;
@@ -851,33 +848,33 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   }
 }
 
-void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
-                        hipStream_t stream) {
+void our_init_run_state_120b(RunState *s, Config *p, OurRunState *rs, int device_id,
+                             hipStream_t stream) {
   CHECK_HIP(hipSetDevice(device_id));
-  int pp_rank = (device_id % TOTAL_PIPELINES) / TP;
-  int tp_rank = device_id % TP;
+  int pp_rank = (device_id % TOTAL_PIPELINES) / TP_120B;
+  int tp_rank = device_id % TP_120B;
 
   // Create Tensor wrappers for state buffers
   rs->x = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
 
   rs->t = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
-  rs->tb = new Tensor({BATCH_SIZE, (size_t)p->head_dim * p->n_attn_heads / TP}, stream);
-  // rs->tb_buf = new Tensor({BATCH_SIZE, (size_t)p->head_dim * p->n_attn_heads / TP}, stream);
+  rs->tb = new Tensor({BATCH_SIZE, (size_t)p->head_dim * p->n_attn_heads / TP_120B}, stream);
+  // rs->tb_buf = new Tensor({BATCH_SIZE, (size_t)p->head_dim * p->n_attn_heads / TP_120B}, stream);
 
   rs->tb2 = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
-  // rs->tb2_recv = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / TP}, stream);
-  if (tp_rank < 3 && TP > 1) {
-    rs->tb2_buf = new Tensor({TP / 2, BATCH_SIZE, (size_t)p->hidden_dim}, stream);
+  // rs->tb2_recv = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / TP_120B}, stream);
+  if (tp_rank < 3 && TP_120B > 1) {
+    rs->tb2_buf = new Tensor({TP_120B / 2, BATCH_SIZE, (size_t)p->hidden_dim}, stream);
   } else {
     rs->tb2_buf = nullptr;
   }
 
   rs->tb3 = new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
   // rs->tb3_recv =
-  //   new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim / TP}, stream);
-  if (tp_rank < 3 && TP > 1) {
-    rs->tb3_buf =
-      new Tensor({TP / 2, BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
+  //   new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim / TP_120B}, stream);
+  if (tp_rank < 3 && TP_120B > 1) {
+    rs->tb3_buf = new Tensor(
+      {TP_120B / 2, BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
   } else {
     rs->tb3_buf = nullptr;
   }
@@ -887,7 +884,7 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->topk_i = new TensorI32({BATCH_SIZE, (size_t)p->experts_per_token}, stream);
 
   rs->mlp1_out = new Tensor(
-    {BATCH_SIZE, (size_t)p->experts_per_token, 2 * (size_t)p->intermediate_dim / TP}, stream);
+    {BATCH_SIZE, (size_t)p->experts_per_token, 2 * (size_t)p->intermediate_dim / TP_120B}, stream);
 
   // rs->gate =
   //   new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
@@ -895,41 +892,42 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   //   new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
 
   rs->gate_up = new Tensor(
-    {BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim / TP}, stream);
+    {BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim / TP_120B}, stream);
 
   rs->e_agg = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
-  if (device_id % TP == 0) {
+  if (device_id % TP_120B == 0) {
     rs->e_agg_buf = nullptr;
   } else {
     rs->e_agg_buf = nullptr;
   }
 
   rs->qkv = new Tensor(
-    {BATCH_SIZE, ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim / TP}, stream);
+    {BATCH_SIZE, ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim / TP_120B},
+    stream);
 
-  rs->q = new Tensor({BATCH_SIZE, (size_t)p->n_attn_heads * p->head_dim / TP}, stream);
-  // rs->k = new Tensor({BATCH_SIZE, (size_t)p->n_kv_heads * p->head_dim / TP}, stream);
-  // rs->v = new Tensor({BATCH_SIZE, (size_t)p->n_kv_heads * p->head_dim / TP}, stream);
+  rs->q = new Tensor({BATCH_SIZE, (size_t)p->n_attn_heads * p->head_dim / TP_120B}, stream);
+  // rs->k = new Tensor({BATCH_SIZE, (size_t)p->n_kv_heads * p->head_dim / TP_120B}, stream);
+  // rs->v = new Tensor({BATCH_SIZE, (size_t)p->n_kv_heads * p->head_dim / TP_120B}, stream);
 
   // rs->att = new Tensor({BATCH_SIZE, (size_t)p->n_attn_heads, (size_t)p->seq_len}, stream);
   // rs->logits = new Tensor({BATCH_SIZE, (size_t)p->vocab_size}, stream);
-  rs->tmp_logits = new Tensor({BATCH_SIZE, (size_t)p->vocab_size / TP}, stream);
+  rs->tmp_logits = new Tensor({BATCH_SIZE, (size_t)p->vocab_size / TP_120B}, stream);
 
 #ifdef KV16
   printf("using BF16 KV cache\n");
-  rs->key_cache = new Tensor({BATCH_SIZE * PP_SLOT, ((size_t)p->n_layers / PP), (size_t)p->seq_len,
-                              (size_t)p->n_kv_heads * p->head_dim / TP},
+  rs->key_cache = new Tensor({BATCH_SIZE * PP_SLOT, ((size_t)p->n_layers / PP_120B),
+                              (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim / TP_120B},
                              stream, DType::BF16);
-  rs->value_cache = new Tensor({BATCH_SIZE * PP_SLOT, ((size_t)p->n_layers / PP),
-                                (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim / TP},
+  rs->value_cache = new Tensor({BATCH_SIZE * PP_SLOT, ((size_t)p->n_layers / PP_120B),
+                                (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim / TP_120B},
                                stream, DType::BF16);
 #else
   printf("using FP32 KV cache\n");
-  rs->key_cache = new Tensor({BATCH_SIZE, ((size_t)p->n_layers / PP), (size_t)p->seq_len,
-                              (size_t)p->n_kv_heads * p->head_dim / TP},
+  rs->key_cache = new Tensor({BATCH_SIZE, ((size_t)p->n_layers / PP_120B), (size_t)p->seq_len,
+                              (size_t)p->n_kv_heads * p->head_dim / TP_120B},
                              stream);
-  rs->value_cache = new Tensor({BATCH_SIZE, ((size_t)p->n_layers / PP), (size_t)p->seq_len,
-                                (size_t)p->n_kv_heads * p->head_dim / TP},
+  rs->value_cache = new Tensor({BATCH_SIZE, ((size_t)p->n_layers / PP_120B), (size_t)p->seq_len,
+                                (size_t)p->n_kv_heads * p->head_dim / TP_120B},
                                stream);
 #endif
 
@@ -946,7 +944,7 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
 #ifdef RUN_EP
   rs->x_packed_local =
     new Tensor({(size_t)BATCH_SIZE * p->experts_per_token, (size_t)p->hidden_dim}, stream);
-  rs->expert_offsets_local = new TensorI32({(size_t)(p->n_experts / TP + 1)}, stream);
+  rs->expert_offsets_local = new TensorI32({(size_t)(p->n_experts / TP_120B + 1)}, stream);
 #endif
 
   rs->tokens_buf = new TensorI32({(size_t)BATCH_SIZE}, stream);
@@ -966,7 +964,7 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   // ---- Flash decoding allocation ---
   constexpr int FLASH_ATTN_TILE = 128;
   const size_t head_dim = p->head_dim;
-  const size_t shard_attn_heads = p->n_attn_heads / TP;
+  const size_t shard_attn_heads = p->n_attn_heads / TP_120B;
   const size_t c_max = (p->seq_len + FLASH_ATTN_TILE - 1) / FLASH_ATTN_TILE;
 
   rs->g_fa_pmax = new Tensor({BATCH_SIZE, shard_attn_heads, c_max}, stream);
@@ -974,227 +972,14 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->g_fa_pnum = new Tensor({BATCH_SIZE, shard_attn_heads, c_max, head_dim}, stream);
 
   rs->logits_out = nullptr;
-  if (tp_rank == 0 && pp_rank == PP - 1) {
+  if (tp_rank == 0 && pp_rank == PP_120B - 1) {
     CHECK_HIP(hipHostMalloc((void **)&rs->logits_out,
                             BATCH_SIZE * (size_t)p->vocab_size * sizeof(float),
                             hipHostMallocMapped));
   }
 
   rs->logits_max = new Tensor({BATCH_SIZE}, stream);
-  rs->logits_max_total = new Tensor({TP, BATCH_SIZE}, stream);
+  rs->logits_max_total = new Tensor({TP_120B, BATCH_SIZE}, stream);
   rs->logits_id = new TensorI32({BATCH_SIZE}, stream);
-  rs->logits_id_total = new TensorI32({TP, BATCH_SIZE}, stream);
-}
-
-#endif
-
-void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunState *rs,
-              hipStream_t *total_streams, hipTotalEvents_t *total_events) {
-  Config *p = &transformer->config;
-  TransformerWeights *w = &transformer->weights;
-  RunState *s = &transformer->state;
-
-  if (p->n_experts == 128) {
-    RUN_MODEL_20B = false;
-  } else {
-    RUN_MODEL_20B = true;
-  }
-
-  p->seq_len = 1024;
-  total_events->tp_ready = new hipEvent_t[TOTAL_GPUS_NEEDED];
-  total_events->tp_finish = new hipEvent_t[TOTAL_GPUS_NEEDED];
-  total_events->pp_sync = new hipEvent_t[TOTAL_GPUS_NEEDED];
-
-  // #ifndef RUN_20B
-  // #ifndef RUN_EP
-  //   alloc_w_mlp1_final(weights, w->w_mlp1, p, total_streams);
-  //   alloc_w_mlp2_final(weights, w->w_mlp2, p, total_streams);
-  // #else
-  //   alloc_w_mlp1_ep(weights, w->w_mlp1, p, total_streams);
-  //   alloc_w_mlp2_ep(weights, w->w_mlp2, p, total_streams);
-  // #endif
-  // #endif
-
-#pragma omp parallel for num_threads(TOTAL_GPUS_NEEDED)
-  for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
-    CHECK_HIP(hipSetDevice(i));
-
-    if (RUN_MODEL_20B) {
-      CHECK_HIP(hipStreamCreate(&total_streams[i]));
-      CHECK_HIP(hipEventCreate(&(total_events->tp_ready[i])));
-      CHECK_HIP(hipEventCreate(&(total_events->tp_finish[i])));
-      our_init_weights_20b(w, p, &weights[i], i, total_streams[i]);
-      our_init_run_state_20b(s, p, &rs[i], i, total_streams[i]);
-    } else {
-      CHECK_HIP(hipStreamCreate(&total_streams[i]));
-      CHECK_HIP(hipEventCreate(&(total_events->tp_ready[i])));
-      CHECK_HIP(hipEventCreate(&(total_events->tp_finish[i])));
-      if (PP_120B > 1) {
-        CHECK_HIP(hipEventCreate(&(total_events->pp_sync[i])));
-      }
-      our_init_weights_120b(w, p, &weights[i], i, total_streams[i]);
-      our_init_run_state_120b(s, p, &rs[i], i, total_streams[i]);
-    }
-
-    // #ifdef RUN_20B
-    //     CHECK_HIP(hipStreamCreate(&total_streams[i]));
-    //     CHECK_HIP(hipEventCreate(&(total_events->tp_ready[i])));
-    //     CHECK_HIP(hipEventCreate(&(total_events->tp_finish[i])));
-    //     our_init_weights(w, p, &weights[i], i, total_streams[i]);
-    //     our_init_run_state(s, p, &rs[i], i, total_streams[i]);
-    // #else
-    //     CHECK_HIP(hipStreamCreate(&total_streams[i]));
-    //     CHECK_HIP(hipEventCreate(&(total_events->tp_ready[i])));
-    //     CHECK_HIP(hipEventCreate(&(total_events->tp_finish[i])));
-    //     if (PP > 1) {
-    //       CHECK_HIP(hipEventCreate(&(total_events->pp_sync[i])));
-    //     }
-    //     our_init_weights(w, p, &weights[i], i, total_streams[i]);
-    //     our_init_run_state(s, p, &rs[i], i, total_streams[i]);
-    // #endif
-  }
-}
-
-void our_free_each(OurTransformerWeights *weights, OurRunState *rs) {
-  if (weights->token_embedding_table)
-    delete weights->token_embedding_table;
-  if (weights->rms_attn_w)
-    delete weights->rms_attn_w;
-  if (weights->rms_ffn_w)
-    delete weights->rms_ffn_w;
-  if (weights->w_qkv)
-    delete weights->w_qkv;
-  if (weights->w_o)
-    delete weights->w_o;
-  if (weights->b_qkv)
-    delete weights->b_qkv;
-  if (weights->b_o)
-    delete weights->b_o;
-  if (weights->attn_sinks)
-    delete weights->attn_sinks;
-  if (weights->w_router)
-    delete weights->w_router;
-  if (weights->b_router)
-    delete weights->b_router;
-  if (weights->w_mlp1)
-    delete weights->w_mlp1;
-  if (weights->w_mlp2)
-    delete weights->w_mlp2;
-  if (weights->b_mlp1)
-    delete weights->b_mlp1;
-  if (weights->b_mlp2)
-    delete weights->b_mlp2;
-  if (weights->rms_out_w)
-    delete weights->rms_out_w;
-  if (weights->out)
-    delete weights->out;
-
-  // delete rs
-  if (rs->x)
-    delete rs->x;
-  if (rs->t)
-    delete rs->t;
-  if (rs->tb)
-    delete rs->tb;
-  if (rs->tb2)
-    delete rs->tb2;
-  if (rs->router_score)
-    delete rs->router_score;
-  if (rs->topk_v)
-    delete rs->topk_v;
-  if (rs->topk_i)
-    delete rs->topk_i;
-  if (rs->mlp1_out)
-    delete rs->mlp1_out;
-  if (rs->gate_up)
-    delete rs->gate_up;
-  if (rs->e_agg)
-    delete rs->e_agg;
-  if (rs->e_agg_buf)
-    delete rs->e_agg_buf;
-  if (rs->qkv)
-    delete rs->qkv;
-  if (rs->q)
-    delete rs->q;
-  if (rs->logits)
-    delete rs->logits;
-  if (rs->key_cache)
-    delete rs->key_cache;
-  if (rs->value_cache)
-    delete rs->value_cache;
-  if (rs->mask)
-    delete rs->mask;
-
-  // MoE buffer
-  if (rs->sorted_pair_ids)
-    delete rs->sorted_pair_ids;
-  if (rs->expert_offsets)
-    delete rs->expert_offsets;
-  if (rs->x_packed)
-    delete rs->x_packed;
-
-  if (rs->tokens_buf)
-    delete rs->tokens_buf;
-
-  CHECK_HIP(hipFree(rs->max_rows));
-
-  if (rs->pipeline_each)
-    delete rs->pipeline_each;
-
-  // Others
-  if (rs->cos_tensor)
-    delete rs->cos_tensor;
-  if (rs->sin_tensor)
-    delete rs->sin_tensor;
-
-  if (rs->g_fa_pmax) {
-    delete rs->g_fa_pmax;
-  }
-  if (rs->g_fa_psum) {
-    delete rs->g_fa_psum;
-  }
-  if (rs->g_fa_pnum) {
-    delete rs->g_fa_pnum;
-  }
-
-  if (rs->logits_out) {
-    CHECK_HIP(hipHostFree(rs->logits_out));
-  }
-  if (rs->logits_max) {
-    delete rs->logits_max;
-  }
-  if (rs->logits_max_total) {
-    delete rs->logits_max_total;
-  }
-  if (rs->logits_id) {
-    delete rs->logits_id;
-  }
-  if (rs->logits_id_total) {
-    delete rs->logits_id_total;
-  }
-}
-
-void our_free(OurTransformerWeights *weights, OurRunState *rs, hipStream_t *total_streams,
-              hipTotalEvents_t *total_events) {
-  for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
-    // fprintf(stderr, "Freeing weights and run state of id %d\n", i);
-
-    CHECK_HIP(hipSetDevice(i));
-    CHECK_HIP(hipStreamDestroy(total_streams[i]));
-    CHECK_HIP(hipEventDestroy(total_events->tp_ready[i]));
-    CHECK_HIP(hipEventDestroy(total_events->tp_finish[i]));
-    if (PP > 1) {
-      CHECK_HIP(hipEventDestroy(total_events->pp_sync[i]));
-    }
-
-    our_free_each(&weights[i], &rs[i]);
-
-    // fprintf(stderr, "Finish freeing weights and run state of id %d, moving on to actual pointer\n",
-    //         i);
-    // fprintf(stderr, "Finish everything id %d\n", i);
-  }
-
-  delete total_events->tp_ready;
-  delete total_events->tp_finish;
-  delete total_events->pp_sync;
+  rs->logits_id_total = new TensorI32({TP_120B, BATCH_SIZE}, stream);
 }

@@ -3,8 +3,6 @@
 #include <cmath>
 #include <cstring>
 
-#ifdef RUN_20B
-
 int *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flow_id) {
   Config *p = public_config;
 
@@ -156,8 +154,6 @@ int *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flow_
 
   return rs_now->logits_id->buf;
 }
-
-#else
 
 // two events are needed
 int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow_id, int tp_rank,
@@ -500,5 +496,3 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
     return nullptr;
   }
 }
-
-#endif

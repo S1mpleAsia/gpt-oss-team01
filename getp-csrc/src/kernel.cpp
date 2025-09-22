@@ -753,35 +753,65 @@ static inline void moe_mlp1_forward(Tensor *x_packed,  // [total_pairs, hidden_d
   //   total_pairs, 2 * inter_dim, hidden_dim);
 
   {
-#if defined(RUN_20B) || defined(RUN_EP)
-    constexpr int BM = 64;
-    constexpr int BN = 128;
-    constexpr int BK = 32;
-    constexpr int TM = 32;
-    constexpr int TN = 32;
-    constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
+    if (RUN_MODEL_20B) {
+      constexpr int BM = 64;
+      constexpr int BN = 128;
+      constexpr int BK = 32;
+      constexpr int TM = 32;
+      constexpr int TN = 32;
+      constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 
-#else
-    constexpr int BM = 16;
-    constexpr int BN = 128;
-    constexpr int BK = 32;
-    constexpr int TM = 16;
-    constexpr int TN = 16;
-    constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
-#endif
+      dim3 block_size(blockDim);
+      dim3 grid_size((2 * inter_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
 
-    dim3 block_size(blockDim);
-    dim3 grid_size((2 * inter_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
+      gemm_mfma_moe_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+        (const float *)x_packed->d_buf, w1_ptr, (float *)mlp1_out->d_buf, b1_ptr,
+        expert_offsets->d_buf, total_pairs, 2 * inter_dim, hidden_dim);
+    } else {
+      constexpr int BM = 16;
+      constexpr int BN = 128;
+      constexpr int BK = 32;
+      constexpr int TM = 16;
+      constexpr int TN = 16;
+      constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 
-#if defined(RUN_20B) || defined(RUN_EP)
-    gemm_mfma_moe_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
-      (const float *)x_packed->d_buf, w1_ptr, (float *)mlp1_out->d_buf, b1_ptr,
-      expert_offsets->d_buf, total_pairs, 2 * inter_dim, hidden_dim);
-#else
-    gemm_mfma_moe<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
-      (const float *)x_packed->d_buf, w1_ptr, (float *)mlp1_out->d_buf, b1_ptr,
-      expert_offsets->d_buf, total_pairs, 2 * inter_dim, hidden_dim);
-#endif
+      dim3 block_size(blockDim);
+      dim3 grid_size((2 * inter_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
+
+      gemm_mfma_moe<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+        (const float *)x_packed->d_buf, w1_ptr, (float *)mlp1_out->d_buf, b1_ptr,
+        expert_offsets->d_buf, total_pairs, 2 * inter_dim, hidden_dim);
+    }
+
+    // #if defined(RUN_20B) || defined(RUN_EP)
+    //     constexpr int BM = 64;
+    //     constexpr int BN = 128;
+    //     constexpr int BK = 32;
+    //     constexpr int TM = 32;
+    //     constexpr int TN = 32;
+    //     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
+
+    // #else
+    //     constexpr int BM = 16;
+    //     constexpr int BN = 128;
+    //     constexpr int BK = 32;
+    //     constexpr int TM = 16;
+    //     constexpr int TN = 16;
+    //     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
+    // #endif
+
+    //     dim3 block_size(blockDim);
+    //     dim3 grid_size((2 * inter_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
+
+    // #if defined(RUN_20B) || defined(RUN_EP)
+    //     gemm_mfma_moe_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+    //       (const float *)x_packed->d_buf, w1_ptr, (float *)mlp1_out->d_buf, b1_ptr,
+    //       expert_offsets->d_buf, total_pairs, 2 * inter_dim, hidden_dim);
+    // #else
+    //     gemm_mfma_moe<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+    //       (const float *)x_packed->d_buf, w1_ptr, (float *)mlp1_out->d_buf, b1_ptr,
+    //       expert_offsets->d_buf, total_pairs, 2 * inter_dim, hidden_dim);
+    // #endif
   }
 }
 
@@ -824,35 +854,64 @@ static inline void moe_mlp2_forward(Tensor *gate_up,  // [total_pairs, inter_dim
   //   total_pairs, hidden_dim, inter_dim);
 
   {
-#if defined(RUN_20B) || defined(RUN_EP)
-    constexpr int BM = 64;
-    constexpr int BN = 128;
-    constexpr int BK = 32;
-    constexpr int TM = 32;
-    constexpr int TN = 32;
-    constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
+    if (RUN_MODEL_20B) {
+      constexpr int BM = 64;
+      constexpr int BN = 128;
+      constexpr int BK = 32;
+      constexpr int TM = 32;
+      constexpr int TN = 32;
+      constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 
-#else
-    constexpr int BM = 16;
-    constexpr int BN = 128;
-    constexpr int BK = 32;
-    constexpr int TM = 16;
-    constexpr int TN = 16;
-    constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
-#endif
+      dim3 block_size(blockDim);
+      dim3 grid_size((hidden_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
 
-    dim3 block_size(blockDim);
-    dim3 grid_size((hidden_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
+      gemm_mfma_moe_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+        (const float *)gate_up->d_buf, w2_ptr, (float *)tb3->d_buf, b2_ptr, expert_offsets->d_buf,
+        total_pairs, hidden_dim, inter_dim);
+    } else {
+      constexpr int BM = 16;
+      constexpr int BN = 128;
+      constexpr int BK = 32;
+      constexpr int TM = 16;
+      constexpr int TN = 16;
+      constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 
-#if defined(RUN_20B) || defined(RUN_EP)
-    gemm_mfma_moe_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
-      (const float *)gate_up->d_buf, w2_ptr, (float *)tb3->d_buf, b2_ptr, expert_offsets->d_buf,
-      total_pairs, hidden_dim, inter_dim);
-#else
-    gemm_mfma_moe<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
-      (const float *)gate_up->d_buf, w2_ptr, (float *)tb3->d_buf, b2_ptr, expert_offsets->d_buf,
-      total_pairs, hidden_dim, inter_dim);
-#endif
+      dim3 block_size(blockDim);
+      dim3 grid_size((hidden_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
+
+      gemm_mfma_moe<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+        (const float *)gate_up->d_buf, w2_ptr, (float *)tb3->d_buf, b2_ptr, expert_offsets->d_buf,
+        total_pairs, hidden_dim, inter_dim);
+    }
+    // #if defined(RUN_20B) || defined(RUN_EP)
+    //     constexpr int BM = 64;
+    //     constexpr int BN = 128;
+    //     constexpr int BK = 32;
+    //     constexpr int TM = 32;
+    //     constexpr int TN = 32;
+    //     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
+
+    // #else
+    //     constexpr int BM = 16;
+    //     constexpr int BN = 128;
+    //     constexpr int BK = 32;
+    //     constexpr int TM = 16;
+    //     constexpr int TN = 16;
+    //     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
+    // #endif
+
+    //     dim3 block_size(blockDim);
+    //     dim3 grid_size((hidden_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
+
+    // #if defined(RUN_20B) || defined(RUN_EP)
+    //     gemm_mfma_moe_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+    //       (const float *)gate_up->d_buf, w2_ptr, (float *)tb3->d_buf, b2_ptr, expert_offsets->d_buf,
+    //       total_pairs, hidden_dim, inter_dim);
+    // #else
+    //     gemm_mfma_moe<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+    //       (const float *)gate_up->d_buf, w2_ptr, (float *)tb3->d_buf, b2_ptr, expert_offsets->d_buf,
+    //       total_pairs, hidden_dim, inter_dim);
+    // #endif
   }
 }
 
