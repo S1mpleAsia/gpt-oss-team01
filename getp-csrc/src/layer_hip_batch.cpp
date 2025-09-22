@@ -432,17 +432,17 @@ void qkv_gemm_batched_v2(Tensor *x,            // Shape: [batch_size, hidden_dim
       gemm_mfma_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
         x_ptr, w_qkv_ptr, qkv_ptr, b_qkv_ptr, cur_batch_size, out_features, in_features);
     } else {
-      constexpr int BM = 16;
+      constexpr int BM = 64;
       constexpr int BN = 128;
       constexpr int BK = 32;
-      constexpr int TM = 16;
-      constexpr int TN = 16;
+      constexpr int TM = 32;
+      constexpr int TN = 32;
       constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 
       dim3 block_size(blockDim);
       dim3 grid_size((out_features + BN - 1) / BN, ((cur_batch_size + BM - 1) / BM));
 
-      gemm_mfma<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+      gemm_mfma_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
         x_ptr, w_qkv_ptr, qkv_ptr, b_qkv_ptr, cur_batch_size, out_features, in_features);
     }
     // #ifdef RUN_20B
@@ -1060,17 +1060,17 @@ void attn_out_project_batched_v2(Tensor *tb,         // Shape: [batch_size, n_at
       gemm_mfma_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
         tb_ptr, w_o_ptr, y_ptr, b_o_ptr, cur_batch_size, out_features, in_features);
     } else {
-      constexpr int BM = 16;
+     constexpr int BM = 64;
       constexpr int BN = 128;
       constexpr int BK = 32;
-      constexpr int TM = 16;
-      constexpr int TN = 16;
+      constexpr int TM = 32;
+      constexpr int TN = 32;
       constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 
       dim3 block_size(blockDim);
       dim3 grid_size((out_features + BN - 1) / BN, ((cur_batch_size + BM - 1) / BM));
 
-      gemm_mfma<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+      gemm_mfma_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
         tb_ptr, w_o_ptr, y_ptr, b_o_ptr, cur_batch_size, out_features, in_features);
     }
     // #ifdef RUN_20B
@@ -1769,39 +1769,61 @@ void classifier_gemm_batched_v2(const Tensor *W_out,  // Shape: [hidden_dim, voc
 
 // The GPU kernel function. This is the code that will run in parallel on the GPU.
 // The __global__ specifier indicates that it's a kernel.
-__global__ void max_kernel_gpu(const float *__restrict__ logits, float *__restrict__ logits_max,
-                               int *__restrict__ id_max, int batch_size, int length, int tp_rank) {
-  // Determine the unique thread index within the grid.
-  // Each thread will be responsible for a single batch (row) of data.
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void max_kernel_gpu_v2(
+  const float* __restrict__ logits, float* __restrict__ logits_max,
+  int* __restrict__ id_max, int batch_size, int length, int tp_rank
+) {
+  // One block = one row (batch element)
+  int row = blockIdx.x;
+  if (row >= batch_size) return;
 
-  // We only need to process up to the total number of batches.
-  if (i < batch_size) {
-    float current_max = -FLT_MAX;
-    int current_id = -1;
+  // Shared memory for block reduction
+  extern __shared__ char new_smem[];
+  float* sdata_val = (float*)new_smem;
+  int*   sdata_idx = (int*)(sdata_val + blockDim.x);
 
-    // Loop through the elements of the current batch (row)
-    for (int j = 0; j < length; ++j) {
-      // Calculate the 1D index for the 2D data
-      float value = logits[i * length + j];
+  int tid = threadIdx.x;
+  int start = row * length;
 
-      // If the current value is greater than the max found so far, update the max and its index.
-      if (value > current_max) {
-        current_max = value;
-        current_id = j;
+  // Each thread scans a strided portion of this row
+  float local_max = -FLT_MAX;
+  int local_idx = -1;
+  for (int j = tid; j < length; j += blockDim.x) {
+    float val = logits[start + j];
+    if (val > local_max) {
+      local_max = val;
+      local_idx = j;
+    }
+  }
+
+  // Store partial results into shared memory
+  sdata_val[tid] = local_max;
+  sdata_idx[tid] = local_idx;
+  __syncthreads();
+
+  // Parallel reduction to find max and index
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+  if (tid < s) {
+      if (sdata_val[tid + s] > sdata_val[tid]) {
+        sdata_val[tid] = sdata_val[tid + s];
+        sdata_idx[tid] = sdata_idx[tid + s];
       }
     }
+    __syncthreads();
+  }
 
-    // Store the result for this batch in the output arrays.
-    logits_max[i] = current_max;
-    id_max[i] = current_id + tp_rank * length;
+  // Thread 0 writes the result for this row
+  if (tid == 0) {
+    logits_max[row] = sdata_val[0];
+    id_max[row] = sdata_idx[0] + tp_rank * length;
   }
 }
 
-void max_logits_batched(Tensor *logits, Tensor *logits_max, TensorI32 *logits_id,
-                        int cur_batch_size, int tp_rank, bool logits_to_device,
-                        bool logits_max_from_device, bool logits_id_from_device,
-                        hipStream_t stream) {
+void max_logits_batched(
+  Tensor *logits, Tensor *logits_max, TensorI32 *logits_id,
+  int cur_batch_size, int tp_rank, bool logits_to_device,
+  bool logits_max_from_device, bool logits_id_from_device, hipStream_t stream
+) {
   if (logits_to_device) {
     logits->to_device(stream);
   }
@@ -1812,11 +1834,14 @@ void max_logits_batched(Tensor *logits, Tensor *logits_max, TensorI32 *logits_id
   float *logits_max_buf = (float *)logits_max->d_buf;
   int *logits_id_buf = (int *)logits_id->d_buf;
 
-  const dim3 gridSize(cur_batch_size);
-  const dim3 blockSize(1);
+  int blockSize = 256; // tune: 128/256/512 depending on GPU
+  dim3 gridSize(cur_batch_size);
+  size_t sharedMemSize = blockSize * (sizeof(float) + sizeof(int));
 
-  max_kernel_gpu<<<gridSize, blockSize, 0, stream>>>(logits_buf, logits_max_buf, logits_id_buf,
-                                                     cur_batch_size, num_elems, tp_rank);
+  max_kernel_gpu_v2<<<gridSize, blockSize, sharedMemSize, stream>>>(
+    logits_buf, logits_max_buf, logits_id_buf,
+    cur_batch_size, num_elems, tp_rank
+  );
 
   if (logits_max_from_device) {
     logits_max->from_device(stream);

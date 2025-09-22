@@ -72,7 +72,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   weights->b_router = new Tensor({(size_t)p->n_layers, (size_t)p->n_experts}, w->b_router, stream);
 
   {
-    printf("Starting alloc mlp1\n");
+    //printf("Starting alloc mlp1\n");
     fflush(stdout);
     size_t n_layers = p->n_layers;
     size_t n_experts = p->n_experts;
@@ -107,7 +107,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     CHECK_HIP(hipStreamSynchronize(stream));
     free(tmp);
 
-    printf("End alloc mlp1\n");
+//    printf("End alloc mlp1\n");
     fflush(stdout);
   }
 
@@ -116,7 +116,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
                w->b_mlp1, stream, DType::BF16);
 
   {
-    printf("Starting alloc mlp2\n");
+   // printf("Starting alloc mlp2\n");
     fflush(stdout);
     size_t n_layers = p->n_layers;
     size_t n_experts = p->n_experts;
@@ -151,7 +151,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     free(tmp);
 
     // weights->w_mlp2->to_device(0);
-    printf("End alloc mlp2\n");
+   // printf("End alloc mlp2\n");
     fflush(stdout);
   }
 
@@ -206,7 +206,7 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->logits = new Tensor({BATCH_SIZE, (size_t)p->vocab_size}, stream);
 
 #ifdef KV16
-  printf("using BF16 KV cache\n");
+  //printf("using BF16 KV cache\n");
   rs->key_cache = new Tensor(
     {BATCH_SIZE, (size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
     stream, DType::BF16);
@@ -214,7 +214,7 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
     {BATCH_SIZE, (size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
     stream, DType::BF16);
 #else
-  printf("using FP32 KV cache\n");
+  //printf("using FP32 KV cache\n");
   rs->key_cache = new Tensor(
     {BATCH_SIZE, (size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
     stream);
@@ -285,7 +285,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   // }
   if (pp_rank == 0) {
     {
-      printf("Starting alloc token_embedding_table...\n");
+      //printf("Starting alloc token_embedding_table...\n");
       fflush(stdout);
 
       size_t vocab_size = p->vocab_size;
@@ -328,7 +328,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
       free(tmp);
       CHECK_HIP(hipEventDestroy(finish_env));
 
-      printf("Finish alloc token_embedding_table\n");
+//      printf("Finish alloc token_embedding_table\n");
       fflush(stdout);
     }
   } else {
@@ -476,7 +476,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 #ifndef RUN_EP
   /* Tensor parallelism w_mlp1*/
   {
-    printf("Starting alloc mlp1\n");
+  //  printf("Starting alloc mlp1\n");
     fflush(stdout);
     size_t n_layers = layers_per_stage;
     size_t n_experts = p->n_experts;
@@ -520,13 +520,13 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     CHECK_HIP(hipStreamSynchronize(stream));
     free(tmp);
 
-    printf("End alloc mlp1\n");
+  //  printf("End alloc mlp1\n");
     fflush(stdout);
   }
 #else
   /* Expert parallelism */
   {
-    printf("Starting alloc mlp1\n");
+//    printf("Starting alloc mlp1\n");
     fflush(stdout);
 
     size_t hidden_dim = p->hidden_dim;
@@ -564,7 +564,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     //   CHECK_HIP(hipStreamSynchronize(stream));
     //   free(tmp);
 
-    printf("End alloc mlp1\n");
+//   printf("End alloc mlp1\n");
     fflush(stdout);
   }
 #endif
@@ -576,7 +576,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 #ifndef RUN_EP
   /* Tensor parallelism b_mlp1 */
   {
-    printf("Starting alloc b_mlp1\n");
+  //  printf("Starting alloc b_mlp1\n");
     fflush(stdout);
     size_t inter_dim = p->intermediate_dim;
     size_t shard_dim = shard_inter_dim;
@@ -615,13 +615,13 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     CHECK_HIP(hipStreamSynchronize(stream));
     free(tmp);
 
-    printf("End alloc b_mlp1\n");
+    //printf("End alloc b_mlp1\n");
     fflush(stdout);
   }
 #else
   /* Expert parallelism b_mlp1 */
   {
-    printf("Starting alloc b_mlp1\n");
+    //printf("Starting alloc b_mlp1\n");
     fflush(stdout);
 
     size_t hidden_dim = p->hidden_dim;
@@ -654,7 +654,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 
     CHECK_HIP(hipStreamSynchronize(stream));
     free(tmp);
-    printf("End alloc b_mlp1\n");
+    //printf("End alloc b_mlp1\n");
     fflush(stdout);
   }
 #endif
@@ -666,7 +666,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 #ifndef RUN_EP
   /* Tensor parallelism w_mlp2*/
   {
-    printf("Starting alloc mlp2\n");
+    //printf("Starting alloc mlp2\n");
     fflush(stdout);
     size_t hidden_dim = p->hidden_dim;
     size_t inter_dim = p->intermediate_dim;
@@ -709,13 +709,13 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     free(tmp);
 
     // weights->w_mlp2->to_device(0);
-    printf("End alloc mlp2\n");
+//    printf("End alloc mlp2\n");
     fflush(stdout);
   }
 #else
   /* Expert parallelism for w_mlp2 */
   {
-    printf("Starting alloc mlp2\n");
+    //printf("Starting alloc mlp2\n");
     fflush(stdout);
 
     size_t hidden_dim = p->hidden_dim;
@@ -752,7 +752,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     //   CHECK_HIP(hipStreamSynchronize(stream));
     //   free(tmp);
 
-    printf("End alloc mlp2\n");
+    //printf("End alloc mlp2\n");
     fflush(stdout);
   }
 #endif
@@ -767,7 +767,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
 #else
   /* Expert parallelism b_mlp2*/
   {
-    printf("Starting alloc b_mlp2\n");
+    //printf("Starting alloc b_mlp2\n");
     fflush(stdout);
 
     size_t hidden_dim = p->hidden_dim;
@@ -800,7 +800,7 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     CHECK_HIP(hipStreamSynchronize(stream));
     free(tmp);
 
-    printf("End alloc b_mlp2\n");
+    //printf("End alloc b_mlp2\n");
     fflush(stdout);
   }
 #endif
@@ -916,7 +916,7 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->tmp_logits = new Tensor({BATCH_SIZE, (size_t)p->vocab_size / TP}, stream);
 
 #ifdef KV16
-  printf("using BF16 KV cache\n");
+  //printf("using BF16 KV cache\n");
   rs->key_cache = new Tensor({BATCH_SIZE * PP_SLOT, ((size_t)p->n_layers / PP), (size_t)p->seq_len,
                               (size_t)p->n_kv_heads * p->head_dim / TP},
                              stream, DType::BF16);
@@ -924,7 +924,7 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
                                 (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim / TP},
                                stream, DType::BF16);
 #else
-  printf("using FP32 KV cache\n");
+  //printf("using FP32 KV cache\n");
   rs->key_cache = new Tensor({BATCH_SIZE, ((size_t)p->n_layers / PP), (size_t)p->seq_len,
                               (size_t)p->n_kv_heads * p->head_dim / TP},
                              stream);
