@@ -24,96 +24,98 @@
 
 typedef struct {
   // Model Config
-  int vocab_size;  // vocabulary size
-  int hidden_dim;  // model dim
+  int vocab_size; // vocabulary size
+  int hidden_dim; // model dim
   // MLP Config
-  int n_experts;          // number of experts
-  int experts_per_token;  // num top-k
-  int intermediate_dim;   // for ffn layers
-  int n_layers;           // num hidden layers
+  int n_experts;         // number of experts
+  int experts_per_token; // num top-k
+  int intermediate_dim;  // for ffn layers
+  int n_layers;          // num hidden layers
   // Attention Config
-  int head_dim;                // head dimension
-  int n_attn_heads;            // number of query heads
-  int n_kv_heads;              // number of key/value heads (can be < query heads because of
-                               // MQA)
-  int seq_len;                 // max sequence length e.g., 1024
-  int initial_context_length;  // e.g., 4096
-  float rope_theta;            // rope theta e.g., 150000.0
-  float rope_scaling_factor;   // e.g., 32.0
-  int sliding_window;          // e.g., 128
-  float swiglu_limit;          // e.g., 7.0
+  int head_dim;     // head dimension
+  int n_attn_heads; // number of query heads
+  int n_kv_heads; // number of key/value heads (can be < query heads because of
+                  // MQA)
+  int seq_len;    // max sequence length e.g., 1024
+  int initial_context_length; // e.g., 4096
+  float rope_theta;           // rope theta e.g., 150000.0
+  float rope_scaling_factor;  // e.g., 32.0
+  int sliding_window;         // e.g., 128
+  float swiglu_limit;         // e.g., 7.0
 } Config;
 
 typedef struct {
   // token_embedding_table - embedding.weight
-  float *token_embedding_table;  // (vocab_size, hidden_dim) (in, out)
+  float *token_embedding_table; // (vocab_size, hidden_dim) (in, out)
   // weights for rmsnorms
-  float *rms_attn_w;  // (n_layers, hidden_dim) [attn.norm.scale]
-  float *rms_ffn_w;   // (n_layers, hidden_dim) [mlp.norm.scale]
+  float *rms_attn_w; // (n_layers, hidden_dim) [attn.norm.scale]
+  float *rms_ffn_w;  // (n_layers, hidden_dim) [mlp.norm.scale]
   // weights for attention [attn.qkv.weight & attn.qkv.bias]
-  float *w_qkv;       // (n_layers, head_dim * n_attn_heads + 2 * head_dim * n_kv_heads,
-                      // hidden_dim) where w_q (head_dim * n_attn_heads, hidden_dim)
-                      // (out_features, in_features) w_k (head_dim * n_kv_heads,
-                      // hidden_dim)  (out_features, in_features) w_v (head_dim *
-                      // n_kv_heads, hidden_dim)  (out_features, in_features)
-  float *w_o;         // (n_layers, hidden_dim, head_dim * n_attn_heads)
-  float *b_qkv;       // (n_layers, head_dim * n_attn_heads + 2 * head_dim *
-                      // n_kv_heads) (head_dim * n_attn_heads) (head_dim * n_kv_heads)
-                      // (head_dim * n_kv_heads)
-  float *b_o;         // (n_layers, hidden_dim)
-  float *attn_sinks;  // (n_layers, n_attn_heads)
+  float
+      *w_qkv; // (n_layers, head_dim * n_attn_heads + 2 * head_dim * n_kv_heads,
+              // hidden_dim) where w_q (head_dim * n_attn_heads, hidden_dim)
+              // (out_features, in_features) w_k (head_dim * n_kv_heads,
+              // hidden_dim)  (out_features, in_features) w_v (head_dim *
+              // n_kv_heads, hidden_dim)  (out_features, in_features)
+  float *w_o; // (n_layers, hidden_dim, head_dim * n_attn_heads)
+  float *b_qkv; // (n_layers, head_dim * n_attn_heads + 2 * head_dim *
+                // n_kv_heads) (head_dim * n_attn_heads) (head_dim * n_kv_heads)
+                // (head_dim * n_kv_heads)
+  float *b_o;   // (n_layers, hidden_dim)
+  float *attn_sinks; // (n_layers, n_attn_heads)
   // weights for router [mlp.gate.weight & mlp.gate.bias]
-  float *w_router;  // (n_layers, hidden_dim, n_experts)
-  float *b_router;  // (n_layers, n_experts)
+  float *w_router; // (n_layers, hidden_dim, n_experts)
+  float *b_router; // (n_layers, n_experts)
   // weights for MoE [mlp.mlp1_weight & mlp.mlp1_bias & mlp.mlp2_weight &
   // mlp.mlp2_bias] NOTE: gate_up projects from hidden_dim to intermediate_dim,
   // the shape is kinda reverted because the original code use einsum to reduce
   // over hidden_dim
-  float *w_mlp1;  // gate_up_proj (n_layers, n_experts, 2 * intermediate_dim,
-                  // hidden_dim)
-  float *w_mlp2;  // down_proj (n_layers, n_experts, hidden_dim, intermediate_dim)
-  float *b_mlp1;  // gate_up proj (n_layers, n_experts, 2 * intermediate_dim)
-  float *b_mlp2;  // down_proj (n_layers, n_experts, hidden_dim)
+  float *w_mlp1; // gate_up_proj (n_layers, n_experts, 2 * intermediate_dim,
+                 // hidden_dim)
+  float
+      *w_mlp2; // down_proj (n_layers, n_experts, hidden_dim, intermediate_dim)
+  float *b_mlp1; // gate_up proj (n_layers, n_experts, 2 * intermediate_dim)
+  float *b_mlp2; // down_proj (n_layers, n_experts, hidden_dim)
   // final norm [norm.scale]
-  float *rms_out_w;  // (hidden_dim, )
+  float *rms_out_w; // (hidden_dim, )
   // classifier weights for the logits [unembedding.weight]
-  float *out;  // (vocab_size, hidden_dim) (out, in)
+  float *out; // (vocab_size, hidden_dim) (out, in)
 } TransformerWeights;
 
 typedef struct {
   // current wave of activations
-  float *x;             // activation at current time stamp (hidden_dim, )
-  float *t;             // same, but inside a residual branch (hidden_dim, )
-  float *tb;            // (head_dim * n_attn_heads, )
-  float *tb2;           // (hidden_dim, )
-  float *router_score;  // router score (n_experts, )
-  float *topk_v;        // topk expert weights (experts_per_token, )
-  int *topk_i;          // topk expert indices (experts_per_token, )
+  float *x;            // activation at current time stamp (hidden_dim, )
+  float *t;            // same, but inside a residual branch (hidden_dim, )
+  float *tb;           // (head_dim * n_attn_heads, )
+  float *tb2;          // (hidden_dim, )
+  float *router_score; // router score (n_experts, )
+  float *topk_v;       // topk expert weights (experts_per_token, )
+  int *topk_i;         // topk expert indices (experts_per_token, )
   float *mlp1_out;
   float *gate;
   float *up;
   float *gate_up;
   float *e_agg;
-  float *qkv;     // an additional buffer just for convenience (head_dim *
-                  // (n_attn_heads + 2 * n_kv_heads), )
-  float *q;       // query (n_attn_heads * head_dim,)
-  float *k;       // key (n_kv_heads * head_dim,)
-  float *v;       // value (n_kv_heads * head_dim,)
-  float *att;     // buffer for scores/attention values (n_heads, seq_len)
-  float *logits;  // output logits
+  float *qkv;    // an additional buffer just for convenience (head_dim *
+                 // (n_attn_heads + 2 * n_kv_heads), )
+  float *q;      // query (n_attn_heads * head_dim,)
+  float *k;      // key (n_kv_heads * head_dim,)
+  float *v;      // value (n_kv_heads * head_dim,)
+  float *att;    // buffer for scores/attention values (n_heads, seq_len)
+  float *logits; // output logits
   // kv cache
-  float *key_cache;    // (layer, seq_len, kv_dim)
-  float *value_cache;  // (layer, seq_len, kv_dim)
+  float *key_cache;   // (layer, seq_len, kv_dim)
+  float *value_cache; // (layer, seq_len, kv_dim)
   float *mask;
 } RunState;
 
 typedef struct {
   Config config;
   TransformerWeights weights;
-  RunState state;     // buffers for the "wave" of activations in the forward pass
-  int fd;             // file descriptor for memory mapping
-  float *data;        // memory mapped data pointer
-  ssize_t file_size;  // size of the checkpoint file in bytes
+  RunState state; // buffers for the "wave" of activations in the forward pass
+  int fd;         // file descriptor for memory mapping
+  float *data;    // memory mapped data pointer
+  ssize_t file_size; // size of the checkpoint file in bytes
 } Transformer;
 
 void malloc_run_state(RunState *s, Config *p) {
@@ -121,36 +123,46 @@ void malloc_run_state(RunState *s, Config *p) {
   int kv_dim = p->head_dim * p->n_kv_heads;
   s->x = reinterpret_cast<float *>(calloc(p->hidden_dim, sizeof(float)));
   s->t = reinterpret_cast<float *>(calloc(p->hidden_dim, sizeof(float)));
-  s->tb = reinterpret_cast<float *>(calloc(p->head_dim * p->n_attn_heads, sizeof(float)));
+  s->tb = reinterpret_cast<float *>(
+      calloc(p->head_dim * p->n_attn_heads, sizeof(float)));
   s->tb2 = reinterpret_cast<float *>(calloc(p->hidden_dim, sizeof(float)));
 
-  s->router_score = reinterpret_cast<float *>(calloc(p->n_experts, sizeof(float)));
-  s->topk_v = reinterpret_cast<float *>(calloc(p->experts_per_token, sizeof(float)));
-  s->topk_i = reinterpret_cast<int *>(calloc(p->experts_per_token, sizeof(int)));
+  s->router_score =
+      reinterpret_cast<float *>(calloc(p->n_experts, sizeof(float)));
+  s->topk_v =
+      reinterpret_cast<float *>(calloc(p->experts_per_token, sizeof(float)));
+  s->topk_i =
+      reinterpret_cast<int *>(calloc(p->experts_per_token, sizeof(int)));
 
-  s->mlp1_out = reinterpret_cast<float *>(calloc(2 * p->intermediate_dim, sizeof(float)));
-  s->gate = reinterpret_cast<float *>(calloc(p->intermediate_dim, sizeof(float)));
+  s->mlp1_out =
+      reinterpret_cast<float *>(calloc(2 * p->intermediate_dim, sizeof(float)));
+  s->gate =
+      reinterpret_cast<float *>(calloc(p->intermediate_dim, sizeof(float)));
   s->up = reinterpret_cast<float *>(calloc(p->intermediate_dim, sizeof(float)));
-  s->gate_up = reinterpret_cast<float *>(calloc(p->intermediate_dim, sizeof(float)));
+  s->gate_up =
+      reinterpret_cast<float *>(calloc(p->intermediate_dim, sizeof(float)));
   s->e_agg = reinterpret_cast<float *>(calloc(p->hidden_dim, sizeof(float)));
 
-  s->qkv = reinterpret_cast<float *>(
-    calloc(p->head_dim * (p->n_attn_heads + 2 * p->n_kv_heads), sizeof(float)));
-  s->q = reinterpret_cast<float *>(calloc(p->n_attn_heads * p->head_dim, sizeof(float)));
+  s->qkv = reinterpret_cast<float *>(calloc(
+      p->head_dim * (p->n_attn_heads + 2 * p->n_kv_heads), sizeof(float)));
+  s->q = reinterpret_cast<float *>(
+      calloc(p->n_attn_heads * p->head_dim, sizeof(float)));
 
-  s->key_cache =
-    reinterpret_cast<float *>(calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float)));
-  s->value_cache =
-    reinterpret_cast<float *>(calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float)));
-  s->att = reinterpret_cast<float *>(calloc(p->n_attn_heads * p->seq_len, sizeof(float)));
+  s->key_cache = reinterpret_cast<float *>(
+      calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float)));
+  s->value_cache = reinterpret_cast<float *>(
+      calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float)));
+  s->att = reinterpret_cast<float *>(
+      calloc(p->n_attn_heads * p->seq_len, sizeof(float)));
   s->logits = reinterpret_cast<float *>(calloc(p->vocab_size, sizeof(float)));
-  s->mask = p->sliding_window > 0
-              ? reinterpret_cast<float *>(calloc(p->seq_len * p->seq_len, sizeof(float)))
-              : NULL;
+  s->mask = p->sliding_window > 0 ? reinterpret_cast<float *>(calloc(
+                                        p->seq_len * p->seq_len, sizeof(float)))
+                                  : NULL;
 
   // ensure all mallocs went fine
-  if (!s->x || !s->t || !s->tb || !s->tb2 || !s->qkv || !s->q || !s->key_cache || !s->value_cache ||
-      !s->att || !s->logits || (p->sliding_window > 0 && !s->mask) || !s->e_agg) {
+  if (!s->x || !s->t || !s->tb || !s->tb2 || !s->qkv || !s->q ||
+      !s->key_cache || !s->value_cache || !s->att || !s->logits ||
+      (p->sliding_window > 0 && !s->mask) || !s->e_agg) {
     fprintf(stderr, "malloc failed!\n");
     exit(EXIT_FAILURE);
   }
@@ -158,7 +170,7 @@ void malloc_run_state(RunState *s, Config *p) {
   for (int i = 0; i < p->seq_len; i++) {
     for (int j = 0; j < p->seq_len; j++) {
       if (p->sliding_window > 0 && i - j >= p->sliding_window) {
-        s->mask[i * p->seq_len + j] = -INFINITY;  // Sliding window mask
+        s->mask[i * p->seq_len + j] = -INFINITY; // Sliding window mask
       }
     }
   }
@@ -197,7 +209,7 @@ void memory_map_weights(TransformerWeights *w, Config *cfg, float *ptr) {
   int n_experts = cfg->n_experts;
   w->token_embedding_table = ptr;
   ptr += 1ll * cfg->vocab_size * cfg->hidden_dim;
-  w->out = ptr;  // unembedding
+  w->out = ptr; // unembedding
   ptr += 1ll * cfg->vocab_size * cfg->hidden_dim;
   w->rms_attn_w = ptr;
   ptr += 1ll * n_layers * cfg->hidden_dim;
@@ -210,7 +222,8 @@ void memory_map_weights(TransformerWeights *w, Config *cfg, float *ptr) {
   ptr += 1ll * n_layers * cfg->hidden_dim *
          (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
   w->b_qkv = ptr;
-  ptr += 1ll * n_layers * (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
+  ptr += 1ll * n_layers *
+         (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
   w->w_o = ptr;
   ptr += 1ll * n_layers * (head_dim * cfg->n_attn_heads) * cfg->hidden_dim;
   w->b_o = ptr;
@@ -223,7 +236,8 @@ void memory_map_weights(TransformerWeights *w, Config *cfg, float *ptr) {
   ptr += 1ll * n_layers * n_experts;
   // hey it's gate_upgate_up, not gategateupup
   w->w_mlp1 = ptr;
-  ptr += 1ll * n_layers * n_experts * 2 * cfg->intermediate_dim * cfg->hidden_dim;
+  ptr +=
+      1ll * n_layers * n_experts * 2 * cfg->intermediate_dim * cfg->hidden_dim;
   w->b_mlp1 = ptr;
   ptr += 1ll * n_layers * n_experts * 2 * cfg->intermediate_dim;
   w->w_mlp2 = ptr;
@@ -232,8 +246,8 @@ void memory_map_weights(TransformerWeights *w, Config *cfg, float *ptr) {
   ptr += 1ll * n_layers * n_experts * cfg->hidden_dim;
 }
 
-void load_checkpoint(char *ckpt, Config *config, TransformerWeights *weights, int *fd, float **data,
-                     ssize_t *file_size) {
+void load_checkpoint(char *ckpt, Config *config, TransformerWeights *weights,
+                     int *fd, float **data, ssize_t *file_size) {
   FILE *file = fopen(ckpt, "rb");
   if (!file) {
     fprintf(stderr, "Couldn't open file %s\n", ckpt);
@@ -261,17 +275,18 @@ void load_checkpoint(char *ckpt, Config *config, TransformerWeights *weights, in
   printf("rope_scaling_factor: %f\n", config->rope_scaling_factor);
   printf("sliding window: %d\n", config->sliding_window);
   printf("swiglu_limit: %f\n", config->swiglu_limit);
-  fseek(file, 0, SEEK_END);  // move file pointer to end of file
+  fseek(file, 0, SEEK_END); // move file pointer to end of file
 
-  *file_size = ftell(file);  // get the file size, in bytes
+  *file_size = ftell(file); // get the file size, in bytes
   fclose(file);
   // memory map the Transformer weights into the data pointer
-  *fd = open(ckpt, O_RDONLY);  // open in read only mode
+  *fd = open(ckpt, O_RDONLY); // open in read only mode
   if (*fd == -1) {
     fprintf(stderr, "open failed\n");
     exit(EXIT_FAILURE);
   }
-  *data = reinterpret_cast<float *>(mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0));
+  *data = reinterpret_cast<float *>(
+      mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0));
   if (*data == MAP_FAILED) {
     fprintf(stderr, "mmap failed!\n");
     exit(EXIT_FAILURE);
@@ -282,7 +297,8 @@ void load_checkpoint(char *ckpt, Config *config, TransformerWeights *weights, in
 
 void build_transformer(Transformer *t, char *ckpt_path) {
   // read in the Config and the Weights from the checkpoint
-  load_checkpoint(ckpt_path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
+  load_checkpoint(ckpt_path, &t->config, &t->weights, &t->fd, &t->data,
+                  &t->file_size);
   malloc_run_state(&t->state, &t->config);
 }
 
@@ -368,11 +384,13 @@ int compare_desc(const void *a, const void *b) {
 }
 
 // topk function: returns top-k values and their indices
-void topk(float *topk_values, int *topk_indices, float *router_score, int num_experts,
-          int experts_per_token) {
-  if (num_experts <= 0 || experts_per_token <= 0 || experts_per_token > num_experts) {
-    fprintf(stderr, "Invalid parameters: num_experts=%d, experts_per_token=%d\n", num_experts,
-            experts_per_token);
+void topk(float *topk_values, int *topk_indices, float *router_score,
+          int num_experts, int experts_per_token) {
+  if (num_experts <= 0 || experts_per_token <= 0 ||
+      experts_per_token > num_experts) {
+    fprintf(stderr,
+            "Invalid parameters: num_experts=%d, experts_per_token=%d\n",
+            num_experts, experts_per_token);
     return;
   }
   if (!router_score || !topk_values || !topk_indices) {
@@ -401,10 +419,12 @@ void topk(float *topk_values, int *topk_indices, float *router_score, int num_ex
   free(pairs);
 }
 
-void compute_concentration_and_inv_freq(float base, int head_dim, float scaling_factor,
-                                        float initial_context_length, float ntk_beta,
-                                        float ntk_alpha, float *concentration_out,
-                                        float *inv_freq_out  // length head_dim/2
+void compute_concentration_and_inv_freq(float base, int head_dim,
+                                        float scaling_factor,
+                                        float initial_context_length,
+                                        float ntk_beta, float ntk_alpha,
+                                        float *concentration_out,
+                                        float *inv_freq_out // length head_dim/2
 ) {
   int d_half = head_dim / 2;
 
@@ -420,8 +440,12 @@ void compute_concentration_and_inv_freq(float base, int head_dim, float scaling_
     concentration = 0.1f * logf(scaling_factor) + 1.0f;
 
     // NTK by parts
-    float low = d_half * logf(initial_context_length / (ntk_beta * 2.0f * M_PI)) / logf(base);
-    float high = d_half * logf(initial_context_length / (ntk_alpha * 2.0f * M_PI)) / logf(base);
+    float low = d_half *
+                logf(initial_context_length / (ntk_beta * 2.0f * M_PI)) /
+                logf(base);
+    float high = d_half *
+                 logf(initial_context_length / (ntk_alpha * 2.0f * M_PI)) /
+                 logf(base);
 
     assert(0 < low && low < high && high < d_half - 1);
 
@@ -452,11 +476,12 @@ void compute_concentration_and_inv_freq(float base, int head_dim, float scaling_
   free(freq);
 }
 
-void compute_cos_sin(int pos,  // position index
-                     float base, int head_dim, float scaling_factor, float initial_context_length,
-                     float ntk_beta, float ntk_alpha,
-                     float *cos_out,  // shape: head_dim/2
-                     float *sin_out   // shape: head_dim/2
+void compute_cos_sin(int pos, // position index
+                     float base, int head_dim, float scaling_factor,
+                     float initial_context_length, float ntk_beta,
+                     float ntk_alpha,
+                     float *cos_out, // shape: head_dim/2
+                     float *sin_out  // shape: head_dim/2
 ) {
   int d_half = head_dim / 2;
 
@@ -464,8 +489,9 @@ void compute_cos_sin(int pos,  // position index
   float concentration;
   float *inv_freq = (float *)malloc(d_half * sizeof(float));
 
-  compute_concentration_and_inv_freq(base, head_dim, scaling_factor, initial_context_length,
-                                     ntk_beta, ntk_alpha, &concentration, inv_freq);
+  compute_concentration_and_inv_freq(base, head_dim, scaling_factor,
+                                     initial_context_length, ntk_beta,
+                                     ntk_alpha, &concentration, inv_freq);
 
   // Compute cos and sin for this position
   for (int j = 0; j < d_half; j++) {
@@ -477,14 +503,15 @@ void compute_cos_sin(int pos,  // position index
   free(inv_freq);
 }
 
-void apply_rotary_emb(float *x, float *cos, float *sin, int n_heads, int head_dim) {
+void apply_rotary_emb(float *x, float *cos, float *sin, int n_heads,
+                      int head_dim) {
   int half = head_dim / 2;
 
   for (int h = 0; h < n_heads; h++) {
     for (int i = 0; i < half; i++) {
       // Indexing: head h, dim i
-      float x1 = x[h * head_dim + i];         // first half
-      float x2 = x[h * head_dim + half + i];  // second half
+      float x1 = x[h * head_dim + i];        // first half
+      float x2 = x[h * head_dim + half + i]; // second half
 
       float c = cos[i];
       float s = sin[i];
@@ -508,7 +535,8 @@ float *forward(Transformer *transformer, int token, int pos) {
   int hidden_dim = p->hidden_dim;
   int kv_dim = p->head_dim * p->n_kv_heads;
   int kv_mul =
-    p->n_attn_heads / p->n_kv_heads;  // integer multiplier of the kv sharing in multiquery
+      p->n_attn_heads /
+      p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
   int intermediate_dim = p->intermediate_dim;
   int n_experts = p->n_experts;
 
@@ -522,26 +550,30 @@ float *forward(Transformer *transformer, int token, int pos) {
     rmsnorm(s->t, x, w->rms_attn_w + 1ll * l * hidden_dim, hidden_dim);
 
     // key and value point to the kv cache
-    int loff = l * p->seq_len * kv_dim;  // kv cache layer offset for convenience
+    int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
     s->k = s->key_cache + loff + pos * kv_dim;
     s->v = s->value_cache + loff + pos * kv_dim;
 
     // s->qkv = w->w_qkv * s->t = (head_dim * (n_attn_heads + 2 * n_kv_heads),
     // hidden_dim) * (hidden_dim, ) = head_dim * (n_attn_heads + 2 * n_kv_heads)
-    float *w_qkv =
-      w->w_qkv + 1ll * l * hidden_dim * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
-    float *b_qkv = w->b_qkv + 1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
-    matmul(s->qkv, s->t, w_qkv, hidden_dim, (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
+    float *w_qkv = w->w_qkv + 1ll * l * hidden_dim *
+                                  (head_dim * p->n_attn_heads +
+                                   2 * head_dim * p->n_kv_heads);
+    float *b_qkv =
+        w->b_qkv +
+        1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
+    matmul(s->qkv, s->t, w_qkv, hidden_dim,
+           (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
     // add bias
     for (int i = 0; i < (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim; ++i) {
       s->qkv[i] += b_qkv[i];
     }
     // Separate q, k, v
-    memcpy(s->q, s->qkv, head_dim * p->n_attn_heads * sizeof(float));  // gate
+    memcpy(s->q, s->qkv, head_dim * p->n_attn_heads * sizeof(float)); // gate
     memcpy(s->k, s->qkv + head_dim * p->n_attn_heads,
-           head_dim * p->n_kv_heads * sizeof(float));  // gate
+           head_dim * p->n_kv_heads * sizeof(float)); // gate
     memcpy(s->v, s->qkv + head_dim * p->n_attn_heads + head_dim * p->n_kv_heads,
-           head_dim * p->n_kv_heads * sizeof(float));  // gate
+           head_dim * p->n_kv_heads * sizeof(float)); // gate
 
     // RoPE relative positional encoding: complex-valued rotate q and k in each
     // head Adapted from
@@ -549,10 +581,13 @@ float *forward(Transformer *transformer, int token, int pos) {
     // RoPE with YaRN scaling adapted from Python code
     float ntk_beta = 32.0f;
     float ntk_alpha = 1.0f;
-    float *cos_vals = reinterpret_cast<float *>(malloc((head_dim / 2) * sizeof(float)));
-    float *sin_vals = reinterpret_cast<float *>(malloc((head_dim / 2) * sizeof(float)));
-    compute_cos_sin(pos, p->rope_theta, head_dim, p->rope_scaling_factor, p->initial_context_length,
-                    ntk_beta, ntk_alpha, cos_vals, sin_vals);
+    float *cos_vals =
+        reinterpret_cast<float *>(malloc((head_dim / 2) * sizeof(float)));
+    float *sin_vals =
+        reinterpret_cast<float *>(malloc((head_dim / 2) * sizeof(float)));
+    compute_cos_sin(pos, p->rope_theta, head_dim, p->rope_scaling_factor,
+                    p->initial_context_length, ntk_beta, ntk_alpha, cos_vals,
+                    sin_vals);
     apply_rotary_emb(s->q, cos_vals, sin_vals, p->n_attn_heads, head_dim);
     apply_rotary_emb(s->k, cos_vals, sin_vals, p->n_kv_heads, head_dim);
 
@@ -627,15 +662,16 @@ float *forward(Transformer *transformer, int token, int pos) {
     float *w_router = w->w_router + 1ll * l * hidden_dim * n_experts;
     float *b_router = w->b_router + 1ll * l * n_experts;
     matmul(s->router_score, s->t, w_router, hidden_dim,
-           n_experts);  // s->router_score now stores router_score (n_experts, )
+           n_experts); // s->router_score now stores router_score (n_experts, )
     // add bias b_router
     for (int i = 0; i < n_experts; i++) {
       s->router_score[i] += b_router[i];
     }
     // Select top-k experts
-    topk(s->topk_v, s->topk_i, s->router_score, n_experts, p->experts_per_token);
+    topk(s->topk_v, s->topk_i, s->router_score, n_experts,
+         p->experts_per_token);
     // Normalize selected experts using softmax or sigmoid
-    softmax(s->topk_v, p->experts_per_token);  // expert
+    softmax(s->topk_v, p->experts_per_token); // expert
 
     // Route the tokens to their corresponding top-k experts
     memset(s->e_agg, 0, hidden_dim * sizeof(float));
@@ -652,11 +688,12 @@ float *forward(Transformer *transformer, int token, int pos) {
       }
 
       if (in_topk) {
-        float *w_mlp1 =
-          w->w_mlp1 + 1ll * (l * n_experts + e) * (2 * p->intermediate_dim) * hidden_dim;
-        float *b_mlp1 = w->b_mlp1 + 1ll * (l * n_experts + e) * (2 * p->intermediate_dim);
+        float *w_mlp1 = w->w_mlp1 + 1ll * (l * n_experts + e) *
+                                        (2 * p->intermediate_dim) * hidden_dim;
+        float *b_mlp1 =
+            w->b_mlp1 + 1ll * (l * n_experts + e) * (2 * p->intermediate_dim);
         matmul(s->mlp1_out, s->t, w_mlp1, hidden_dim,
-               2 * p->intermediate_dim);  // (2 * intermediate_dim, )
+               2 * p->intermediate_dim); // (2 * intermediate_dim, )
         for (int i = 0; i < 2 * p->intermediate_dim; i++) {
           s->mlp1_out[i] += b_mlp1[i];
         }
@@ -681,17 +718,19 @@ float *forward(Transformer *transformer, int token, int pos) {
           // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
           val *= (1.0f / (1.0f + expf(-alpha * val)));
           // elementwise multiply with w_gate(x)
-          val *= (up_val + 1.0f);  // gpt-oss adds an extra bias of 1 to the up layer
+          val *= (up_val +
+                  1.0f); // gpt-oss adds an extra bias of 1 to the up layer
           s->gate_up[i] = val;
         }
 
         // final matmul to get the output of the ffn
         float *w_mlp2 =
-          w->w_mlp2 + 1ll * (l * n_experts + e) * hidden_dim *
-                        p->intermediate_dim;  // (out: hidden_dim, in: intermediate_dim)
+            w->w_mlp2 +
+            1ll * (l * n_experts + e) * hidden_dim *
+                p->intermediate_dim; // (out: hidden_dim, in: intermediate_dim)
         float *b_mlp2 = w->b_mlp2 + 1ll * (l * n_experts + e) * hidden_dim;
         matmul(s->tb2, s->gate_up, w_mlp2, p->intermediate_dim,
-               hidden_dim);  // (hidden_dim, )
+               hidden_dim); // (hidden_dim, )
         for (int i = 0; i < hidden_dim; i++) {
           s->tb2[i] += b_mlp2[i];
         }
@@ -726,11 +765,11 @@ float *forward(Transformer *transformer, int token, int pos) {
 typedef struct {
   float prob;
   int index;
-} ProbIndex;  // struct used when sorting probabilities during top-p sampling
+} ProbIndex; // struct used when sorting probabilities during top-p sampling
 
 typedef struct {
   int vocab_size;
-  ProbIndex *probindex;  // buffer used in top-p sampling
+  ProbIndex *probindex; // buffer used in top-p sampling
   float temperature;
   float topp;
   unsigned long long rng_state;
@@ -759,7 +798,7 @@ int sample_mult(float *probabilities, int n, float coin) {
       return i;
     }
   }
-  return n - 1;  // in case of rounding errors
+  return n - 1; // in case of rounding errors
 }
 
 int compare(const void *a, const void *b) {
@@ -772,7 +811,8 @@ int compare(const void *a, const void *b) {
   return 0;
 }
 
-int sample_topp(float *probabilities, int n, float topp, ProbIndex *probindex, float coin) {
+int sample_topp(float *probabilities, int n, float topp, ProbIndex *probindex,
+                float coin) {
   // top-p sampling (or "nucleus sampling") samples from the smallest set of
   // tokens that exceed probability topp. This way we never sample tokens that
   // have very low probabilities and are less likely to go "off the rails".
@@ -794,12 +834,12 @@ int sample_topp(float *probabilities, int n, float topp, ProbIndex *probindex, f
 
   // truncate the list where cumulative probability exceeds topp
   float cumulative_prob = 0.0f;
-  int last_idx = n0 - 1;  // in case of rounding errors consider all elements
+  int last_idx = n0 - 1; // in case of rounding errors consider all elements
   for (int i = 0; i < n0; i++) {
     cumulative_prob += probindex[i].prob;
     if (cumulative_prob > topp) {
       last_idx = i;
-      break;  // we've exceeded topp by including last_idx
+      break; // we've exceeded topp by including last_idx
     }
   }
 
@@ -812,23 +852,21 @@ int sample_topp(float *probabilities, int n, float topp, ProbIndex *probindex, f
       return probindex[i].index;
     }
   }
-  return probindex[last_idx].index;  // in case of rounding errors
+  return probindex[last_idx].index; // in case of rounding errors
 }
 
-void build_sampler(Sampler *sampler, int vocab_size, float temperature, float topp,
-                   unsigned long long rng_seed) {
+void build_sampler(Sampler *sampler, int vocab_size, float temperature,
+                   float topp, unsigned long long rng_seed) {
   sampler->vocab_size = vocab_size;
   sampler->temperature = temperature;
   sampler->topp = topp;
   sampler->rng_state = rng_seed;
   // buffer only used with nucleus sampling; may not need but it's ~small
-  sampler->probindex =
-    reinterpret_cast<ProbIndex *>(malloc(sampler->vocab_size * sizeof(ProbIndex)));
+  sampler->probindex = reinterpret_cast<ProbIndex *>(
+      malloc(sampler->vocab_size * sizeof(ProbIndex)));
 }
 
-void free_sampler(Sampler *sampler) {
-  free(sampler->probindex);
-}
+void free_sampler(Sampler *sampler) { free(sampler->probindex); }
 
 unsigned int random_u32(unsigned long long *state) {
   // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
@@ -837,7 +875,7 @@ unsigned int random_u32(unsigned long long *state) {
   *state ^= *state >> 27;
   return (*state * 0x2545F4914F6CDD1Dull) >> 32;
 }
-float random_f32(unsigned long long *state) {  // random float32 in [0,1)
+float random_f32(unsigned long long *state) { // random float32 in [0,1)
   return (random_u32(state) >> 8) / 16777216.0f;
 }
 
@@ -862,7 +900,8 @@ int sample(Sampler *sampler, float *logits) {
       next = sample_mult(logits, sampler->vocab_size, coin);
     } else {
       // top-p (nucleus) sampling, clamping the least likely tokens to zero
-      next = sample_topp(logits, sampler->vocab_size, sampler->topp, sampler->probindex, coin);
+      next = sample_topp(logits, sampler->vocab_size, sampler->topp,
+                         sampler->probindex, coin);
     }
   }
   return next;
@@ -881,8 +920,8 @@ long time_in_ms() {
 // ----------------------------------------------------------------------------
 // generation loop
 
-void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, const char *prompt,
-              int steps) {
+void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
+              const char *prompt, int steps) {
   // <|start|>: 200006
   // <|end|>: 200007
   // <|return|>: 200002
@@ -898,8 +937,8 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
 
   // encode the (string) prompt into tokens sequence
   int num_prompt_tokens = 0;
-  int *prompt_tokens =
-    (int *)malloc((strlen(prompt) + 3) * sizeof(int));  // +3 for '\0', ?BOS, ?EOS
+  int *prompt_tokens = (int *)malloc((strlen(prompt) + 3) *
+                                     sizeof(int)); // +3 for '\0', ?BOS, ?EOS
 
   encode(tokenizer, prompt, -1, -1, prompt_tokens, &num_prompt_tokens,
          transformer->config.initial_context_length);
@@ -909,10 +948,11 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
   }
 
   // start the main loop
-  long start = 0;                // used to time our code, only initialized after first iteration
-  int next;                      // will store the next token in the sequence
-  int token = prompt_tokens[0];  // kick off with the first token in the prompt
-  int pos = 0;                   // position in the sequence
+  long start =
+      0;    // used to time our code, only initialized after first iteration
+  int next; // will store the next token in the sequence
+  int token = prompt_tokens[0]; // kick off with the first token in the prompt
+  int pos = 0;                  // position in the sequence
 
   // print the very first token
   const char *first_piece = decode_piece(tokenizer, 200006, token);
@@ -920,6 +960,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
   fflush(stdout);
 
   while (pos < steps) {
+
     // forward the transformer to get logits for the next token
     float *logits = forward(transformer, token, pos);
 
@@ -942,7 +983,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
 
     // print the token as string, decode it with the Tokenizer object
     const char *piece = decode_piece(tokenizer, token, next);
-    safe_printf(piece);  // same as printf("%s", piece), but skips "unsafe" bytes
+    safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
     fflush(stdout);
     token = next;
 
@@ -957,7 +998,8 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
   // iteration)
   if (pos > 1) {
     long end = time_in_ms();
-    fprintf(stderr, "achieved tok/s: %f\n", (pos - 1) / (double)(end - start) * 1000);
+    fprintf(stderr, "achieved tok/s: %f\n",
+            (pos - 1) / (double)(end - start) * 1000);
   }
 
   free(prompt_tokens);
@@ -969,7 +1011,7 @@ void read_stdin(const char *guide, char *buffer, size_t bufsize) {
   if (fgets(buffer, bufsize, stdin) != NULL) {
     size_t len = strlen(buffer);
     if (len > 0 && buffer[len - 1] == '\n') {
-      buffer[len - 1] = '\0';  // strip newline
+      buffer[len - 1] = '\0'; // strip newline
     }
   }
 }
@@ -981,7 +1023,9 @@ void read_stdin(const char *guide, char *buffer, size_t bufsize) {
 // is not safely implemented, it's more a proof of concept atm.
 
 void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
-          const char *cli_user_prompt, const char *cli_system_prompt, int steps) {
+          const char *cli_user_prompt, const char *cli_system_prompt,
+          int steps) {
+
   // buffers for reading the system prompt and user prompt from stdin
   // you'll notice they are soomewhat haphazardly and unsafely set atm
   char system_prompt[512];
@@ -992,12 +1036,13 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
   int user_idx;
 
   // start the main loop
-  int8_t user_turn = 1;  // user starts
-  int next;              // will store the next token in the sequence
-  int token;             // stores the current token to feed into the transformer
+  int8_t user_turn = 1; // user starts
+  int next;             // will store the next token in the sequence
+  int token;            // stores the current token to feed into the transformer
   int prev_token;
-  int pos = 0;  // position in the sequence
+  int pos = 0; // position in the sequence
   while (pos < steps) {
+
     // when it is the user's turn to contribute tokens to the dialog...
     if (user_turn) {
       // get the (optional) system prompt at position 0
@@ -1005,7 +1050,8 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
         // at position 0, the user can also contribute a system prompt
         if (cli_system_prompt == NULL) {
           // system prompt was not passed in, attempt to get it from stdin
-          read_stdin("Enter system prompt (optional): ", system_prompt, sizeof(system_prompt));
+          read_stdin("Enter system prompt (optional): ", system_prompt,
+                     sizeof(system_prompt));
         } else {
           // system prompt was passed in, use it
           strcpy(system_prompt, cli_system_prompt);
@@ -1028,9 +1074,9 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
         sprintf(rendered_prompt, user_template, user_prompt);
       }
       // encode the rendered prompt into tokens
-      encode(tokenizer, rendered_prompt, -1, -1, prompt_tokens, &num_prompt_tokens,
-             transformer->config.initial_context_length);
-      user_idx = 0;  // reset the user index
+      encode(tokenizer, rendered_prompt, -1, -1, prompt_tokens,
+             &num_prompt_tokens, transformer->config.initial_context_length);
+      user_idx = 0; // reset the user index
       user_turn = 0;
       printf("Assistant: ");
     }
@@ -1057,7 +1103,8 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
     if (user_idx >= num_prompt_tokens && next != 2) {
       // the Assistant is responding, so print its output
       const char *piece = decode_piece(tokenizer, token, next);
-      safe_printf(piece);  // same as printf("%s", piece), but skips "unsafe" bytes
+      safe_printf(
+          piece); // same as printf("%s", piece), but skips "unsafe" bytes
       fflush(stdout);
     }
     if (next == 2) {
@@ -1085,25 +1132,31 @@ void error_usage() {
   fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
   fprintf(stderr, "  -n <int>    number of steps to run for, default 1024. 0 = "
                   "max_seq_len\n");
-  fprintf(stderr, "  -i <string> input file in getp mode or input prompt in other modes\n");
+  fprintf(
+      stderr,
+      "  -i <string> input file in getp mode or input prompt in other modes\n");
   fprintf(stderr, "  -o <string> output file in getp mode\n");
   fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
-  fprintf(stderr, "  -m <string> mode: generate|chat|getp, default: generate\n");
+  fprintf(stderr,
+          "  -m <string> mode: generate|chat|getp, default: generate\n");
   fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
   exit(EXIT_FAILURE);
 }
 
 int main(int argc, char **argv) {
   // default parameters
-  char *checkpoint_path = NULL;  // e.g. out/model.bin
+  char *checkpoint_path = NULL; // e.g. out/model.bin
   const char *tokenizer_path = "tokenizer.bin";
-  float temperature = 0.0f;  // 0.0 = greedy deterministic. 1.0 = original. don't set higher
-  float topp = 0.9f;         // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
-  int steps = 1024;          // number of steps to run for
-  char *prompt = NULL;       // prompt string
-  unsigned long long rng_seed = 0;  // seed rng with time by default
-  const char *mode = "generate";    // generate|chat
-  char *system_prompt = NULL;       // the (optional) system prompt to use in chat mode
+  float temperature =
+      0.0f; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
+  float topp =
+      0.9f; // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
+  int steps = 1024;                // number of steps to run for
+  char *prompt = NULL;             // prompt string
+  unsigned long long rng_seed = 0; // seed rng with time by default
+  const char *mode = "generate";   // generate|chat
+  char *system_prompt =
+      NULL; // the (optional) system prompt to use in chat mode
   char *input_filename = NULL;
   char *output_filename = NULL;
 
@@ -1118,13 +1171,13 @@ int main(int argc, char **argv) {
     // do some basic validation
     if (i + 1 >= argc) {
       error_usage();
-    }  // must have arg after flag
+    } // must have arg after flag
     if (argv[i][0] != '-') {
       error_usage();
-    }  // must start with dash
+    } // must start with dash
     if (strlen(argv[i]) != 2) {
       error_usage();
-    }  // must be -x (one dash, one letter)
+    } // must be -x (one dash, one letter)
     // read in the args
     if (argv[i][1] == 't') {
       temperature = atof(argv[i + 1]);
@@ -1164,7 +1217,7 @@ int main(int argc, char **argv) {
   Transformer transformer;
   build_transformer(&transformer, checkpoint_path);
   if (steps == 0 || steps > transformer.config.seq_len)
-    steps = transformer.config.seq_len;  // override to ~max length
+    steps = transformer.config.seq_len; // override to ~max length
 
   // build the Tokenizer via the tokenizer .bin file
   Tokenizer tokenizer;
@@ -1172,7 +1225,8 @@ int main(int argc, char **argv) {
 
   // build the Sampler
   Sampler sampler;
-  build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
+  build_sampler(&sampler, transformer.config.vocab_size, temperature, topp,
+                rng_seed);
 
   // run!
   if (strcmp(mode, "generate") == 0) {
@@ -1180,7 +1234,8 @@ int main(int argc, char **argv) {
   } else if (strcmp(mode, "chat") == 0) {
     chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
   } else if (strcmp(mode, "getp") == 0) {
-    getp(&transformer, &tokenizer, &sampler, input_filename, output_filename, steps);
+    getp(&transformer, &tokenizer, &sampler, input_filename, output_filename,
+         steps);
   } else {
     fprintf(stderr, "unknown mode: %s\n", mode);
     error_usage();
