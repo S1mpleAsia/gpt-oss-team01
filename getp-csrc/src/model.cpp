@@ -292,8 +292,8 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
 #endif
 
     // MoE routing
-    router_gemm_batched(weights_now->w_router, rs_now->t, weights_now->b_router,
-                        rs_now->router_score, cur_batch_size, 1ll * l, false, false, stream);
+    router_gemm_v2(weights_now->w_router, rs_now->t, weights_now->b_router, rs_now->router_score,
+                   cur_batch_size, 1ll * l, false, false, stream);
 
 #ifdef DEBUG
     if (flag)
@@ -319,34 +319,33 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
       rs_now->e_agg->printDebug("rs_now->e_agg", tp_rank, 0, stream);
 #endif
 
-    if (tp_rank == 0) {
-      moe_build_offsets_hip(rs_now->topk_i, rs_now->sorted_pair_ids, rs_now->expert_offsets,
-                            cur_batch_size, p->experts_per_token, p->n_experts, stream);
+    moe_build_offsets_hip(rs_now->topk_i, rs_now->sorted_pair_ids, rs_now->expert_offsets,
+                          cur_batch_size, p->experts_per_token, p->n_experts, stream);
+    // if (tp_rank == 0) {
+    //   CHECK_HIP(hipEventRecord(tp_ready, stream));
+    // }
 
-      CHECK_HIP(hipEventRecord(tp_ready, stream));
-    }
+    // pthread_barrier_wait(tp_barrier);
 
-    pthread_barrier_wait(tp_barrier);
+    // if (tp_rank > 0) {
+    //   hipEvent_t leader_tp_ready = total_events->tp_ready[cur_device - tp_rank];
+    //   CHECK_HIP(hipStreamWaitEvent(stream, leader_tp_ready));
 
-    if (tp_rank > 0) {
-      hipEvent_t leader_tp_ready = total_events->tp_ready[cur_device - tp_rank];
-      CHECK_HIP(hipStreamWaitEvent(stream, leader_tp_ready));
+    //   void *dst_sorted_ids = rs_now->sorted_pair_ids->d_buf;
+    //   const void *src_sorted_ids = rs_leader->sorted_pair_ids->d_buf;
+    //   size_t bytes_sorted_ids = rs_now->sorted_pair_ids->num_elem() * sizeof(int);
 
-      void *dst_sorted_ids = rs_now->sorted_pair_ids->d_buf;
-      const void *src_sorted_ids = rs_leader->sorted_pair_ids->d_buf;
-      size_t bytes_sorted_ids = rs_now->sorted_pair_ids->num_elem() * sizeof(int);
+    //   void *dst_offsets = rs_now->expert_offsets->d_buf;
+    //   const void *src_offsets = rs_leader->expert_offsets->d_buf;
+    //   size_t bytes_offsets = rs_now->expert_offsets->num_elem() * sizeof(int);
 
-      void *dst_offsets = rs_now->expert_offsets->d_buf;
-      const void *src_offsets = rs_leader->expert_offsets->d_buf;
-      size_t bytes_offsets = rs_now->expert_offsets->num_elem() * sizeof(int);
+    //   CHECK_HIP(hipMemcpyPeerAsync(dst_sorted_ids, cur_device, src_sorted_ids, cur_device - tp_rank,
+    //                                bytes_sorted_ids, stream));
+    //   CHECK_HIP(hipMemcpyPeerAsync(dst_offsets, cur_device, src_offsets, cur_device - tp_rank,
+    //                                bytes_offsets, stream));
+    // }
 
-      CHECK_HIP(hipMemcpyPeerAsync(dst_sorted_ids, cur_device, src_sorted_ids, cur_device - tp_rank,
-                                   bytes_sorted_ids, stream));
-      CHECK_HIP(hipMemcpyPeerAsync(dst_offsets, cur_device, src_offsets, cur_device - tp_rank,
-                                   bytes_offsets, stream));
-    }
-
-    pthread_barrier_wait(tp_barrier);
+    // pthread_barrier_wait(tp_barrier);
 
 #ifdef DEBUG
     if (flag) {
@@ -412,14 +411,14 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
 #endif
 
 #ifdef RUN_EP
-    all_gather_tb3(rs_now, rs_leader, tp_rank, cur_device, p, tp_barrier, stream, tp_ready,
-                   tp_finish);
+      // all_gather_tb3(rs_now, rs_leader, tp_rank, cur_device, p, tp_barrier, stream, tp_ready,
+      //                tp_finish);
 #else
     // reduce_tb3(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready,
     //            tp_finish);
 
-    reduce_tb3_new(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream,
-                   tp_ready, tp_finish);
+    // reduce_tb3_new(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream,
+    //                tp_ready, tp_finish);
 
     // ring_all_reduce_tb3(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream);
 #endif
@@ -430,12 +429,29 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
 #endif
 
 #ifdef RUN_EP
-    max_rows = moe_get_max_rows_per_expert_hip(rs_now->expert_offsets, rs_now->max_rows,
-                                               p->n_experts, stream);
-#endif
+    // max_rows = moe_get_max_rows_per_expert_hip(rs_now->expert_offsets, rs_now->max_rows,
+    //                                            p->n_experts, stream);
+
+    int experts_per_gpu = p->n_experts / TP;
+    int start_expert_offset = rs_now->expert_offsets->buf[tp_rank * experts_per_gpu];
+    int end_expert_offset = rs_now->expert_offsets->buf[(tp_rank + 1) * experts_per_gpu];
+    moe_scatter_aggregate_ep_hip(rs_now->tb3, rs_now->sorted_pair_ids, rs_now->topk_v,
+                                 rs_now->e_agg, rs_now->expert_offsets, p->hidden_dim,
+                                 p->experts_per_token, p->n_experts, 0, start_expert_offset,
+                                 end_expert_offset, stream);
+
+    reduce_agg(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready,
+               tp_finish);
+
+#else
     moe_scatter_aggregate_hip_120b(rs_now->tb3, rs_now->sorted_pair_ids, rs_now->topk_v,
                                    rs_now->e_agg, rs_now->expert_offsets, p->hidden_dim,
-                                   p->experts_per_token, p->n_experts, max_rows, stream);
+                                   p->experts_per_token, p->n_experts, 0, stream);
+
+    reduce_agg(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready,
+               tp_finish);
+
+#endif
 
 #ifdef DEBUG
     if (flag)

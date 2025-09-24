@@ -112,6 +112,13 @@ void router_gemm_batched(const Tensor *w_router,  // Shape: [n_experts, hidden_d
                          int cur_batch_size, long long layer_offset, bool t_to_device,
                          bool r_from_device, hipStream_t stream = 0);
 
+void router_gemm_v2(const Tensor *w_router,  // Shape: [hidden_dim, n_experts]
+                    Tensor *t,               // Shape: [batch_size, hidden_dim]
+                    const Tensor *b_router,  // Shape: [n_experts]
+                    Tensor *router_scores,   // Shape: [batch_size, n_experts]
+                    int cur_batch_size, long long layer_offset, bool t_to_device,
+                    bool r_from_device, hipStream_t stream = 0);
+
 // ---------- TopK + softmax(k) ----------
 void topk_softmax_batched(Tensor *r,            // Shape: [batch_size, n_experts]
                           Tensor *topk_vals,    // Shape: [batch_size, k]
@@ -186,6 +193,15 @@ static inline void moe_scatter_aggregate_hip(
   TensorI32 *expert_offsets,   // [n_experts+1]
   int hidden_dim, int experts_per_token, int n_experts, int max_rows_per_expert,
   hipStream_t stream);
+
+static inline void moe_scatter_aggregate_ep_hip(
+  Tensor *tb3,                 // [total_pairs, hidden_dim]
+  TensorI32 *sorted_pair_ids,  // [batch_size * experts_per_token]
+  Tensor *topk_v,              // [batch_size, experts_per_token]
+  Tensor *e_agg,               // [batch_size, hidden_dim]
+  TensorI32 *expert_offsets,   // [n_experts+1]
+  int hidden_dim, int experts_per_token, int n_experts, int max_rows_per_expert,
+  int start_expert_offset, int end_expert_offset, hipStream_t stream);
 /*  --------------  End MoE  --------------------  */
 
 static inline void moe_mlp1_batched(Tensor *t, Tensor *w_mlp1, Tensor *b_mlp1, TensorI32 *topk_idx,

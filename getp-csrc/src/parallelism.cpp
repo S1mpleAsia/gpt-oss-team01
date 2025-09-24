@@ -795,6 +795,88 @@ void all_gather_tb3(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, in
   pthread_barrier_wait(tp_barrier);
 }
 
+void reduce_agg(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
+                int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream,
+                hipEvent_t tp_ready, hipEvent_t tp_finish) {
+  // GpuTimer timer("reduce_agg");
+
+  size_t active_elems = (size_t)cur_batch_size * rs_now->e_agg->shape[1];
+  size_t active_num_bytes = active_elems * rs_now->e_agg->get_dtype_size();
+
+  bool is_leader = (tp_rank == 0 || tp_rank == 2);
+  bool is_partner = !is_leader;
+  int reduce_rank = tp_rank / 2;
+
+  if (is_partner) {
+    OurRunState *rs_leader_peer = rs_now - 1;
+    void *dst_buf = rs_leader_peer->tb2_buf->d_buf;
+    const void *src_buf = rs_now->e_agg->d_buf;
+
+    CHECK_HIP(
+      hipMemcpyPeerAsync(dst_buf, cur_device - 1, src_buf, cur_device, active_num_bytes, stream));
+    CHECK_HIP(hipEventRecord(tp_ready, stream));
+  }
+
+  pthread_barrier_wait(tp_barrier + reduce_rank + 1);
+
+  if (is_leader) {
+    hipEvent_t partner_ready = total_events->tp_ready[cur_device + 1];
+    CHECK_HIP(hipStreamWaitEvent(stream, partner_ready));
+    int lead_offset = (tp_rank == 0) ? 2 : -2;
+
+    const float *d_buf = (const float *)rs_now->e_agg->d_buf;
+    float *d_buf_each = (float *)rs_now->tb2_buf->d_buf;
+
+    const int block_size = 256;
+    const int grid_size = (active_elems + block_size - 1) / block_size;
+
+    add_vector_kernel_batched<<<grid_size, block_size, 0, stream>>>(d_buf_each, d_buf,
+                                                                    active_elems);
+
+    const void *src_buf = rs_now->tb2_buf->d_buf;
+    void *dst_buf = (void *)((float *)(rs_now + lead_offset)->tb2_buf->d_buf + active_elems);
+
+    CHECK_HIP(hipMemcpyPeerAsync(dst_buf, cur_device + lead_offset, src_buf, cur_device,
+                                 active_num_bytes, stream));
+
+    CHECK_HIP(hipEventRecord(tp_ready, stream));
+
+    pthread_barrier_wait(tp_barrier + 3);
+
+    hipEvent_t other_leader_ready = total_events->tp_ready[cur_device + lead_offset];
+    CHECK_HIP(hipStreamWaitEvent(stream, other_leader_ready));
+
+    float *d_buf_now = (float *)rs_now->e_agg->d_buf;
+    const float *d_buf_1 = (const float *)rs_now->tb2_buf->d_buf;
+    const float *d_buf_2 = (const float *)(rs_now->tb2_buf->d_buf) + active_elems;
+
+    add_vector_kernel_direct<<<grid_size, block_size, 0, stream>>>(d_buf_now, d_buf_1, d_buf_2,
+                                                                   active_elems);
+
+    CHECK_HIP(hipEventRecord(tp_finish, stream));
+  }
+
+  pthread_barrier_wait(tp_barrier + reduce_rank + 1);
+
+  if (is_partner) {
+    hipEvent_t tp_finish_leader = total_events->tp_finish[cur_device - 1];
+
+    CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_leader));
+
+    void *dst_buf = rs_now->e_agg->d_buf;
+    const void *src_buf = (rs_now - 1)->e_agg->d_buf;
+
+    CHECK_HIP(
+      hipMemcpyPeerAsync(dst_buf, cur_device, src_buf, cur_device - 1, active_num_bytes, stream));
+    CHECK_HIP(hipEventRecord(tp_finish, stream));
+  } else {
+    hipEvent_t tp_finish_each = total_events->tp_finish[cur_device + 1];
+    CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_each));
+  }
+
+  // pthread_barrier_wait(tp_barrier + reduce_rank + 1);
+}
+
 void moe_build_local_ep_data(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, Config *p,
                              pthread_barrier_t *tp_barrier, hipStream_t stream) {
   // GpuTimer timer("moe_local_ep");

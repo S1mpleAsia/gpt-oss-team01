@@ -80,3 +80,12 @@ static inline void moe_scatter_aggregate_120b(
   TensorI32 *expert_offsets,   // [n_experts+1]
   int hidden_dim, int experts_per_token, int n_experts, int max_rows_per_expert,
   hipStream_t stream);
+
+static inline void moe_scatter_aggregate_120b_ep(
+  Tensor *tb3,                 // [total_pairs, hidden_dim]
+  TensorI32 *sorted_pair_ids,  // [batch_size * experts_per_token]
+  Tensor *topk_v,              // [batch_size, experts_per_token]
+  Tensor *e_agg,               // [batch_size, hidden_dim]
+  TensorI32 *expert_offsets,   // [n_experts+1]
+  int hidden_dim, int experts_per_token, int n_experts, int max_rows_per_expert,
+  int start_expert_offset, int end_expert_offset, hipStream_t stream);

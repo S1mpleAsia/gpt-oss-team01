@@ -15,7 +15,7 @@
 // #define TIME_GPU
 // #define DEBUG
 // #define RUN_20B
-// #define RUN_EP
+#define RUN_EP
 
 #ifdef RUN_20B
 #define DP 8
@@ -89,9 +89,8 @@ typedef struct {
   // Tensor *up;
   Tensor *gate_up;  // [batch_size * experts_per_toeken, inter_dim]
   Tensor *e_agg;    // [batch_size, hidden_dim]
-  Tensor *e_agg_buf;
-  Tensor *qkv;  // an additional buffer just for convenience (head_dim *
-                // (n_attn_heads + 2 * n_kv_heads), )
+  Tensor *qkv;      // an additional buffer just for convenience (head_dim *
+                    // (n_attn_heads + 2 * n_kv_heads), )
   Tensor *tmp_qkv;
   Tensor *q;  // query (n_attn_heads * head_dim,)
   // Tensor *k;           // key (n_kv_heads * head_dim,)

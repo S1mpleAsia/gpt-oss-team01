@@ -54,5 +54,9 @@ void all_gather_tb3(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, in
                     Config *p, pthread_barrier_t *tp_barrier, hipStream_t stream,
                     hipEvent_t tp_ready, hipEvent_t tp_finish);
 
+void reduce_agg(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
+                int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream,
+                hipEvent_t tp_ready, hipEvent_t tp_finish);
+
 void moe_build_local_ep_data(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, Config *p,
                              pthread_barrier_t *tp_barrier, hipStream_t stream);

@@ -426,11 +426,11 @@ void qkv_gemm_batched_v2(Tensor *x,            // Shape: [batch_size, hidden_dim
     constexpr int TN = 32;
     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 #else
-    constexpr int BM = 16;
+    constexpr int BM = 64;
     constexpr int BN = 128;
     constexpr int BK = 32;
-    constexpr int TM = 16;
-    constexpr int TN = 16;
+    constexpr int TM = 32;
+    constexpr int TN = 32;
     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 #endif
 
@@ -441,7 +441,7 @@ void qkv_gemm_batched_v2(Tensor *x,            // Shape: [batch_size, hidden_dim
     gemm_mfma_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
       x_ptr, w_qkv_ptr, qkv_ptr, b_qkv_ptr, cur_batch_size, out_features, in_features);
 #else
-    gemm_mfma<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+    gemm_mfma_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
       x_ptr, w_qkv_ptr, qkv_ptr, b_qkv_ptr, cur_batch_size, out_features, in_features);
 #endif
   }
@@ -1027,11 +1027,11 @@ void attn_out_project_batched_v2(Tensor *tb,         // Shape: [batch_size, n_at
     constexpr int TN = 32;
     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 #else
-    constexpr int BM = 16;
+    constexpr int BM = 64;
     constexpr int BN = 128;
     constexpr int BK = 32;
-    constexpr int TM = 16;
-    constexpr int TN = 16;
+    constexpr int TM = 32;
+    constexpr int TN = 32;
     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 #endif
 
@@ -1042,7 +1042,7 @@ void attn_out_project_batched_v2(Tensor *tb,         // Shape: [batch_size, n_at
     gemm_mfma_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
       tb_ptr, w_o_ptr, y_ptr, b_o_ptr, cur_batch_size, out_features, in_features);
 #else
-    gemm_mfma<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+    gemm_mfma_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
       tb_ptr, w_o_ptr, y_ptr, b_o_ptr, cur_batch_size, out_features, in_features);
 #endif
   }
@@ -1102,6 +1102,46 @@ void router_gemm_batched(const Tensor *w_router,  // [n_experts, hidden_dim]
     <<<grid_dim, block_dim, shmem, stream>>>(W, X, b, R, E, H, cur_batch_size);
 
   CHECK_HIP(hipGetLastError());
+  if (r_from_device) {
+    router_scores->from_device(stream);
+    CHECK_HIP(hipStreamSynchronize(stream));
+  }
+}
+
+void router_gemm_v2(const Tensor *w_router,  // Shape: [n_layers, hidden_dim, n_experts]
+                    Tensor *t,               // Shape: [batch_size, hidden_dim]
+                    const Tensor *b_router,  // Shape: [n_layers, n_experts]
+                    Tensor *router_scores,   // Shape: [batch_size, n_experts]
+                    int cur_batch_size, long long layer_offset, bool t_to_device,
+                    bool r_from_device, hipStream_t stream) {
+  // GpuTimer timer("router_gemm_v2", stream);
+  if (t_to_device)
+    t->to_device(stream);
+
+  // const int batch_size = x->shape[0];      // M
+  const int hidden_dim = t->shape[1];             // K
+  const int n_experts = router_scores->shape[1];  // N
+
+  const float *t_ptr = (float *)t->d_buf;
+  const bf16 *w_router_ptr =
+    (const bf16 *)w_router->d_buf + 1ll * layer_offset * n_experts * hidden_dim;
+  const bf16 *b_router_ptr = (const bf16 *)b_router->d_buf + 1ll * layer_offset * n_experts;
+  float *router_score_ptr = (float *)router_scores->d_buf;
+  {
+    constexpr int BM = 64;
+    constexpr int BN = 64;
+    constexpr int BK = 64;
+    constexpr int TM = 32;
+    constexpr int TN = 16;
+    constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
+
+    dim3 block_size(blockDim);
+    dim3 grid_size((n_experts + BN - 1) / BN, ((cur_batch_size + BM - 1) / BM));
+
+    gemm_mfma_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+      t_ptr, w_router_ptr, router_score_ptr, b_router_ptr, cur_batch_size, n_experts, hidden_dim);
+  }
+
   if (r_from_device) {
     router_scores->from_device(stream);
     CHECK_HIP(hipStreamSynchronize(stream));
@@ -1480,7 +1520,7 @@ static inline void moe_mlp1_forward_hip(Tensor *x_packed,  // [total_pairs, hidd
                                         long long layer_offset, int n_experts, int hidden_dim,
                                         int inter_dim, int max_rows_per_expert, int total_pairs,
                                         hipStream_t stream) {
-  GpuTimer timer("moe_mlp1", stream);
+  // GpuTimer timer("moe_mlp1", stream);
   moe_mlp1_forward(x_packed, w_mlp1, b_mlp1, expert_offsets, mlp1_out, layer_offset, n_experts,
                    hidden_dim, inter_dim, max_rows_per_expert, total_pairs, stream);
 }
@@ -1500,7 +1540,7 @@ static inline void moe_mlp2_forward_hip(Tensor *gate_up,  // [total_pairs, inter
                                         bool has_bias, long long layer_offset, int n_experts,
                                         int inter_dim, int hidden_dim, int max_rows_per_expert,
                                         int total_pairs, hipStream_t stream) {
-  GpuTimer timer("moe_mlp2", stream);
+  // GpuTimer timer("moe_mlp2", stream);
   moe_mlp2_forward(gate_up, w_mlp2, b_mlp2, expert_offsets, tb3, has_bias, layer_offset, n_experts,
                    inter_dim, hidden_dim, max_rows_per_expert, total_pairs, stream);
 }
@@ -1516,6 +1556,21 @@ static inline void moe_scatter_aggregate_hip(
   // GpuTimer timer("moe_agg", stream);
   moe_scatter_aggregate(tb3, sorted_pair_ids, topk_v, e_agg, expert_offsets, hidden_dim,
                         experts_per_token, n_experts, max_rows_per_expert, stream);
+}
+
+static inline void moe_scatter_aggregate_ep_hip(
+  Tensor *tb3,                 // [total_pairs, hidden_dim]
+  TensorI32 *sorted_pair_ids,  // [batch_size * experts_per_token]
+  Tensor *topk_v,              // [batch_size, experts_per_token]
+  Tensor *e_agg,               // [batch_size, hidden_dim]
+  TensorI32 *expert_offsets,   // [n_experts+1]
+  int hidden_dim, int experts_per_token, int n_experts, int max_rows_per_expert,
+  int start_expert_offset, int end_expert_offset, hipStream_t stream) {
+  // GpuTimer timer("moe_agg_v2", stream);
+
+  moe_scatter_aggregate_120b_ep(tb3, sorted_pair_ids, topk_v, e_agg, expert_offsets, hidden_dim,
+                                experts_per_token, n_experts, max_rows_per_expert,
+                                start_expert_offset, end_expert_offset, stream);
 }
 
 static inline void moe_scatter_aggregate_hip_120b(
@@ -1711,9 +1766,9 @@ void classifier_gemm_batched_v2(const Tensor *W_out,  // Shape: [hidden_dim, voc
     constexpr int TN = 16;
     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 #else
-    constexpr int BM = 32;
-    constexpr int BN = 256;
-    constexpr int BK = 16;
+    constexpr int BM = 64;
+    constexpr int BN = 128;
+    constexpr int BK = 32;
     constexpr int TM = 32;
     constexpr int TN = 32;
     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
@@ -1722,7 +1777,7 @@ void classifier_gemm_batched_v2(const Tensor *W_out,  // Shape: [hidden_dim, voc
     dim3 block_size(blockDim);
     dim3 grid_size((vocab_size + BN - 1) / BN, ((cur_batch_size + BM - 1) / BM));
 
-    gemm_mfma<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+    gemm_mfma_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
       x_ptr, w_out_ptr, logits_buf, nullptr, cur_batch_size, vocab_size, hidden_dim);
   }
   if (logits_from_device) {
@@ -1732,32 +1787,53 @@ void classifier_gemm_batched_v2(const Tensor *W_out,  // Shape: [hidden_dim, voc
 
 // The GPU kernel function. This is the code that will run in parallel on the GPU.
 // The __global__ specifier indicates that it's a kernel.
-__global__ void max_kernel_gpu(const float *__restrict__ logits, float *__restrict__ logits_max,
-                               int *__restrict__ id_max, int batch_size, int length, int tp_rank) {
-  // Determine the unique thread index within the grid.
-  // Each thread will be responsible for a single batch (row) of data.
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void max_kernel_gpu_v2(const float *__restrict__ logits, float *__restrict__ logits_max,
+                                  int *__restrict__ id_max, int batch_size, int length,
+                                  int tp_rank) {
+  // One block = one row (batch element)
+  int row = blockIdx.x;
+  if (row >= batch_size)
+    return;
 
-  // We only need to process up to the total number of batches.
-  if (i < batch_size) {
-    float current_max = -FLT_MAX;
-    int current_id = -1;
+  // Shared memory for block reduction
+  extern __shared__ char new_smem[];
+  float *sdata_val = (float *)new_smem;
+  int *sdata_idx = (int *)(sdata_val + blockDim.x);
 
-    // Loop through the elements of the current batch (row)
-    for (int j = 0; j < length; ++j) {
-      // Calculate the 1D index for the 2D data
-      float value = logits[i * length + j];
+  int tid = threadIdx.x;
+  int start = row * length;
 
-      // If the current value is greater than the max found so far, update the max and its index.
-      if (value > current_max) {
-        current_max = value;
-        current_id = j;
+  // Each thread scans a strided portion of this row
+  float local_max = -FLT_MAX;
+  int local_idx = -1;
+  for (int j = tid; j < length; j += blockDim.x) {
+    float val = logits[start + j];
+    if (val > local_max) {
+      local_max = val;
+      local_idx = j;
+    }
+  }
+
+  // Store partial results into shared memory
+  sdata_val[tid] = local_max;
+  sdata_idx[tid] = local_idx;
+  __syncthreads();
+
+  // Parallel reduction to find max and index
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      if (sdata_val[tid + s] > sdata_val[tid]) {
+        sdata_val[tid] = sdata_val[tid + s];
+        sdata_idx[tid] = sdata_idx[tid + s];
       }
     }
+    __syncthreads();
+  }
 
-    // Store the result for this batch in the output arrays.
-    logits_max[i] = current_max;
-    id_max[i] = current_id + tp_rank * length;
+  // Thread 0 writes the result for this row
+  if (tid == 0) {
+    logits_max[row] = sdata_val[0];
+    id_max[row] = sdata_idx[0] + tp_rank * length;
   }
 }
 
@@ -1775,11 +1851,12 @@ void max_logits_batched(Tensor *logits, Tensor *logits_max, TensorI32 *logits_id
   float *logits_max_buf = (float *)logits_max->d_buf;
   int *logits_id_buf = (int *)logits_id->d_buf;
 
-  const dim3 gridSize(cur_batch_size);
-  const dim3 blockSize(1);
+  int blockSize = 256;  // tune: 128/256/512 depending on GPU
+  dim3 gridSize(cur_batch_size);
+  size_t sharedMemSize = blockSize * (sizeof(float) + sizeof(int));
 
-  max_kernel_gpu<<<gridSize, blockSize, 0, stream>>>(logits_buf, logits_max_buf, logits_id_buf,
-                                                     cur_batch_size, num_elems, tp_rank);
+  max_kernel_gpu_v2<<<gridSize, blockSize, sharedMemSize, stream>>>(
+    logits_buf, logits_max_buf, logits_id_buf, cur_batch_size, num_elems, tp_rank);
 
   if (logits_max_from_device) {
     logits_max->from_device(stream);

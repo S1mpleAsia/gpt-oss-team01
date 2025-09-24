@@ -197,7 +197,6 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
     new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
 
   rs->e_agg = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
-  rs->e_agg_buf = nullptr;
 
   rs->qkv = new Tensor(
     {BATCH_SIZE, ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim}, stream);
@@ -463,11 +462,35 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     weights->attn_sinks->to_device(stream);
   }
 
-  weights->w_router = new Tensor(
-    {layers_per_stage, (size_t)p->n_experts, (size_t)p->hidden_dim},
-    w->w_router + 1ll * pp_offset * (size_t)p->n_experts * (size_t)p->hidden_dim, stream);
-  weights->b_router = new Tensor({layers_per_stage, (size_t)p->n_experts},
-                                 w->b_router + 1ll * pp_offset * (size_t)p->n_experts, stream);
+  // weights->w_router = new Tensor(
+  //   {layers_per_stage, (size_t)p->n_experts, (size_t)p->hidden_dim},
+  //   w->w_router + 1ll * pp_offset * (size_t)p->n_experts * (size_t)p->hidden_dim, stream);
+
+  {
+    size_t n_experts = p->n_experts;
+    size_t hidden_dim = p->hidden_dim;
+
+    float *w_router_ptr = w->w_router + 1ll * pp_offset * n_experts * hidden_dim;
+
+    weights->w_router = new Tensor({layers_per_stage, hidden_dim, n_experts}, stream, DType::BF16);
+
+    for (size_t l = 0; l < layers_per_stage; l++) {
+      float *src_ptr = w_router_ptr + 1ll * l * n_experts * hidden_dim;
+      float *dst_ptr = weights->w_router->buf + 1ll * l * hidden_dim * n_experts;
+
+      for (size_t e = 0; e < n_experts; e++) {
+        for (size_t h = 0; h < hidden_dim; h++) {
+          dst_ptr[h * n_experts + e] = src_ptr[e * hidden_dim + h];
+        }
+      }
+    }
+
+    weights->w_router->to_device(stream);
+  }
+
+  weights->b_router =
+    new Tensor({layers_per_stage, (size_t)p->n_experts},
+               w->b_router + 1ll * pp_offset * (size_t)p->n_experts, stream, DType::BF16);
 
   float *w_mlp1_ptr = w->w_mlp1 + 1ll * pp_offset * (size_t)p->n_experts * 2 *
                                     (size_t)p->intermediate_dim * (size_t)p->hidden_dim;
@@ -874,34 +897,29 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->tb3 = new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
   // rs->tb3_recv =
   //   new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim / TP}, stream);
-  if (tp_rank < 3 && TP > 1) {
-    rs->tb3_buf =
-      new Tensor({TP / 2, BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
-  } else {
-    rs->tb3_buf = nullptr;
-  }
+  // if (tp_rank < 3 && TP > 1) {
+  //   rs->tb3_buf =
+  //     new Tensor({TP / 2, BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
+  // } else {
+  //   rs->tb3_buf = nullptr;
+  // }
 
   rs->router_score = new Tensor({BATCH_SIZE, (size_t)p->n_experts}, stream);
   rs->topk_v = new Tensor({BATCH_SIZE, (size_t)p->experts_per_token}, stream);
   rs->topk_i = new TensorI32({BATCH_SIZE, (size_t)p->experts_per_token}, stream);
 
-  rs->mlp1_out = new Tensor(
-    {BATCH_SIZE, (size_t)p->experts_per_token, 2 * (size_t)p->intermediate_dim / TP}, stream);
+  rs->mlp1_out =
+    new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, 2 * (size_t)p->intermediate_dim}, stream);
 
   // rs->gate =
   //   new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
   // rs->up =
   //   new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
 
-  rs->gate_up = new Tensor(
-    {BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim / TP}, stream);
+  rs->gate_up =
+    new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
 
   rs->e_agg = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
-  if (device_id % TP == 0) {
-    rs->e_agg_buf = nullptr;
-  } else {
-    rs->e_agg_buf = nullptr;
-  }
 
   rs->qkv = new Tensor(
     {BATCH_SIZE, ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim / TP}, stream);
@@ -1086,8 +1104,6 @@ void our_free_each(OurTransformerWeights *weights, OurRunState *rs) {
     delete rs->gate_up;
   if (rs->e_agg)
     delete rs->e_agg;
-  if (rs->e_agg_buf)
-    delete rs->e_agg_buf;
   if (rs->qkv)
     delete rs->qkv;
   if (rs->q)

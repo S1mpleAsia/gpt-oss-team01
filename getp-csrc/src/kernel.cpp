@@ -558,20 +558,21 @@ __global__ void gather_inputs_by_sorted_kernel(
 }
 
 // Just copied from the origin
-__global__ void swiglu_interleaved_batched_fast_v2(const float *__restrict__ in2I,  // [NK, 2I]
-                                                   float *__restrict__ outI,        // [NK, I]
-                                                   int I, int NK, float clamp_limit) {
+__global__ void swiglu_interleaved_batched_fast_v2(
+  const float *__restrict__ mlp1_out,  // [total_pairs, 2 * inter_dim]
+  float *__restrict__ gate_up,         // [total_pairs, inter_dim]
+  int inter_dim, int total_pairs, float clamp_limit) {
   size_t idx = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-  size_t N = (size_t)NK * I;
+  size_t N = (size_t)total_pairs * inter_dim;
   if (idx >= N)
     return;
 
-  int j = idx % I;
-  size_t s = idx / I;
-  size_t base = s * (size_t)(2 * I);
+  int j = idx % inter_dim;
+  size_t s = idx / inter_dim;
+  size_t base = s * (size_t)(2 * inter_dim);
 
-  float g = in2I[base + 2 * j];
-  float u = in2I[base + 2 * j + 1];
+  float g = mlp1_out[base + 2 * j];
+  float u = mlp1_out[base + 2 * j + 1];
 
   if (clamp_limit > 0.f) {
     g = fminf(fmaxf(g, -clamp_limit), clamp_limit);
@@ -579,7 +580,7 @@ __global__ void swiglu_interleaved_batched_fast_v2(const float *__restrict__ in2
   }
   const float alpha = 1.702f;
   float silu = g * (1.f / (1.f + expf(-alpha * g)));
-  outI[idx] = silu * (u + 1.f);
+  gate_up[idx] = silu * (u + 1.f);
 }
 
 __global__ void scale_scatter_add_kernel_sorted(
@@ -661,6 +662,34 @@ __global__ void moe_agg_kernel_120b(
 
   const float w = topk_v[(size_t)b * experts_per_token + e];
   const float val = tb3_ptr[(size_t)row * hidden_dim + h] * w;
+
+  atomicAdd(&e_agg[(size_t)b * hidden_dim + h], val);
+}
+
+__global__ void moe_agg_kernel_120b_ep(
+  const float *__restrict__ tb3_ptr,   // [total_pairs, hidden_dim]
+  const int *__restrict__ sorted_ids,  //[total_pair]
+  const float *__restrict__ topk_v,    // [batch_size, experts_per_token]
+  float *__restrict__ e_agg,           // [batch_size, hidden_dim]
+  int hidden_dim, int experts_per_token, int total_pairs, int start_expert_offset,
+  int end_expert_offset) {
+  const int h = blockIdx.x * blockDim.x + threadIdx.x;
+  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+
+  if (h >= hidden_dim || row >= total_pairs)
+    return;
+
+  if (row < start_expert_offset || row >= end_expert_offset)
+    return;
+
+  int local_row = row - start_expert_offset;
+
+  const int pair = sorted_ids[row];
+  const int b = pair / experts_per_token;
+  const int e = pair % experts_per_token;
+
+  const float w = topk_v[(size_t)b * experts_per_token + e];
+  const float val = tb3_ptr[(size_t)local_row * hidden_dim + h] * w;
 
   atomicAdd(&e_agg[(size_t)b * hidden_dim + h], val);
 }
@@ -762,11 +791,11 @@ static inline void moe_mlp1_forward(Tensor *x_packed,  // [total_pairs, hidden_d
     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 
 #else
-    constexpr int BM = 16;
+    constexpr int BM = 64;
     constexpr int BN = 128;
     constexpr int BK = 32;
-    constexpr int TM = 16;
-    constexpr int TN = 16;
+    constexpr int TM = 32;
+    constexpr int TN = 32;
     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 #endif
 
@@ -778,7 +807,7 @@ static inline void moe_mlp1_forward(Tensor *x_packed,  // [total_pairs, hidden_d
       (const float *)x_packed->d_buf, w1_ptr, (float *)mlp1_out->d_buf, b1_ptr,
       expert_offsets->d_buf, total_pairs, 2 * inter_dim, hidden_dim);
 #else
-    gemm_mfma_moe<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+    gemm_mfma_moe_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
       (const float *)x_packed->d_buf, w1_ptr, (float *)mlp1_out->d_buf, b1_ptr,
       expert_offsets->d_buf, total_pairs, 2 * inter_dim, hidden_dim);
 #endif
@@ -833,11 +862,11 @@ static inline void moe_mlp2_forward(Tensor *gate_up,  // [total_pairs, inter_dim
     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 
 #else
-    constexpr int BM = 16;
+    constexpr int BM = 64;
     constexpr int BN = 128;
     constexpr int BK = 32;
-    constexpr int TM = 16;
-    constexpr int TN = 16;
+    constexpr int TM = 32;
+    constexpr int TN = 32;
     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 #endif
 
@@ -849,7 +878,7 @@ static inline void moe_mlp2_forward(Tensor *gate_up,  // [total_pairs, inter_dim
       (const float *)gate_up->d_buf, w2_ptr, (float *)tb3->d_buf, b2_ptr, expert_offsets->d_buf,
       total_pairs, hidden_dim, inter_dim);
 #else
-    gemm_mfma_moe<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+    gemm_mfma_moe_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
       (const float *)gate_up->d_buf, w2_ptr, (float *)tb3->d_buf, b2_ptr, expert_offsets->d_buf,
       total_pairs, hidden_dim, inter_dim);
 #endif
@@ -875,6 +904,30 @@ static inline void moe_scatter_aggregate(
   moe_agg_kernel<<<grid_size, block_size, 0, stream>>>(
     (const float *)tb3->d_buf, (const int *)sorted_pair_ids->d_buf, topk_v_ptr, e_agg_ptr,
     expert_offsets->d_buf, hidden_dim, experts_per_token);
+}
+
+static inline void moe_scatter_aggregate_120b_ep(
+  Tensor *tb3,                 // [total_pairs, hidden_dim]
+  TensorI32 *sorted_pair_ids,  // [batch_size * experts_per_token]
+  Tensor *topk_v,              // [batch_size, experts_per_token]
+  Tensor *e_agg,               // [batch_size, hidden_dim]
+  TensorI32 *expert_offsets,   // [n_experts+1]
+  int hidden_dim, int experts_per_token, int n_experts, int max_rows_per_expert,
+  int start_expert_offset, int end_expert_offset, hipStream_t stream) {
+  const float *tb3_ptr = (const float *)tb3->d_buf;
+  const int *sorted_pair_ptr = (const int *)sorted_pair_ids->d_buf;
+  const float *topk_v_ptr = (const float *)topk_v->d_buf;
+  float *e_agg_ptr = (float *)e_agg->d_buf;
+
+  const int total_pairs = sorted_pair_ids->shape[0];
+
+  dim3 block_size(64, 4, 1);
+  dim3 grid_size((hidden_dim + block_size.x - 1) / block_size.x,
+                 (total_pairs + block_size.y - 1) / block_size.y, 1);
+
+  moe_agg_kernel_120b_ep<<<grid_size, block_size, 0, stream>>>(
+    tb3_ptr, sorted_pair_ptr, topk_v_ptr, e_agg_ptr, hidden_dim, experts_per_token, total_pairs,
+    start_expert_offset, end_expert_offset);
 }
 
 static inline void moe_scatter_aggregate_120b(
