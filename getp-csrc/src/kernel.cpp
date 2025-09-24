@@ -562,25 +562,41 @@ __global__ void swiglu_interleaved_batched_fast_v2(
   const float *__restrict__ mlp1_out,  // [total_pairs, 2 * inter_dim]
   float *__restrict__ gate_up,         // [total_pairs, inter_dim]
   int inter_dim, int total_pairs, float clamp_limit) {
-  size_t idx = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-  size_t N = (size_t)total_pairs * inter_dim;
+  const float4 *mlp1_out_ptr = (const float4 *)mlp1_out;
+  float4 *gate_up_ptr = (float4 *)gate_up;
+
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t N = total_pairs * inter_dim / 4;
+
   if (idx >= N)
     return;
 
-  int j = idx % inter_dim;
-  size_t s = idx / inter_dim;
-  size_t base = s * (size_t)(2 * inter_dim);
+  float4 val1 = mlp1_out_ptr[idx * 2];
+  float4 val2 = mlp1_out_ptr[idx * 2 + 1];
 
-  float g = mlp1_out[base + 2 * j];
-  float u = mlp1_out[base + 2 * j + 1];
+  float4 g = {val1.x, val1.z, val2.x, val2.z};
+  float4 u = {val1.y, val1.w, val2.y, val2.w};
 
-  if (clamp_limit > 0.f) {
-    g = fminf(fmaxf(g, -clamp_limit), clamp_limit);
-    u = fminf(fmaxf(u, -clamp_limit), clamp_limit);
-  }
-  const float alpha = 1.702f;
-  float silu = g * (1.f / (1.f + expf(-alpha * g)));
-  gate_up[idx] = silu * (u + 1.f);
+  g.x = fminf(g.x, clamp_limit);
+  g.y = fminf(g.y, clamp_limit);
+  g.z = fminf(g.z, clamp_limit);
+  g.w = fminf(g.w, clamp_limit);
+
+  u.x = fminf(fmaxf(u.x, -clamp_limit), clamp_limit);
+  u.y = fminf(fmaxf(u.y, -clamp_limit), clamp_limit);
+  u.z = fminf(fmaxf(u.z, -clamp_limit), clamp_limit);
+  u.w = fminf(fmaxf(u.w, -clamp_limit), clamp_limit);
+
+  constexpr float alpha = 1.702f;
+  float4 silu;
+
+  silu.x = g.x * (1.f / (1.f + expf(-alpha * g.x)));
+  silu.y = g.y * (1.f / (1.f + expf(-alpha * g.y)));
+  silu.z = g.z * (1.f / (1.f + expf(-alpha * g.z)));
+  silu.w = g.w * (1.f / (1.f + expf(-alpha * g.w)));
+
+  float4 result = silu * (u + 1.f);
+  gate_up_ptr[idx] = result;
 }
 
 __global__ void scale_scatter_add_kernel_sorted(
@@ -785,7 +801,7 @@ static inline void moe_mlp1_forward(Tensor *x_packed,  // [total_pairs, hidden_d
 #if defined(RUN_20B) || defined(RUN_EP)
     constexpr int BM = 64;
     constexpr int BN = 128;
-    constexpr int BK = 32;
+    constexpr int BK = 64;
     constexpr int TM = 32;
     constexpr int TN = 32;
     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
@@ -820,8 +836,10 @@ static inline void moe_swiglu(Tensor *mlp1_out,  // [total_pairs, 2*inter_dim]
                               int batch_size, int experts_per_token, int inter_dim,
                               float clamp_limit, hipStream_t stream) {
   size_t total = (size_t)batch_size * experts_per_token * inter_dim;
+  size_t total_vec = total / 4;
+
   dim3 block_size(256);
-  dim3 grid_size((total + 255) / 256);
+  dim3 grid_size((total_vec + 255) / 256);
 
   swiglu_interleaved_batched_fast_v2<<<grid_size, block_size, 0, stream>>>(
     (const float *)mlp1_out->d_buf, (float *)gate_up->d_buf, inter_dim,
@@ -856,7 +874,7 @@ static inline void moe_mlp2_forward(Tensor *gate_up,  // [total_pairs, inter_dim
 #if defined(RUN_20B) || defined(RUN_EP)
     constexpr int BM = 64;
     constexpr int BN = 128;
-    constexpr int BK = 32;
+    constexpr int BK = 64;
     constexpr int TM = 32;
     constexpr int TN = 32;
     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)

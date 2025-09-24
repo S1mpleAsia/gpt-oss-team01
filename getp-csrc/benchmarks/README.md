@@ -14,7 +14,6 @@ This folder contains a standalone CMake project for benchmarking the custom `gem
 
 ## Configure & Build
 
-
 ### Makefile Build (no CMake available)
 
 ```
@@ -24,8 +23,6 @@ make WITH_ROCBLAS=0  # builds without rocBLAS comparison
 ```
 
 Set `HIPCC=/path/to/hipcc` if it is not on `PATH`. The binary is written next to the sources as `./gemm_bench`.
-
-
 
 The project mirrors the flags used by the main repo’s `runomp` target: it defaults to `hipcc`, adds `-O3`, and passes `--offload-arch=gfx90a`.
 
@@ -82,7 +79,7 @@ For each triplet the executable prints:
 - The matrix shape.
 - Average runtime and GFLOP/s for `gemm_mfma_v2`.
 - rocBLAS runtime/GFLOP/s plus max absolute and relative L2 differences (when `WITH_ROCBLAS=ON`).
-  * If your rocBLAS build lacks BF16 support, the benchmark automatically falls back to FP32 `sgemm` (it will annotate the output and note that weights were promoted). Enable the BF16 path by setting `GEMM_BENCH_TRY_BF16=1` before running.
+  - If your rocBLAS build lacks BF16 support, the benchmark automatically falls back to FP32 `sgemm` (it will annotate the output and note that weights were promoted). Enable the BF16 path by setting `GEMM_BENCH_TRY_BF16=1` before running.
 - A separator line for readability.
 
 All HIP and rocBLAS calls are wrapped in macros that report the failing API call, file, line, and error code before exiting. Improper CLI usage (e.g. missing multiples of three arguments) also results in a usage message and non-zero exit status.
@@ -92,7 +89,6 @@ All HIP and rocBLAS calls are wrapped in macros that report the failing API call
 ## Customising the Kernel Launch
 
 `gemm_mfma_v2_kernel.hpp` exposes `launch_gemm_mfma_v2`, which is configured with the same tile/block setup that the main application uses (`BM=64`, `BN=128`, `BK=32`, `TM=TN=32`, `BLOCK_THREADS=512`). Adjust these constants if you need to explore alternative tilings; make sure the blockDim/launch configuration stays consistent across your application and benchmark.
-
 
 ## Flash Attention Benchmark
 

@@ -8,4 +8,3 @@ pmc : TCC_BUSY_avr
 pmc : LDSBankConflict
 
 kernel: gemm_mfma_v2     # uncomment & set once you know the exact base name
-

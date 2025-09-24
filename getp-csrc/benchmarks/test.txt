@@ -3,4 +3,3 @@ pmc : VALUUtilization WavesPerCU MemUnitBusy L2CacheHitRate LDSBankConflictRate
 # optional filters (uncomment and adjust)
 # gpu: 0
 # kernel: gemm_mfma_v2
-

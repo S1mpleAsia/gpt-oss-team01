@@ -125,9 +125,9 @@ int *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flow_
                          rs_now->expert_offsets, rs_now->tb3, true, 1ll * l, p->n_experts,
                          p->intermediate_dim, p->hidden_dim, max_rows, total_pairs, stream);
 
-    moe_scatter_aggregate_hip(rs_now->tb3, rs_now->sorted_pair_ids, rs_now->topk_v, rs_now->e_agg,
-                              rs_now->expert_offsets, p->hidden_dim, p->experts_per_token,
-                              p->n_experts, max_rows, stream);
+    moe_scatter_aggregate_hip_120b(rs_now->tb3, rs_now->sorted_pair_ids, rs_now->topk_v,
+                                   rs_now->e_agg, rs_now->expert_offsets, p->hidden_dim,
+                                   p->experts_per_token, p->n_experts, 0, stream);
 
 #ifdef DEBUG
     rs_now->tb3->printDebug("rs_now->tb3", 0, 0, stream);
@@ -321,31 +321,6 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
 
     moe_build_offsets_hip(rs_now->topk_i, rs_now->sorted_pair_ids, rs_now->expert_offsets,
                           cur_batch_size, p->experts_per_token, p->n_experts, stream);
-    // if (tp_rank == 0) {
-    //   CHECK_HIP(hipEventRecord(tp_ready, stream));
-    // }
-
-    // pthread_barrier_wait(tp_barrier);
-
-    // if (tp_rank > 0) {
-    //   hipEvent_t leader_tp_ready = total_events->tp_ready[cur_device - tp_rank];
-    //   CHECK_HIP(hipStreamWaitEvent(stream, leader_tp_ready));
-
-    //   void *dst_sorted_ids = rs_now->sorted_pair_ids->d_buf;
-    //   const void *src_sorted_ids = rs_leader->sorted_pair_ids->d_buf;
-    //   size_t bytes_sorted_ids = rs_now->sorted_pair_ids->num_elem() * sizeof(int);
-
-    //   void *dst_offsets = rs_now->expert_offsets->d_buf;
-    //   const void *src_offsets = rs_leader->expert_offsets->d_buf;
-    //   size_t bytes_offsets = rs_now->expert_offsets->num_elem() * sizeof(int);
-
-    //   CHECK_HIP(hipMemcpyPeerAsync(dst_sorted_ids, cur_device, src_sorted_ids, cur_device - tp_rank,
-    //                                bytes_sorted_ids, stream));
-    //   CHECK_HIP(hipMemcpyPeerAsync(dst_offsets, cur_device, src_offsets, cur_device - tp_rank,
-    //                                bytes_offsets, stream));
-    // }
-
-    // pthread_barrier_wait(tp_barrier);
 
 #ifdef DEBUG
     if (flag) {
@@ -408,19 +383,6 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
 #ifdef DEBUG
     if (flag)
       rs_now->tb3->printDebug("rs_now->tb3", tp_rank, 0, stream);
-#endif
-
-#ifdef RUN_EP
-      // all_gather_tb3(rs_now, rs_leader, tp_rank, cur_device, p, tp_barrier, stream, tp_ready,
-      //                tp_finish);
-#else
-    // reduce_tb3(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready,
-    //            tp_finish);
-
-    // reduce_tb3_new(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream,
-    //                tp_ready, tp_finish);
-
-    // ring_all_reduce_tb3(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream);
 #endif
 
 #ifdef DEBUG

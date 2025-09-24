@@ -23,19 +23,15 @@ void single_query_attn_flash_batched(Tensor *q, Tensor *K_cache, Tensor *V_cache
                                      int seq_len, int sliding_window, int pos,
                                      long long layer_offset, bool q_to_device,
                                      bool k_cache_to_device, bool v_cache_to_device,
-                                     bool mask_to_device, bool tb_from_device,
-                                     hipStream_t stream);
+                                     bool mask_to_device, bool tb_from_device, hipStream_t stream);
 
 // Optional workspace kernel (provide your optimized version in a separate TU)
-void single_query_attn_flash_batched_opt(Tensor *q, Tensor *K_cache, Tensor *V_cache, Tensor *mask,
-                                         Tensor *attn_sinks, Tensor *tb, Tensor *g_fa_pmax,
-                                         Tensor *g_fa_psum, Tensor *g_fa_pnum, int cur_batch_size,
-                                         int head_dim, int num_query_heads, int kv_mul, int kv_dim,
-                                         int seq_len, int sliding_window, int pos,
-                                         long long layer_offset, bool q_to_device,
-                                         bool k_cache_to_device, bool v_cache_to_device,
-                                         bool mask_to_device, bool tb_from_device,
-                                         hipStream_t stream) __attribute__((weak));
+void single_query_attn_flash_batched_opt(
+  Tensor *q, Tensor *K_cache, Tensor *V_cache, Tensor *mask, Tensor *attn_sinks, Tensor *tb,
+  Tensor *g_fa_pmax, Tensor *g_fa_psum, Tensor *g_fa_pnum, int cur_batch_size, int head_dim,
+  int num_query_heads, int kv_mul, int kv_dim, int seq_len, int sliding_window, int pos,
+  long long layer_offset, bool q_to_device, bool k_cache_to_device, bool v_cache_to_device,
+  bool mask_to_device, bool tb_from_device, hipStream_t stream) __attribute__((weak));
 
 using FlashKernelFn = void (*)(Tensor *, Tensor *, Tensor *, Tensor *, Tensor *, Tensor *, Tensor *,
                                Tensor *, Tensor *, int, int, int, int, int, int, int, int,
@@ -138,8 +134,7 @@ double compute_gflops(float avg_ms, int effective_tokens, const BenchConfig &cfg
 double compute_max_abs_diff(const std::vector<float> &a, const std::vector<float> &b) {
   double max_diff = 0.0;
   for (size_t i = 0; i < a.size(); ++i) {
-    max_diff = std::max(max_diff,
-                        std::fabs(static_cast<double>(a[i]) - static_cast<double>(b[i])));
+    max_diff = std::max(max_diff, std::fabs(static_cast<double>(a[i]) - static_cast<double>(b[i])));
   }
   return max_diff;
 }
@@ -164,16 +159,15 @@ struct RunResult {
 };
 
 RunResult run_kernel(FlashKernelFn kernel, Tensor &q, Tensor &k_cache, Tensor &v_cache,
-                     Tensor &attn_sinks, Tensor &tb, Tensor &g_pmax, Tensor &g_psum,
-                     Tensor &g_pnum, const BenchConfig &cfg, hipStream_t stream, int kv_dim,
-                     int pos) {
+                     Tensor &attn_sinks, Tensor &tb, Tensor &g_pmax, Tensor &g_psum, Tensor &g_pnum,
+                     const BenchConfig &cfg, hipStream_t stream, int kv_dim, int pos) {
   if (!kernel)
     throw std::runtime_error("flash attention kernel pointer is null");
 
   for (int i = 0; i < cfg.warmup; ++i) {
-    kernel(&q, &k_cache, &v_cache, nullptr, &attn_sinks, &tb, &g_pmax, &g_psum, &g_pnum,
-           cfg.batch, cfg.head_dim, cfg.n_q, cfg.kv_mul, kv_dim, cfg.seq_len, cfg.sliding_window,
-           pos, 0, false, false, false, false, false, stream);
+    kernel(&q, &k_cache, &v_cache, nullptr, &attn_sinks, &tb, &g_pmax, &g_psum, &g_pnum, cfg.batch,
+           cfg.head_dim, cfg.n_q, cfg.kv_mul, kv_dim, cfg.seq_len, cfg.sliding_window, pos, 0,
+           false, false, false, false, false, stream);
   }
   CHECK_HIP(hipStreamSynchronize(stream));
 
@@ -183,9 +177,9 @@ RunResult run_kernel(FlashKernelFn kernel, Tensor &q, Tensor &k_cache, Tensor &v
 
   CHECK_HIP(hipEventRecord(start, stream));
   for (int i = 0; i < cfg.iters; ++i) {
-    kernel(&q, &k_cache, &v_cache, nullptr, &attn_sinks, &tb, &g_pmax, &g_psum, &g_pnum,
-           cfg.batch, cfg.head_dim, cfg.n_q, cfg.kv_mul, kv_dim, cfg.seq_len, cfg.sliding_window,
-           pos, 0, false, false, false, false, false, stream);
+    kernel(&q, &k_cache, &v_cache, nullptr, &attn_sinks, &tb, &g_pmax, &g_psum, &g_pnum, cfg.batch,
+           cfg.head_dim, cfg.n_q, cfg.kv_mul, kv_dim, cfg.seq_len, cfg.sliding_window, pos, 0,
+           false, false, false, false, false, stream);
   }
   CHECK_HIP(hipEventRecord(stop, stream));
   CHECK_HIP(hipEventSynchronize(stop));
@@ -239,8 +233,8 @@ int main(int argc, char **argv) {
   const int kv_dim = kv_heads * cfg.head_dim;
   const int pos = cfg.seq_len - 1;
   const int attn_len = pos + 1;
-  const int effective_tokens = (cfg.sliding_window > 0) ? std::min(attn_len, cfg.sliding_window)
-                                                        : attn_len;
+  const int effective_tokens =
+    (cfg.sliding_window > 0) ? std::min(attn_len, cfg.sliding_window) : attn_len;
 
   hipStream_t stream;
   CHECK_HIP(hipStreamCreate(&stream));
@@ -312,8 +306,7 @@ int main(int argc, char **argv) {
       const double speedup = (workspace.avg_ms > 0.0f)
                                ? static_cast<double>(baseline.avg_ms) / workspace.avg_ms
                                : std::numeric_limits<double>::quiet_NaN();
-      const double max_diff =
-        compute_max_abs_diff(baseline.host_output, workspace.host_output);
+      const double max_diff = compute_max_abs_diff(baseline.host_output, workspace.host_output);
       const double rel_l2 = compute_l2_rel_error(baseline.host_output, workspace.host_output);
 
       std::cout << "  baseline_avg_ms=" << baseline.avg_ms

@@ -419,10 +419,10 @@ void qkv_gemm_batched_v2(Tensor *x,            // Shape: [batch_size, hidden_dim
   float *qkv_ptr = (float *)qkv->d_buf;
   {
 #ifdef RUN_20B
-    constexpr int BM = 64;
+    constexpr int BM = 128;
     constexpr int BN = 128;
     constexpr int BK = 32;
-    constexpr int TM = 32;
+    constexpr int TM = 64;
     constexpr int TN = 32;
     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 #else
@@ -1022,7 +1022,7 @@ void attn_out_project_batched_v2(Tensor *tb,         // Shape: [batch_size, n_at
 #ifdef RUN_20B
     constexpr int BM = 64;
     constexpr int BN = 128;
-    constexpr int BK = 32;
+    constexpr int BK = 64;
     constexpr int TM = 32;
     constexpr int TN = 32;
     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
@@ -1758,27 +1758,32 @@ void classifier_gemm_batched_v2(const Tensor *W_out,  // Shape: [hidden_dim, voc
   float *logits_buf = (float *)logits->d_buf;
 
   {
-#if BATCH_SIZE <= 16
-    constexpr int BM = 16;
-    constexpr int BN = 128;
+#ifdef RUN_20B
+    constexpr int BM = 128;
+    constexpr int BN = 256;
     constexpr int BK = 32;
-    constexpr int TM = 16;
-    constexpr int TN = 16;
+    constexpr int TM = 64;
+    constexpr int TN = 64;
     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 #else
-    constexpr int BM = 64;
-    constexpr int BN = 128;
+    constexpr int BM = 128;
+    constexpr int BN = 256;
     constexpr int BK = 32;
-    constexpr int TM = 32;
-    constexpr int TN = 32;
+    constexpr int TM = 64;
+    constexpr int TN = 64;
     constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
 #endif
 
     dim3 block_size(blockDim);
     dim3 grid_size((vocab_size + BN - 1) / BN, ((cur_batch_size + BM - 1) / BM));
 
+#ifdef RUN_20B
     gemm_mfma_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
       x_ptr, w_out_ptr, logits_buf, nullptr, cur_batch_size, vocab_size, hidden_dim);
+#else
+    gemm_mfma_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+      x_ptr, w_out_ptr, logits_buf, nullptr, cur_batch_size, vocab_size, hidden_dim);
+#endif
   }
   if (logits_from_device) {
     logits->from_device(stream);
