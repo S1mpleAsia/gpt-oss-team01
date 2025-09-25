@@ -1,0 +1,4 @@
+"Name","Calls","TotalDurationNs","AverageNs","Percentage"
+"fd_partial_kernel_bf16",210,1223817826,5827703,98.0622904422831
+"fd_reduce_kernel_stable_v2",210,24137359,114939,1.9340825558195913
+"<barrier packet>",1,45265,45265,0.003627001897315021
