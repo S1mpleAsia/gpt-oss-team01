@@ -38,6 +38,15 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   }
 #endif
 
+  for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
+    for (int j = 0; j < TOTAL_GPUS_NEEDED; j++) {
+      CHECK_HIP(hipSetDevice(i));
+      if (i != j) {
+        CHECK_HIP(hipDeviceEnablePeerAccess(j, 0));
+      }
+    }
+  }
+
   weights = new OurTransformerWeights[TOTAL_GPUS_NEEDED];
   rs = new OurRunState[TOTAL_GPUS_NEEDED];
   total_streams = new hipStream_t[TOTAL_GPUS_NEEDED];

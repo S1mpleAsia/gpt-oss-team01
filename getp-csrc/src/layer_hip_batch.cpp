@@ -586,12 +586,12 @@ void qkv_split_rope_batched(Tensor *qkv_out,             // Shape: [batch_size, 
 
 template <bool KV_BF16 = false>
 __global__ void qkv_split_rope_store_kernel(
-  const float *__restrict__ qkv_in,    // [B, (n_q + 2*n_kv)*hd]
-  float *__restrict__ q_out,           // [B, n_q*hd]
-  void *__restrict__ K_cache,          // [B, L, S, kv_dim] (layer-offset)
-  void *__restrict__ V_cache,          // [B, L, S, kv_dim] (layer-offset)
-  const float *__restrict__ rope_cos,  // [hd/2] row for 'pos'
-  const float *__restrict__ rope_sin,  // [hd/2] row for 'pos'
+  const float *__restrict__ qkv_in,    // [batch_size, (n_attn_heads + 2 * n_kv_heads) * head_dim]
+  float *__restrict__ q_out,           // [batch_size, n_attn_heads * head_dim]
+  void *__restrict__ K_cache,          // [batch_size, n_layers, seq_len, kv_dim]
+  void *__restrict__ V_cache,          // [batch_size, n_layers, seq_len, kv_dim]
+  const float *__restrict__ rope_cos,  // [head_dim / 2] row for 'pos'
+  const float *__restrict__ rope_sin,  // [head_dim / 2] row for 'pos'
   int B, int head_dim, int n_q, int n_kv, int seq_len, int n_layers, int pos) {
   const int b = blockIdx.y;
   if (b >= B)
@@ -599,31 +599,30 @@ __global__ void qkv_split_rope_store_kernel(
 
   const int lane = blockIdx.x * blockDim.x + threadIdx.x;
 
-  const int hd = head_dim;
-  const int h2 = hd >> 1;
-  const int qdim = n_q * hd;
-  const int kdim = n_kv * hd;
-  const int vdim = n_kv * hd;
-  const int total = qdim + kdim + vdim;
+  const int half_head = head_dim >> 1;
+  const int q_dim = n_q * head_dim;
+  const int k_dim = n_kv * head_dim;
+  const int v_dim = n_kv * head_dim;
+  const int total = q_dim + k_dim + v_dim;
 
   const float *qkv_b = qkv_in + (size_t)b * total;
-  float *q_b = q_out + (size_t)b * qdim;
+  float *q_b = q_out + (size_t)b * q_dim;
 
   // per-batch base in the cache (host already offset to layer 0)
-  const size_t kv_batch_stride = (size_t)n_layers * seq_len * (size_t)(n_kv * hd);
+  const size_t kv_batch_stride = (size_t)n_layers * seq_len * (size_t)(n_kv * head_dim);
   char *Kb =
     (char *)K_cache + (size_t)b * kv_batch_stride * (KV_BF16 ? sizeof(bf16) : sizeof(float));
   char *Vb =
     (char *)V_cache + (size_t)b * kv_batch_stride * (KV_BF16 ? sizeof(bf16) : sizeof(float));
-  const size_t t_base = (size_t)pos * (size_t)(n_kv * hd);
+  const size_t t_base = (size_t)pos * (size_t)(n_kv * head_dim);
 
   // -------- 1) Q: RoPE in pairs, write to q_out --------
   // treat as (n_q * h2) pairs
-  for (int p = lane; p < n_q * h2; p += gridDim.x * blockDim.x) {
-    int h = p / h2;  // q-head
-    int j = p % h2;  // pair index within head
-    int i0 = h * hd + j;
-    int i1 = i0 + h2;
+  for (int p = lane; p < n_q * half_head; p += gridDim.x * blockDim.x) {
+    int h = p / half_head;  // q-head
+    int j = p % half_head;  // pair index within head
+    int i0 = h * head_dim + j;
+    int i1 = i0 + half_head;
 
     const float c = rope_cos[j];
     const float s = rope_sin[j];
@@ -638,12 +637,12 @@ __global__ void qkv_split_rope_store_kernel(
     q_b[i1] = y1;
   }
 
-  // K section starts at offset qdim
-  for (int p = lane; p < n_kv * h2; p += gridDim.x * blockDim.x) {
-    int h = p / h2;  // kv-head
-    int j = p % h2;
-    int i0 = qdim + h * hd + j;  // source in qkv_b
-    int i1 = i0 + h2;
+  // K section starts at offset q_dim
+  for (int p = lane; p < n_kv * half_head; p += gridDim.x * blockDim.x) {
+    int h = p / half_head;  // kv-head
+    int j = p % half_head;
+    int i0 = q_dim + h * head_dim + j;  // source in qkv_b
+    int i1 = i0 + half_head;
 
     const float c = rope_cos[j];
     const float s = rope_sin[j];
@@ -654,20 +653,20 @@ __global__ void qkv_split_rope_store_kernel(
     float r0 = k0 * c - k1 * s;
     float r1 = k0 * s + k1 * c;
 
-    size_t dst = t_base + (size_t)h * hd + j;  // destination index for j
-                                               // write two elements (j and j+h2)
+    size_t dst = t_base + (size_t)h * head_dim + j;  // destination index for j
+                                                     // write two elements (j and j+h2)
     if constexpr (KV_BF16) {
       ((bf16 *)Kb)[dst] = (bf16)r0;
-      ((bf16 *)Kb)[dst + h2] = (bf16)r1;
+      ((bf16 *)Kb)[dst + half_head] = (bf16)r1;
     } else {
       ((float *)Kb)[dst] = r0;
-      ((float *)Kb)[dst + h2] = r1;
+      ((float *)Kb)[dst + half_head] = r1;
     }
   }
 
-  // V section starts at qdim + kdim ; write contiguous kv_dim elements
-  for (int d = lane; d < kdim; d += gridDim.x * blockDim.x) {
-    float v = qkv_b[qdim + kdim + d];
+  // V section starts at q_dim + kdim ; write contiguous kv_dim elements
+  for (int d = lane; d < k_dim; d += gridDim.x * blockDim.x) {
+    float v = qkv_b[q_dim + k_dim + d];
     size_t dst = t_base + d;
     if constexpr (KV_BF16) {
       ((bf16 *)Vb)[dst] = (bf16)v;
@@ -688,33 +687,31 @@ void qkv_split_rope_fused(Tensor *qkv_out,  // Shape: [batch_size, (n_q + 2*n_kv
   // GpuTimer timer("qkv_split_fused", stream);
   // const int batch_size = (int)qkv_out->shape[0];
   const int kv_dim = n_kv * head_dim;
-
-  // pre-offset caches to the current layer (BY ELEMENTS)
+  const int seq_len = K_cache->shape[2];
+  const int n_layers = K_cache->shape[1];
 
   const size_t elem_bytes = (K_cache->dtype == DType::BF16) ? sizeof(bf16) : sizeof(float);
-  void *k_ptr = (char *)K_cache->d_buf +
-                (size_t)layer_offset * (size_t)(K_cache->shape[2] * kv_dim) * elem_bytes;
-  void *v_ptr = (char *)V_cache->d_buf +
-                (size_t)layer_offset * (size_t)(V_cache->shape[2] * kv_dim) * elem_bytes;
+  void *k_ptr = (char *)K_cache->d_buf + layer_offset * seq_len * kv_dim * elem_bytes;
+  void *v_ptr = (char *)V_cache->d_buf + layer_offset * seq_len * kv_dim * elem_bytes;
 
-  const int h2 = head_dim >> 1;
-  const int total_pairs = n_kv > n_q ? n_kv * h2 : n_q * h2;
+  const int half_head = head_dim >> 1;
+  const int total_pairs = n_kv > n_q ? n_kv * half_head : n_q * half_head;
   const int vec_span = total_pairs > kv_dim ? total_pairs : kv_dim;
 
   dim3 block_size(256);
   dim3 grid_size(((vec_span + block_size.x - 1) / block_size.x), cur_batch_size);
 
-  const float *cos_row = (const float *)rope_cos_pos->d_buf + (size_t)pos * h2;
-  const float *sin_row = (const float *)rope_sin_pos->d_buf + (size_t)pos * h2;
+  const float *cos_row = (const float *)rope_cos_pos->d_buf + (size_t)pos * half_head;
+  const float *sin_row = (const float *)rope_sin_pos->d_buf + (size_t)pos * half_head;
 
   if (K_cache->dtype == DType::BF16) {
     qkv_split_rope_store_kernel<true><<<grid_size, block_size, 0, stream>>>(
       (const float *)qkv_out->d_buf, (float *)q_out->d_buf, k_ptr, v_ptr, cos_row, sin_row,
-      cur_batch_size, head_dim, n_q, n_kv, (int)K_cache->shape[2], (int)K_cache->shape[1], pos);
+      cur_batch_size, head_dim, n_q, n_kv, seq_len, n_layers, pos);
   } else {
     qkv_split_rope_store_kernel<false><<<grid_size, block_size, 0, stream>>>(
       (const float *)qkv_out->d_buf, (float *)q_out->d_buf, k_ptr, v_ptr, cos_row, sin_row,
-      cur_batch_size, head_dim, n_q, n_kv, (int)K_cache->shape[2], (int)K_cache->shape[1], pos);
+      cur_batch_size, head_dim, n_q, n_kv, seq_len, n_layers, pos);
   }
   CHECK_HIP(hipGetLastError());
 }
