@@ -16,7 +16,7 @@
 #define WARP_SIZE 64
 #endif
 #ifndef FA_THREADS
-#define FA_THREADS 256
+#define FA_THREADS 128
 #endif
 #ifndef FA_TILE
 #define FA_TILE 128
