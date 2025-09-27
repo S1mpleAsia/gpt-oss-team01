@@ -19,10 +19,10 @@
 #define FA_THREADS 128
 #endif
 #ifndef FA_TILE
-#define FA_TILE 128
+#define FA_TILE 256
 #endif
 #ifndef FLASH_ATTN_TILE
-#define FLASH_ATTN_TILE 128
+#define FLASH_ATTN_TILE 256
 #endif
 #ifndef GROUP_SIZE
 #define GROUP_SIZE 8      // sub-wave size (8 or 16 are good choices)
