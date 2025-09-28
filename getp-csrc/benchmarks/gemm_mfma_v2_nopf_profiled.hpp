@@ -9,33 +9,36 @@ using bf16_isa = __bf16;
 using bf16x4 = bf16_isa __attribute__((__vector_size__(4 * sizeof(bf16_isa))));
 
 #if defined(__HIP_DEVICE_COMPILE__)
-# if defined(__gfx90a__)
-#  if __has_builtin(__builtin_amdgcn_mfma_f32_16x16x16bf16)
-#   define BF16_MFMA_KSTEP 16
-#   define MFMA_BF16_16x16(a,b,c) __builtin_amdgcn_mfma_f32_16x16x16bf16((a),(b),(c),0,0,0)
-#  elif __has_builtin(__builtin_amdgcn_mfma_f32_16x16x16bf16_1k)
-#   define BF16_MFMA_KSTEP 16
-#   define MFMA_BF16_16x16(a,b,c) __builtin_amdgcn_mfma_f32_16x16x16bf16_1k((a),(b),(c),0,0,0)
-#  elif __has_builtin(__builtin_amdgcn_mfma_f32_16x16x8bf16)
-#   define BF16_MFMA_KSTEP 8
-#   define MFMA_BF16_16x16(a,b,c) __builtin_amdgcn_mfma_f32_16x16x8bf16((a),(b),(c),0,0,0)
-#  elif __has_builtin(__builtin_amdgcn_mfma_f32_16x16x8bf16_1k)
-#   define BF16_MFMA_KSTEP 8
-#   define MFMA_BF16_16x16(a,b,c) __builtin_amdgcn_mfma_f32_16x16x8bf16_1k((a),(b),(c),0,0,0)
-#  else
-#   error "gfx90a device compile without BF16 MFMA builtins"
-#  endif
-# else
-#  error "This kernel targets gfx90a (MI250)."
-# endif
+#if defined(__gfx90a__)
+#if __has_builtin(__builtin_amdgcn_mfma_f32_16x16x16bf16)
+#define BF16_MFMA_KSTEP 16
+#define MFMA_BF16_16x16(a, b, c) __builtin_amdgcn_mfma_f32_16x16x16bf16((a), (b), (c), 0, 0, 0)
+#elif __has_builtin(__builtin_amdgcn_mfma_f32_16x16x16bf16_1k)
+#define BF16_MFMA_KSTEP 16
+#define MFMA_BF16_16x16(a, b, c) __builtin_amdgcn_mfma_f32_16x16x16bf16_1k((a), (b), (c), 0, 0, 0)
+#elif __has_builtin(__builtin_amdgcn_mfma_f32_16x16x8bf16)
+#define BF16_MFMA_KSTEP 8
+#define MFMA_BF16_16x16(a, b, c) __builtin_amdgcn_mfma_f32_16x16x8bf16((a), (b), (c), 0, 0, 0)
+#elif __has_builtin(__builtin_amdgcn_mfma_f32_16x16x8bf16_1k)
+#define BF16_MFMA_KSTEP 8
+#define MFMA_BF16_16x16(a, b, c) __builtin_amdgcn_mfma_f32_16x16x8bf16_1k((a), (b), (c), 0, 0, 0)
 #else
-# define BF16_MFMA_KSTEP 16
-# define MFMA_BF16_16x16(a,b,c) (c)
+#error "gfx90a device compile without BF16 MFMA builtins"
+#endif
+#else
+#error "This kernel targets gfx90a (MI250)."
+#endif
+#else
+#define BF16_MFMA_KSTEP 16
+#define MFMA_BF16_16x16(a, b, c) (c)
 #endif
 
 __device__ __forceinline__ bf16x4 pack_f4_to_bf16x4(const float4 &v) {
   bf16x4 r;
-  r[0] = (bf16_isa)v.x; r[1] = (bf16_isa)v.y; r[2] = (bf16_isa)v.z; r[3] = (bf16_isa)v.w;
+  r[0] = (bf16_isa)v.x;
+  r[1] = (bf16_isa)v.y;
+  r[2] = (bf16_isa)v.z;
+  r[3] = (bf16_isa)v.w;
   return r;
 }
 
@@ -46,20 +49,18 @@ __device__ __forceinline__ bf16x4 pack_f4_to_bf16x4(const float4 &v) {
  *    - time COMPUTE: MFMA loop only (start after sync, stop before sync)
  */
 template <int BM, int BN, int BK, int TM, int TN, int BLOCK_THREADS>
-__global__ __launch_bounds__(BLOCK_THREADS)
-void gemm_mfma_v2_nopf_profiled(const float *__restrict__ A,   // [M,K] fp32
-                                       const bf16  *__restrict__ B,   // [K,N] bf16
-                                       float       *__restrict__ C,   // [M,N] fp32
-                                       const bf16  *__restrict__ bias,// [N] or null
-                                       int M, int N, int K,
-                                       unsigned long long *g_load_cycles,
-                                       unsigned long long *g_comp_cycles) {
+__global__ __launch_bounds__(BLOCK_THREADS) void gemm_mfma_v2_nopf_profiled(
+  const float *__restrict__ A,    // [M,K] fp32
+  const bf16 *__restrict__ B,     // [K,N] bf16
+  float *__restrict__ C,          // [M,N] fp32
+  const bf16 *__restrict__ bias,  // [N] or null
+  int M, int N, int K, unsigned long long *g_load_cycles, unsigned long long *g_comp_cycles) {
   static_assert(BK % BF16_MFMA_KSTEP == 0, "BK must be multiple of MFMA K-step");
   constexpr int WM = 16, WN = 16, WK = BF16_MFMA_KSTEP;
-  constexpr int VEC_B_SIZE = 8;   // 8*bf16 = 16B -> uint4
-  constexpr int VEC_A_SIZE = 4;   // float4
+  constexpr int VEC_B_SIZE = 8;  // 8*bf16 = 16B -> uint4
+  constexpr int VEC_A_SIZE = 4;  // float4
 
-  const int tid     = threadIdx.x;
+  const int tid = threadIdx.x;
   const int wave_id = tid >> 6;
   const int lane_id = tid & 63;
 
@@ -68,8 +69,8 @@ void gemm_mfma_v2_nopf_profiled(const float *__restrict__ A,   // [M,K] fp32
 
   const int waves_per_block_m = BM / TM;
   const int waves_per_block_n = BN / TN;
-  const int wave_row = wave_id /  waves_per_block_n;
-  const int wave_col = wave_id %  waves_per_block_n;
+  const int wave_row = wave_id / waves_per_block_n;
+  const int wave_col = wave_id % waves_per_block_n;
 
   const int wave_row_start = block_row_start + wave_row * TM;
   const int wave_col_start = block_col_start + wave_col * TN;
@@ -90,7 +91,7 @@ void gemm_mfma_v2_nopf_profiled(const float *__restrict__ A,   // [M,K] fp32
   constexpr int A_ELEMS_TILE = BM * BK;
   constexpr int B_ELEMS_TILE = BK * BN;
   constexpr int A_VEC_PER_THR = A_ELEMS_TILE / VEC_A_SIZE / BLOCK_THREADS;
-  constexpr int B_VEC_ELEMS   = B_ELEMS_TILE / VEC_B_SIZE;
+  constexpr int B_VEC_ELEMS = B_ELEMS_TILE / VEC_B_SIZE;
   constexpr int B_VEC_PER_THR = B_VEC_ELEMS / BLOCK_THREADS;
 
   const int lx = lane_id & 15;
@@ -101,12 +102,13 @@ void gemm_mfma_v2_nopf_profiled(const float *__restrict__ A,   // [M,K] fp32
 
   for (int k_base = 0; k_base < K; k_base += BK) {
     // ---- LOAD phase: global -> LDS (time this) ----
-    unsigned long long t_ld0=0, t_ld1=0;
-    if (threadIdx.x == 0) t_ld0 = clock64();
+    unsigned long long t_ld0 = 0, t_ld1 = 0;
+    if (threadIdx.x == 0)
+      t_ld0 = clock64();
 
 #pragma unroll
     for (int i = 0; i < A_VEC_PER_THR; i++) {
-      const int vec_idx  = tid + i * BLOCK_THREADS;
+      const int vec_idx = tid + i * BLOCK_THREADS;
       const int elem_idx = vec_idx * VEC_A_SIZE;
       const int r = elem_idx / BK;
       const int c = elem_idx % BK;
@@ -116,13 +118,15 @@ void gemm_mfma_v2_nopf_profiled(const float *__restrict__ A,   // [M,K] fp32
       if (g_row < M && (g_col + VEC_A_SIZE - 1) < K) {
         const float4 v = *reinterpret_cast<const float4 *>(&A[(size_t)g_row * K + g_col]);
         const bf16x4 packed = pack_f4_to_bf16x4(v);
-        As[r][c + 0] = packed[0]; As[r][c + 1] = packed[1];
-        As[r][c + 2] = packed[2]; As[r][c + 3] = packed[3];
+        As[r][c + 0] = packed[0];
+        As[r][c + 1] = packed[1];
+        As[r][c + 2] = packed[2];
+        As[r][c + 3] = packed[3];
       } else {
 #pragma unroll
         for (int j = 0; j < VEC_A_SIZE; ++j) {
-          const float val = (g_row < M && (g_col + j) < K)
-                              ? A[(size_t)g_row * K + (g_col + j)] : 0.0f;
+          const float val =
+            (g_row < M && (g_col + j) < K) ? A[(size_t)g_row * K + (g_col + j)] : 0.0f;
           As[r][c + j] = (bf16_isa)val;
         }
       }
@@ -130,7 +134,7 @@ void gemm_mfma_v2_nopf_profiled(const float *__restrict__ A,   // [M,K] fp32
 
 #pragma unroll
     for (int i = 0; i < B_VEC_PER_THR; ++i) {
-      const int vec_idx  = tid + i * BLOCK_THREADS;
+      const int vec_idx = tid + i * BLOCK_THREADS;
       const int elem_idx = vec_idx * VEC_B_SIZE;
       const int r = elem_idx / BN;
       const int c = elem_idx % BN;
@@ -141,17 +145,21 @@ void gemm_mfma_v2_nopf_profiled(const float *__restrict__ A,   // [M,K] fp32
         *reinterpret_cast<uint4 *>(&Bs[r][c]) =
           *reinterpret_cast<const uint4 *>(&B[(size_t)g_row * N + g_col]);
       } else {
-        uint4 zero = {0,0,0,0};
+        uint4 zero = {0, 0, 0, 0};
         *reinterpret_cast<uint4 *>(&Bs[r][c]) = zero;
       }
     }
 
-    __syncthreads(); // LOAD ends after this sync
-    if (threadIdx.x == 0) { t_ld1 = clock64(); load_cycles_sum += (t_ld1 - t_ld0); }
+    __syncthreads();  // LOAD ends after this sync
+    if (threadIdx.x == 0) {
+      t_ld1 = clock64();
+      load_cycles_sum += (t_ld1 - t_ld0);
+    }
 
     // ---- COMPUTE phase: MFMA only (time this) ----
-    unsigned long long t_c0=0, t_c1=0;
-    if (threadIdx.x == 0) t_c0 = clock64();
+    unsigned long long t_c0 = 0, t_c1 = 0;
+    if (threadIdx.x == 0)
+      t_c0 = clock64();
 
 #pragma unroll
     for (int kk = 0; kk < BK; kk += WK) {
@@ -174,8 +182,11 @@ void gemm_mfma_v2_nopf_profiled(const float *__restrict__ A,   // [M,K] fp32
       }
     }
 
-    if (threadIdx.x == 0) { t_c1 = clock64(); comp_cycles_sum += (t_c1 - t_c0); }
-    __syncthreads(); // not counted in compute; prepares for next tile load
+    if (threadIdx.x == 0) {
+      t_c1 = clock64();
+      comp_cycles_sum += (t_c1 - t_c0);
+    }
+    __syncthreads();  // not counted in compute; prepares for next tile load
   }
 
   // ---- Write back ----
@@ -190,7 +201,8 @@ void gemm_mfma_v2_nopf_profiled(const float *__restrict__ A,   // [M,K] fp32
         const int col = wave_col_start + nt * WN + lxx;
         if (row < M && col < N) {
           float out = acc[mt][nt][i];
-          if (bias) out += static_cast<float>(bias[col]);
+          if (bias)
+            out += static_cast<float>(bias[col]);
           C[(size_t)row * N + col] = out;
         }
       }
@@ -202,17 +214,15 @@ void gemm_mfma_v2_nopf_profiled(const float *__restrict__ A,   // [M,K] fp32
 }
 
 // Launcher (same tiling as your other kernels)
-inline void launch_gemm_mfma_v2_nopf_profiled(
-    const float *A, const bf16 *B, float *C, int M, int N, int K,
-    unsigned long long *d_load_cycles, unsigned long long *d_comp_cycles,
-    hipStream_t stream = nullptr, const bf16 *bias = nullptr) {
-
+inline void launch_gemm_mfma_v2_nopf_profiled(const float *A, const bf16 *B, float *C, int M, int N,
+                                              int K, unsigned long long *d_load_cycles,
+                                              unsigned long long *d_comp_cycles,
+                                              hipStream_t stream = nullptr,
+                                              const bf16 *bias = nullptr) {
   constexpr int BM = 64, BN = 128, BK = 32, TM = 32, TN = 32, BLOCK_THREADS = 512;
   dim3 block_dim(BLOCK_THREADS);
   dim3 grid_dim((N + BN - 1) / BN, (M + BM - 1) / BM);
 
-  hipLaunchKernelGGL(
-      (gemm_mfma_v2_nopf_profiled<BM, BN, BK, TM, TN, BLOCK_THREADS>),
-      grid_dim, block_dim, 0, stream,
-      A, B, C, bias, M, N, K, d_load_cycles, d_comp_cycles);
+  hipLaunchKernelGGL((gemm_mfma_v2_nopf_profiled<BM, BN, BK, TM, TN, BLOCK_THREADS>), grid_dim,
+                     block_dim, 0, stream, A, B, C, bias, M, N, K, d_load_cycles, d_comp_cycles);
 }

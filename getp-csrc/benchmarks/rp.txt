@@ -1,3 +1,2 @@
 pmc : Wavefronts VALUInsts SALUInsts SFetchInsts FlatVMemInsts LDSInsts FlatLDSInsts
 pmc : FetchSize WriteSize L2CacheHit
-

@@ -5,4 +5,3 @@
 
 // Forward declaration for the Requests struct which is normally provided by getp_eval.cpp.
 struct Requests;
-
