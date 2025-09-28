@@ -141,7 +141,7 @@ void embedding_lookup_batched(Tensor *embedding,      // Shape: [vocab_size, hid
   const bf16 *embedding_ptr = (const bf16 *)embedding->d_buf;
   float *x_ptr = (float *)x->d_buf;
 
-  CHECK_HIP(hipMemcpyAsync(tokens_buf->d_buf, tokens, tokens_buf->num_elem() * sizeof(int),
+  CHECK_HIP(hipMemcpyAsync(tokens_buf->d_buf, tokens, cur_batch_size * sizeof(int),
                            hipMemcpyHostToDevice, stream));
 
   dim3 block_size(32, 16);
@@ -190,7 +190,14 @@ void embedding_lookup_shard_batched(Tensor *embedding,      // Shape: [vocab_siz
   const bf16 *embedding_ptr = (const bf16 *)embedding->d_buf;
   float *x_ptr = (float *)x->d_buf + tp_rank * shard_dim;
 
-  CHECK_HIP(hipMemcpyAsync(tokens_buf->d_buf, tokens, tokens_buf->num_elem() * sizeof(int),
+  // for (int i = 0; i < BATCH_SIZE; i++) {
+  //   if (tokens[i] < 0 || tokens[i] >= 201088) {
+  //     printf("Index out of bound %d\n", tokens[i]);
+  //     return;
+  //   }
+  // }
+
+  CHECK_HIP(hipMemcpyAsync(tokens_buf->d_buf, tokens, cur_batch_size * sizeof(int),
                            hipMemcpyHostToDevice, stream));
 
   dim3 block_size(32, 16);
@@ -723,6 +730,26 @@ __global__ void add_vector_kernel_batched(float *y, const float *b, int len) {
   }
 }
 
+__global__ void add_vector_kernel_v2(float *y, const float *b, int len) {
+  float4 *y4 = reinterpret_cast<float4 *>(y);
+  const float4 *b4 = reinterpret_cast<const float4 *>(b);
+
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int len_vec = len / 4;
+
+  if (i < len_vec) {
+    float4 y_vec = y4[i];
+    const float4 b_vec = b4[i];
+
+    y_vec.x += b_vec.x;
+    y_vec.y += b_vec.y;
+    y_vec.z += b_vec.z;
+    y_vec.w += b_vec.w;
+
+    y4[i] = y_vec;
+  }
+}
+
 __global__ void add_vector_2d_kernel(float *__restrict__ dst, const float *__restrict__ src,
                                      int height, int width, int dst_stride) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1043,23 +1070,6 @@ void attn_out_project_batched_v2(Tensor *tb,         // Shape: [batch_size, n_at
       tb_ptr, w_o_ptr, y_ptr, b_o_ptr, cur_batch_size, out_features, in_features);
 #endif
   }
-
-  // {
-  //   constexpr int BM = 16;
-  //   constexpr int BN = 128;
-  //   constexpr int BK = 16;
-  //   constexpr int TM = 1;
-  //   constexpr int TN = 4;
-
-  //   const int BLOCK_SIZE_X = BN / TN;
-  //   const int BLOCK_SIZE_Y = BM / TM;
-  //   dim3 block_size(BLOCK_SIZE_X, BLOCK_SIZE_Y);
-  //   dim3 grid_size((out_features + BN - 1) / BN, (cur_batch_size + BM - 1) / BM);
-
-  //   matmul_kernel<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
-  //     tb_ptr, w_o_ptr, y_ptr, b_o_ptr, cur_batch_size, out_features, in_features);
-  //   CHECK_HIP(hipGetLastError());
-  // }
 
   if (y_from_device) {
     y->from_device(stream);
@@ -1834,8 +1844,15 @@ __global__ void max_kernel_gpu_v2(const float *__restrict__ logits, float *__res
 
   // Thread 0 writes the result for this row
   if (tid == 0) {
-    logits_max[row] = sdata_val[0];
-    id_max[row] = sdata_idx[0] + tp_rank * length;
+    int final_idx = sdata_idx[0];
+    float final_max = sdata_val[0];
+
+    if (final_idx < 0) {
+      final_idx = 0;
+    }
+
+    logits_max[row] = final_max;
+    id_max[row] = final_idx + tp_rank * length;
   }
 }
 
@@ -1900,6 +1917,10 @@ __global__ void reduceLogitsKernel(const float *__restrict__ logits_max_total,
       max_val = current_val;
       max_id = logits_id_total[idx];
     }
+  }
+
+  if (max_id < 0) {
+    max_id = 0;
   }
 
   // Store the final maximum value and ID in the output arrays.

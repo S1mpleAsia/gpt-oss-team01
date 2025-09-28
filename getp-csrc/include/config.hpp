@@ -8,11 +8,11 @@
 // #include "config_run.hpp"
 #include "pipeline.hpp"
 
-#define BATCH_SIZE 512
+#define BATCH_SIZE 3600
 #define PP_SLOT 1
 #define KV16
 // #define PRINT_LOGITS
-// #define TIME_GPU
+#define TIME_GPU
 // #define DEBUG
 // #define RUN_20B
 #define RUN_EP
@@ -24,7 +24,7 @@
 #else
 #define DP 1
 #define PP 1
-#define TP 4
+#define TP 8
 #endif
 #define TOTAL_GPUS_NEEDED ((DP) * (PP) * (TP))
 #define TOTAL_PIPELINES ((PP) * (TP))
@@ -89,8 +89,10 @@ typedef struct {
   // Tensor *up;
   Tensor *gate_up;  // [batch_size * experts_per_toeken, inter_dim]
   Tensor *e_agg;    // [batch_size, hidden_dim]
-  Tensor *qkv;      // an additional buffer just for convenience (head_dim *
-                    // (n_attn_heads + 2 * n_kv_heads), )
+  Tensor *e_agg_buf;
+  Tensor *e_agg_recv;
+  Tensor *qkv;  // an additional buffer just for convenience (head_dim *
+                // (n_attn_heads + 2 * n_kv_heads), )
   Tensor *tmp_qkv;
   Tensor *q;  // query (n_attn_heads * head_dim,)
   // Tensor *k;           // key (n_kv_heads * head_dim,)

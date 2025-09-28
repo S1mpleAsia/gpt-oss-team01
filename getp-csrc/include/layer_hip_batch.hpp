@@ -70,6 +70,8 @@ void qkv_split_rope_fused(Tensor *qkv_out,  // Shape: [batch_size, (n_q + 2*n_kv
 
 __global__ void add_vector_kernel_batched(float *y, const float *b, int len);
 
+__global__ void add_vector_kernel_v2(float *y, const float *b, int len);
+
 __global__ void add_vector_2d_kernel(float *__restrict__ dst, const float *__restrict__ src,
                                      int height, int width, int dst_stride);
 

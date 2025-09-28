@@ -131,6 +131,105 @@ void all_gather_x_new(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, 
   // pthread_barrier_wait(tp_barrier + leader_rank + 3);
 }
 
+void all_gather_x_full_tp(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
+                          int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream,
+                          hipEvent_t tp_ready, hipEvent_t tp_finish) {
+  // GpuTimer timer("all_gather_x_full");
+
+  // Phase 1: 0-1 | 2-3 | 4-5 | 6-7
+  int reduce_group = tp_rank / 2;
+  int local_rank = tp_rank % 2;
+  int partner_offset = (local_rank == 0) ? 1 : -1;
+
+  float *d_buf_ptr = (float *)rs_now->x->d_buf;
+  float *d_buf_partner_ptr = (float *)(rs_now + partner_offset)->x->d_buf;
+
+  size_t hidden_dim = rs_now->x->shape[1];
+  size_t shard_dim = hidden_dim / TP;
+  size_t shard_size = shard_dim * sizeof(float);
+
+  size_t width = shard_size;
+  size_t pitch_size = hidden_dim * sizeof(float);
+  size_t height = cur_batch_size;
+
+  CHECK_HIP(hipEventRecord(tp_ready, stream));
+  // pthread_barrier_wait(tp_barrier);
+  pthread_barrier_wait(tp_barrier + reduce_group + 1);
+
+  hipEvent_t tp_ready_partner = total_events->tp_ready[cur_device + partner_offset];
+  CHECK_HIP(hipStreamWaitEvent(stream, tp_ready_partner));
+
+  size_t partner_pos_offset = (tp_rank + partner_offset) * shard_dim;
+
+  CHECK_HIP(hipMemcpy2DAsync(d_buf_ptr + partner_pos_offset, pitch_size,
+                             d_buf_partner_ptr + partner_pos_offset, pitch_size, width, height,
+                             hipMemcpyDeviceToDevice, stream));
+
+  CHECK_HIP(hipEventRecord(tp_finish, stream));
+
+  // Phase 2: 0-2 | 1-3 | 4-6 | 5-7
+  // pthread_barrier_wait(tp_barrier);
+  if (tp_rank == 0 || tp_rank == 2)
+    pthread_barrier_wait(tp_barrier + 5);
+  else if (tp_rank == 1 || tp_rank == 3)
+    pthread_barrier_wait(tp_barrier + 6);
+  else if (tp_rank == 4 || tp_rank == 6)
+    pthread_barrier_wait(tp_barrier + 7);
+  else if (tp_rank == 5 || tp_rank == 7)
+    pthread_barrier_wait(tp_barrier + 8);
+
+  int p = 1;
+  int mask = 1 << p;
+  int partner = tp_rank ^ mask;
+  int chunk_size = 1 << p;
+  partner_offset = partner - tp_rank;
+
+  hipEvent_t tp_finish_partner_2 = total_events->tp_finish[cur_device + partner_offset];
+  CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_partner_2));
+
+  float *d_buf_ptr_2 = (float *)rs_now->x->d_buf;
+  float *d_buf_partner_ptr_2 = (float *)(rs_now + partner_offset)->x->d_buf;
+  size_t width_2 = chunk_size * shard_size;
+
+  const int partner_base = (tp_rank & ~(chunk_size - 1)) ^ mask;
+  const size_t col_offset = (size_t)partner_base * shard_dim;
+
+  CHECK_HIP(hipMemcpy2DAsync(d_buf_ptr_2 + col_offset, pitch_size, d_buf_partner_ptr_2 + col_offset,
+                             pitch_size, width_2, height, hipMemcpyDeviceToDevice, stream));
+  CHECK_HIP(hipEventRecord(tp_finish, stream));
+
+  // Phase 3: 0-4 | 2-6 | 1-5 | 3-7
+  // pthread_barrier_wait(tp_barrier);
+  if (tp_rank == 0 || tp_rank == 4)
+    pthread_barrier_wait(tp_barrier + 9);
+  if (tp_rank == 2 || tp_rank == 6)
+    pthread_barrier_wait(tp_barrier + 10);
+  if (tp_rank == 1 || tp_rank == 5)
+    pthread_barrier_wait(tp_barrier + 11);
+  if (tp_rank == 3 || tp_rank == 7)
+    pthread_barrier_wait(tp_barrier + 12);
+
+  p = 2;
+  mask = 1 << p;
+  partner = tp_rank ^ mask;
+  chunk_size = 1 << p;
+  partner_offset = partner - tp_rank;
+
+  hipEvent_t tp_finish_partner_3 = total_events->tp_finish[cur_device + partner_offset];
+  CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_partner_3));
+
+  float *d_buf_ptr_3 = (float *)rs_now->x->d_buf;
+  float *d_buf_partner_ptr_3 = (float *)(rs_now + partner_offset)->x->d_buf;
+  size_t width_3 = chunk_size * shard_size;
+
+  const int partner_base_last = (tp_rank & ~(chunk_size - 1)) ^ mask;
+  const size_t col_offset_last = (size_t)partner_base_last * shard_dim;
+
+  CHECK_HIP(hipMemcpy2DAsync(d_buf_ptr_3 + col_offset_last, pitch_size,
+                             d_buf_partner_ptr_3 + col_offset_last, pitch_size, width_3, height,
+                             hipMemcpyDeviceToDevice, stream));
+}
+
 void reduce_tb3(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
                 int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream,
                 hipEvent_t tp_ready, hipEvent_t tp_finish) {
@@ -422,6 +521,100 @@ void reduce_tb2(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cu
   }
 
   pthread_barrier_wait(tp_barrier);
+}
+
+void reduce_tb2_full_tp(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
+                        int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream,
+                        hipEvent_t tp_ready, hipEvent_t tp_finish) {
+  // GpuTimer timer("reduce_tb2_full");
+
+  // Phase 1: 0-1 | 2-3 | 4-5 | 6-7
+  int reduce_group = tp_rank / 2;
+  int local_rank = tp_rank % 2;
+  int partner_offset = (local_rank == 0) ? 1 : -1;
+
+  float *tb2_ptr = (float *)rs_now->tb2->d_buf;
+  float *local_ptr = (float *)rs_now->tb2_buf->d_buf;
+  float *tb2_partner_ptr = (float *)(rs_now + partner_offset)->tb2->d_buf;
+  size_t active_elems = (size_t)cur_batch_size * rs_now->tb2->shape[1];
+  size_t active_num_bytes = active_elems * rs_now->tb2->get_dtype_size();
+
+  const int block_size = 256;
+  const int grid_size = (active_elems + block_size - 1) / block_size;
+
+  CHECK_HIP(hipEventRecord(tp_ready, stream));
+  // pthread_barrier_wait(tp_barrier);
+  pthread_barrier_wait(tp_barrier + reduce_group + 1);
+
+  hipEvent_t tp_ready_partner = total_events->tp_ready[cur_device + partner_offset];
+  CHECK_HIP(hipStreamWaitEvent(stream, tp_ready_partner));
+
+  CHECK_HIP(hipMemcpyPeerAsync(local_ptr, cur_device, tb2_partner_ptr, cur_device + partner_offset,
+                               active_num_bytes, stream));
+  add_vector_kernel_batched<<<grid_size, block_size, 0, stream>>>(tb2_ptr, (const float *)local_ptr,
+                                                                  active_elems);
+
+  CHECK_HIP(hipEventRecord(tp_finish, stream));
+
+  // Phase 2: 0-2 | 1-3 | 4-6 | 5-7
+  // pthread_barrier_wait(tp_barrier);
+  if (tp_rank == 0 || tp_rank == 2)
+    pthread_barrier_wait(tp_barrier + 5);
+  else if (tp_rank == 1 || tp_rank == 3)
+    pthread_barrier_wait(tp_barrier + 6);
+  else if (tp_rank == 4 || tp_rank == 6)
+    pthread_barrier_wait(tp_barrier + 7);
+  else if (tp_rank == 5 || tp_rank == 7)
+    pthread_barrier_wait(tp_barrier + 8);
+
+  int p = 1;
+  int mask = 1 << p;
+  int partner = tp_rank ^ mask;
+  int chunk_size = 1 << p;
+  partner_offset = partner - tp_rank;
+
+  hipEvent_t tp_finish_partner_2 = total_events->tp_finish[cur_device + partner_offset];
+  CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_partner_2));
+
+  tb2_ptr = (float *)rs_now->tb2->d_buf;
+  local_ptr = (float *)rs_now->tb2_buf->d_buf;
+  tb2_partner_ptr = (float *)(rs_now + partner_offset)->tb2->d_buf;
+
+  CHECK_HIP(hipMemcpyPeerAsync(local_ptr, cur_device, tb2_partner_ptr, cur_device + partner_offset,
+                               active_num_bytes, stream));
+  add_vector_kernel_batched<<<grid_size, block_size, 0, stream>>>(tb2_ptr, (const float *)local_ptr,
+                                                                  active_elems);
+
+  CHECK_HIP(hipEventRecord(tp_finish, stream));
+
+  // Phase 3: 0-4 | 2-6 | 1-5 | 3-7
+  // pthread_barrier_wait(tp_barrier);
+  if (tp_rank == 0 || tp_rank == 4)
+    pthread_barrier_wait(tp_barrier + 9);
+  if (tp_rank == 2 || tp_rank == 6)
+    pthread_barrier_wait(tp_barrier + 10);
+  if (tp_rank == 1 || tp_rank == 5)
+    pthread_barrier_wait(tp_barrier + 11);
+  if (tp_rank == 3 || tp_rank == 7)
+    pthread_barrier_wait(tp_barrier + 12);
+
+  p = 2;
+  mask = 1 << p;
+  partner = tp_rank ^ mask;
+  chunk_size = 1 << p;
+  partner_offset = partner - tp_rank;
+
+  hipEvent_t tp_finish_partner_3 = total_events->tp_finish[cur_device + partner_offset];
+  CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_partner_3));
+
+  tb2_ptr = (float *)rs_now->tb2->d_buf;
+  local_ptr = (float *)rs_now->tb2_buf->d_buf;
+  tb2_partner_ptr = (float *)(rs_now + partner_offset)->tb2->d_buf;
+
+  CHECK_HIP(hipMemcpyPeerAsync(local_ptr, cur_device, tb2_partner_ptr, cur_device + partner_offset,
+                               active_num_bytes, stream));
+  add_vector_kernel_batched<<<grid_size, block_size, 0, stream>>>(tb2_ptr, (const float *)local_ptr,
+                                                                  active_elems);
 }
 
 void reduce_tb2_new(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
@@ -793,6 +986,154 @@ void all_gather_tb3(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, in
   }
 
   pthread_barrier_wait(tp_barrier);
+}
+
+void ring_reduce_agg(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
+                     int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream) {
+  // GpuTimer timer("ring_reduce_agg", stream);
+
+  float *d_buf_now = (float *)rs_now->e_agg->d_buf;
+  size_t hidden_dim = rs_now->e_agg->shape[1];
+  size_t total_elems = cur_batch_size * hidden_dim;
+  size_t chunk_elems = total_elems / TP;
+  size_t chunk_bytes = chunk_elems * rs_now->e_agg->get_dtype_size();
+
+  int left_peer_rank = (tp_rank - 1 + TP) % TP;
+  OurRunState *rs_left = &rs_leader[left_peer_rank];
+  int left_device = cur_device - tp_rank + left_peer_rank;
+
+  void *tmp_ptr = rs_now->e_agg_recv->d_buf;
+
+  const int block_size = 256;
+  const int grid_size = (chunk_elems + block_size - 1) / block_size;
+
+  CHECK_HIP(hipStreamSynchronize(stream));
+  pthread_barrier_wait(tp_barrier);
+
+  for (int i = 0; i < TP - 1; ++i) {
+    int chunk_idx = (tp_rank - i - 1 + TP) % TP;
+    size_t chunk_offset = chunk_idx * chunk_elems;
+
+    const float *left_src_ptr = (const float *)rs_left->e_agg->d_buf + chunk_offset;
+    float *dst_local_ptr = d_buf_now + chunk_offset;
+
+    CHECK_HIP(
+      hipMemcpyPeerAsync(tmp_ptr, cur_device, left_src_ptr, left_device, chunk_bytes, stream));
+
+    add_vector_kernel_batched<<<grid_size, block_size, 0, stream>>>(
+      dst_local_ptr, (const float *)tmp_ptr, chunk_elems);
+
+    CHECK_HIP(hipStreamSynchronize(stream));
+    pthread_barrier_wait(tp_barrier);
+  }
+
+  for (int i = 0; i < TP - 1; i++) {
+    int send_chunk_idx = (tp_rank - i + TP) % TP;
+    size_t chunk_offset = send_chunk_idx * chunk_elems;
+
+    const float *left_src_ptr = (const float *)rs_left->e_agg->d_buf + chunk_offset;
+    float *dst_local_ptr = d_buf_now + chunk_offset;
+
+    CHECK_HIP(hipMemcpyPeerAsync(dst_local_ptr, cur_device, left_src_ptr, left_device, chunk_bytes,
+                                 stream));
+
+    CHECK_HIP(hipStreamSynchronize(stream));
+    pthread_barrier_wait(tp_barrier);
+  }
+}
+
+void reduce_agg_full_tp(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
+                        int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream,
+                        hipEvent_t tp_ready, hipEvent_t tp_finish) {
+  // GpuTimer timer("reduce_agg_full");
+
+  // Phase 1: 0-1 | 2-3 | 4-5 | 6-7
+  int reduce_group = tp_rank / 2;
+  int local_rank = tp_rank % 2;
+  int partner_offset = (local_rank == 0) ? 1 : -1;
+
+  float *e_agg_ptr = (float *)rs_now->e_agg->d_buf;
+  float *local_ptr = (float *)rs_now->e_agg_buf->d_buf;
+  float *e_agg_partner_ptr = (float *)(rs_now + partner_offset)->e_agg->d_buf;
+  size_t active_elems = (size_t)cur_batch_size * rs_now->e_agg->shape[1];
+  size_t active_num_bytes = active_elems * rs_now->e_agg->get_dtype_size();
+
+  const int block_size = 256;
+  const int grid_size = (active_elems + block_size - 1) / block_size;
+
+  CHECK_HIP(hipEventRecord(tp_ready, stream));
+  // pthread_barrier_wait(tp_barrier);
+  pthread_barrier_wait(tp_barrier + reduce_group + 1);
+
+  hipEvent_t tp_ready_partner = total_events->tp_ready[cur_device + partner_offset];
+  CHECK_HIP(hipStreamWaitEvent(stream, tp_ready_partner));
+
+  CHECK_HIP(hipMemcpyPeerAsync(local_ptr, cur_device, e_agg_partner_ptr,
+                               cur_device + partner_offset, active_num_bytes, stream));
+  add_vector_kernel_batched<<<grid_size, block_size, 0, stream>>>(
+    e_agg_ptr, (const float *)local_ptr, active_elems);
+
+  CHECK_HIP(hipEventRecord(tp_finish, stream));
+
+  // Phase 2: 0-2 | 1-3 | 4-6 | 5-7
+  // pthread_barrier_wait(tp_barrier);
+  if (tp_rank == 0 || tp_rank == 2)
+    pthread_barrier_wait(tp_barrier + 5);
+  else if (tp_rank == 1 || tp_rank == 3)
+    pthread_barrier_wait(tp_barrier + 6);
+  else if (tp_rank == 4 || tp_rank == 6)
+    pthread_barrier_wait(tp_barrier + 7);
+  else if (tp_rank == 5 || tp_rank == 7)
+    pthread_barrier_wait(tp_barrier + 8);
+
+  int p = 1;
+  int mask = 1 << p;
+  int partner = tp_rank ^ mask;
+  int chunk_size = 1 << p;
+  partner_offset = partner - tp_rank;
+
+  hipEvent_t tp_finish_partner_2 = total_events->tp_finish[cur_device + partner_offset];
+  CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_partner_2));
+
+  e_agg_ptr = (float *)rs_now->e_agg->d_buf;
+  local_ptr = (float *)rs_now->e_agg_buf->d_buf;
+  e_agg_partner_ptr = (float *)(rs_now + partner_offset)->e_agg->d_buf;
+
+  CHECK_HIP(hipMemcpyPeerAsync(local_ptr, cur_device, e_agg_partner_ptr,
+                               cur_device + partner_offset, active_num_bytes, stream));
+  add_vector_kernel_batched<<<grid_size, block_size, 0, stream>>>(
+    e_agg_ptr, (const float *)local_ptr, active_elems);
+
+  CHECK_HIP(hipEventRecord(tp_finish, stream));
+
+  // Phase 3: 0-4 | 2-6 | 1-5 | 3-7
+  // pthread_barrier_wait(tp_barrier);
+  if (tp_rank == 0 || tp_rank == 4)
+    pthread_barrier_wait(tp_barrier + 9);
+  if (tp_rank == 2 || tp_rank == 6)
+    pthread_barrier_wait(tp_barrier + 10);
+  if (tp_rank == 1 || tp_rank == 5)
+    pthread_barrier_wait(tp_barrier + 11);
+  if (tp_rank == 3 || tp_rank == 7)
+    pthread_barrier_wait(tp_barrier + 12);
+
+  p = 2;
+  mask = 1 << p;
+  partner = tp_rank ^ mask;
+  chunk_size = 1 << p;
+  partner_offset = partner - tp_rank;
+
+  hipEvent_t tp_finish_partner_3 = total_events->tp_finish[cur_device + partner_offset];
+  CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_partner_3));
+
+  e_agg_ptr = (float *)rs_now->e_agg->d_buf;
+  local_ptr = (float *)rs_now->e_agg_buf->d_buf;
+  e_agg_partner_ptr = (float *)(rs_now + partner_offset)->e_agg->d_buf;
+
+  CHECK_HIP(hipMemcpyPeerAsync(local_ptr, cur_device, e_agg_partner_ptr,
+                               cur_device + partner_offset, active_num_bytes, stream));
+  add_vector_kernel_batched<<<grid_size, block_size, 0, stream>>>(
+    e_agg_ptr, (const float *)local_ptr, active_elems);
 }
 
 void reduce_agg(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,

@@ -109,7 +109,7 @@ void *thread_handler(void *arg) {
   int id = args->id;
   int max_seq_len = public_requests->max_seq_len;
   int end_idx = args->end_idx;
-  args->tp_barrier = new pthread_barrier_t[PP * 5];
+  args->tp_barrier = new pthread_barrier_t[PP * 13];
 
 #ifdef RUN_20B
   CHECK_HIP(hipSetDevice(id));
@@ -123,12 +123,20 @@ void *thread_handler(void *arg) {
 
   // barrier for different pipeline stages
   for (int i = 0; i < PP; i++) {
-    int base_idx = i * 5;
+    int base_idx = i * 13;
     pthread_barrier_init(&(args->tp_barrier[base_idx]), NULL, TP);
-    pthread_barrier_init(&(args->tp_barrier[base_idx + 1]), NULL, TP / 2);
-    pthread_barrier_init(&(args->tp_barrier[base_idx + 2]), NULL, TP / 2);
-    pthread_barrier_init(&(args->tp_barrier[base_idx + 3]), NULL, TP / 2);
-    pthread_barrier_init(&(args->tp_barrier[base_idx + 4]), NULL, TP / 2);
+    pthread_barrier_init(&(args->tp_barrier[base_idx + 1]), NULL, 2);
+    pthread_barrier_init(&(args->tp_barrier[base_idx + 2]), NULL, 2);
+    pthread_barrier_init(&(args->tp_barrier[base_idx + 3]), NULL, 2);
+    pthread_barrier_init(&(args->tp_barrier[base_idx + 4]), NULL, 2);
+    pthread_barrier_init(&(args->tp_barrier[base_idx + 5]), NULL, 2);
+    pthread_barrier_init(&(args->tp_barrier[base_idx + 6]), NULL, 2);
+    pthread_barrier_init(&(args->tp_barrier[base_idx + 7]), NULL, 2);
+    pthread_barrier_init(&(args->tp_barrier[base_idx + 8]), NULL, 2);
+    pthread_barrier_init(&(args->tp_barrier[base_idx + 9]), NULL, 2);
+    pthread_barrier_init(&(args->tp_barrier[base_idx + 10]), NULL, 2);
+    pthread_barrier_init(&(args->tp_barrier[base_idx + 11]), NULL, 2);
+    pthread_barrier_init(&(args->tp_barrier[base_idx + 12]), NULL, 2);
   }
 
   int shared_pos = 0;
@@ -137,7 +145,7 @@ void *thread_handler(void *arg) {
   for (int i = 0; i < TOTAL_PIPELINES; i++) {
     inside_args[i].tp_rank = (i % TP);
     inside_args[i].pp_rank = (i % TOTAL_PIPELINES) / TP;
-    inside_args[i].tp_barrier = &(args->tp_barrier[inside_args[i].pp_rank * 5]);
+    inside_args[i].tp_barrier = &(args->tp_barrier[inside_args[i].pp_rank * 13]);
     inside_args[i].id = id;
     inside_args[i].pos_ptr = &shared_pos;
     inside_args[i].finished_ptr = &finished;
@@ -277,7 +285,7 @@ void *thread_handler(void *arg) {
   pthread_barrier_destroy(&start_barrier);
   pthread_barrier_destroy(&end_barrier);
 
-  for (int i = 0; i < PP * 5; i++) {
+  for (int i = 0; i < PP * 13; i++) {
     pthread_barrier_destroy(&(args->tp_barrier[i]));
   }
 #endif

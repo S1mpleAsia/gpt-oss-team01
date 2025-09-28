@@ -282,53 +282,22 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   //   weights->token_embedding_table = nullptr;
   // }
   if (pp_rank == 0) {
-    {
-      printf("Starting alloc token_embedding_table...\n");
-      fflush(stdout);
+    printf("Starting alloc token_embedding_table...\n");
+    fflush(stdout);
 
-      size_t vocab_size = p->vocab_size;
-      size_t hidden_dim = p->hidden_dim;
-      size_t hidden_shard = hidden_dim / TP;
-      weights->token_embedding_table = new Tensor(
-        {vocab_size, hidden_shard}, w->token_embedding_table, stream, DType::BF16, false);
+    size_t vocab_size = p->vocab_size;
+    size_t hidden_dim = p->hidden_dim;
+    size_t hidden_shard = hidden_dim / TP;
+    weights->token_embedding_table = new Tensor({vocab_size, hidden_shard}, stream, DType::BF16);
+    float *weights_ptr = w->token_embedding_table;
 
-      size_t offset_orig = 1ll * hidden_dim;
-      size_t offset_d = 1ll * hidden_shard;
-
-      float *w_embed_ptr = (float *)w->token_embedding_table + tp_rank * offset_d;
-      bf16 *w_embed_d_ptr = (bf16 *)weights->token_embedding_table->d_buf;
-
-      bf16 *tmp = (bf16 *)malloc(hidden_shard * sizeof(bf16));
-
-      hipEvent_t finish_env;
-      CHECK_HIP(hipEventCreate(&finish_env));
-
-      for (int v_id = 0; v_id < vocab_size; v_id++) {
-        if (v_id > 0) {
-          CHECK_HIP(hipEventSynchronize(finish_env));
-        }
-
-#pragma omp simd
-        for (int h = 0; h < hidden_shard; h++) {
-          tmp[h] = w_embed_ptr[h];
-        }
-
-        CHECK_HIP(hipMemcpyAsync(w_embed_d_ptr, tmp, hidden_shard * sizeof(bf16),
-                                 hipMemcpyHostToDevice, stream));
-        CHECK_HIP(hipEventRecord(finish_env, stream));
-
-        w_embed_ptr += offset_orig;
-        w_embed_d_ptr += offset_d;
-      }
-
-      CHECK_HIP(hipEventSynchronize(finish_env));
-
-      free(tmp);
-      CHECK_HIP(hipEventDestroy(finish_env));
-
-      printf("Finish alloc token_embedding_table\n");
-      fflush(stdout);
+    for (size_t v = 0; v < vocab_size; v++) {
+      float *src_ptr = weights_ptr + v * hidden_dim + tp_rank * hidden_shard;
+      float *dst_ptr = weights->token_embedding_table->buf + v * hidden_shard;
+      memcpy(dst_ptr, src_ptr, hidden_shard * sizeof(float));
     }
+
+    weights->token_embedding_table->to_device(stream);
   } else {
     weights->token_embedding_table = nullptr;
   }
@@ -887,22 +856,10 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   // rs->tb_buf = new Tensor({BATCH_SIZE, (size_t)p->head_dim * p->n_attn_heads / TP}, stream);
 
   rs->tb2 = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
-  // rs->tb2_recv = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / TP}, stream);
-  if (tp_rank < 3 && TP > 1) {
-    rs->tb2_buf = new Tensor({TP / 2, BATCH_SIZE, (size_t)p->hidden_dim}, stream);
-  } else {
-    rs->tb2_buf = nullptr;
-  }
+  rs->tb2_recv = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / TP}, stream);
+  // rs->tb2_buf = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
 
   rs->tb3 = new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
-  // rs->tb3_recv =
-  //   new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim / TP}, stream);
-  // if (tp_rank < 3 && TP > 1) {
-  //   rs->tb3_buf =
-  //     new Tensor({TP / 2, BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
-  // } else {
-  //   rs->tb3_buf = nullptr;
-  // }
 
   rs->router_score = new Tensor({BATCH_SIZE, (size_t)p->n_experts}, stream);
   rs->topk_v = new Tensor({BATCH_SIZE, (size_t)p->experts_per_token}, stream);
@@ -920,6 +877,8 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
     new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
 
   rs->e_agg = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
+  // rs->e_agg_buf = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
+  rs->e_agg_recv = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / TP}, stream);
 
   rs->qkv = new Tensor(
     {BATCH_SIZE, ((size_t)p->n_attn_heads + 2 * (size_t)p->n_kv_heads) * p->head_dim / TP}, stream);

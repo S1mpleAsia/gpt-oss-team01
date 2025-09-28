@@ -85,22 +85,6 @@ int *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flow_
     rs_now->topk_v->printDebug("rs_now->topk_v", 0, 0, stream);
 #endif
 
-    // Route the tokens to their corresponding top-k experts
-    // moe_apply_topk_batched(rs_now->t, weights_now->w_mlp1, weights_now->b_mlp1, weights_now->w_mlp2,
-    //                        weights_now->b_mlp2, rs_now->topk_i, rs_now->topk_v, rs_now->mlp1_out, rs_now->gate_up,
-    //                        rs_now->tb3, rs_now->e_agg, p->swiglu_limit, 1ll * l, false, false, false,
-    //                        false);
-
-    // moe_mlp1_batched(rs_now->t, weights_now->w_mlp1, weights_now->b_mlp1, rs_now->topk_i, rs_now->mlp1_out, false,
-    //                  false, 1ll * l);
-
-    // moe_swiglu_batched(rs_now->mlp1_out, rs_now->gate_up, p->experts_per_token, p->swiglu_limit);
-
-    // moe_mlp2_batched(rs_now->gate_up, weights_now->w_mlp2, weights_now->b_mlp2, rs_now->tb3, rs_now->topk_i,
-    //                  p->experts_per_token, true, 1ll * l);
-
-    // moe_agg_batched(rs_now->tb3, rs_now->topk_v, rs_now->e_agg, p->experts_per_token, false);
-
     int total_pairs = cur_batch_size * p->experts_per_token;
     moe_init_buffers_hip(rs_now->e_agg, rs_now->mlp1_out, rs_now->gate_up, rs_now->tb3,
                          rs_now->sorted_pair_ids, rs_now->expert_offsets, rs_now->x_packed,
@@ -190,8 +174,13 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
     embedding_lookup_shard_batched(weights_now->token_embedding_table, tokens, rs_now->tokens_buf,
                                    rs_now->x, cur_batch_size, tp_rank, false, stream);
 
+#if TP == 4
     all_gather_x_new(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream,
                      tp_ready, tp_finish);
+#else
+    all_gather_x_full_tp(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream,
+                         tp_ready, tp_finish);
+#endif
 
   } else {
     rs_now->pipeline_each->dequeue(rs_now->x, stream);
@@ -272,10 +261,14 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
     // reduce_tb2(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready,
     //            tp_finish);
 
+#if TP == 4
     reduce_tb2_new(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream,
                    tp_ready, tp_finish);
-
-    // ring_all_reduce_tb2(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream);
+#else
+    ring_all_reduce_tb2(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream);
+    // reduce_tb2_full_tp(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream,
+    //                    tp_ready, tp_finish);
+#endif
 
 #ifdef DEBUG
     if (flag)
@@ -402,8 +395,14 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
                                  p->experts_per_token, p->n_experts, 0, start_expert_offset,
                                  end_expert_offset, stream);
 
+#if TP == 4
     reduce_agg(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready,
                tp_finish);
+#else
+    ring_reduce_agg(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream);
+    // reduce_agg_full_tp(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream,
+    //                    tp_ready, tp_finish);
+#endif
 
 #else
     moe_scatter_aggregate_hip_120b(rs_now->tb3, rs_now->sorted_pair_ids, rs_now->topk_v,

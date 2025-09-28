@@ -557,6 +557,25 @@ __global__ void gather_inputs_by_sorted_kernel(
   x_packed[packed_row * hidden_dim + col] = x_in[token_id * hidden_dim + col];
 }
 
+__global__ void gather_inputs_vectorized_kernel(const float4 *x_in, const int *sorted_pair_ids,
+                                                float4 *x_packed, int vec_hidden_dim,
+                                                int total_pairs, int experts_per_token) {
+  int vec_col = blockIdx.x * blockDim.x + threadIdx.x;
+  int packed_row = blockIdx.y * blockDim.y + threadIdx.y;
+
+  if (packed_row >= total_pairs || vec_col >= vec_hidden_dim) {
+    return;
+  }
+
+  int pair_id = sorted_pair_ids[packed_row];
+  int token_id = pair_id / experts_per_token;
+
+  const float4 *src_ptr = x_in + token_id * vec_hidden_dim + vec_col;
+  float4 *dst_ptr = x_packed + packed_row * vec_hidden_dim + vec_col;
+
+  *dst_ptr = *src_ptr;
+}
+
 // Just copied from the origin
 __global__ void swiglu_interleaved_batched_fast_v2(
   const float *__restrict__ mlp1_out,  // [total_pairs, 2 * inter_dim]
@@ -710,6 +729,40 @@ __global__ void moe_agg_kernel_120b_ep(
   atomicAdd(&e_agg[(size_t)b * hidden_dim + h], val);
 }
 
+__global__ void moe_agg_kernel_120b_ep_optimized(
+  const float *__restrict__ tb3_ptr,   // [total_pairs, hidden_dim]
+  const int *__restrict__ sorted_ids,  // [total_pairs]
+  const float *__restrict__ topk_v,    // [batch_size, experts_per_token]
+  float *__restrict__ e_agg,           // [batch_size, hidden_dim]
+  int hidden_dim, int experts_per_token, int start_expert_offset, int end_expert_offset,
+  int active_rows) {
+  const int h = blockIdx.x * blockDim.x + threadIdx.x;
+  const int local_row = blockIdx.y * blockDim.y + threadIdx.y;
+  const int global_row = local_row + start_expert_offset;
+
+  if (h >= hidden_dim || local_row >= active_rows) {
+    return;
+  }
+
+  int lane = threadIdx.x & 63;
+  int pair = 0, b = 0, e = 0;
+  float w = 0.f;
+
+  if (lane == 0) {
+    pair = sorted_ids[global_row];
+    b = pair / experts_per_token;
+    e = pair % experts_per_token;
+    w = topk_v[(size_t)b * experts_per_token + e];
+  }
+
+  pair = __shfl(pair, 0);
+  b = __shfl(b, 0);
+  w = __shfl(w, 0);
+
+  const float val = tb3_ptr[(size_t)local_row * hidden_dim + h] * w;
+  atomicAdd(&e_agg[(size_t)b * hidden_dim + h], val);
+}
+
 static inline void moe_init_buffers(Tensor *e_agg, Tensor *mlp1_out, Tensor *gate_up, Tensor *tb3,
                                     TensorI32 *sorted_pair_ids, TensorI32 *expert_offsets,
                                     Tensor *x_packed, int batch_size, int hidden_dim,
@@ -751,6 +804,7 @@ static inline void moe_pack_inputs(
   TensorI32 *sorted_pair_ids,  // [batch_size * experts_per_token]
   Tensor *x_packed,            // [batch_size * experts_per_token, hidden_dim]
   int batch_size, int hidden_dim, int experts_per_token, hipStream_t stream) {
+#ifdef RUN_20B
   const float *x_ptr = (const float *)x_in->d_buf;
 
   const int total_pairs = batch_size * experts_per_token;
@@ -760,6 +814,21 @@ static inline void moe_pack_inputs(
   gather_inputs_by_sorted_kernel<<<grid_size, block_size, 0, stream>>>(
     x_ptr, sorted_pair_ids->d_buf, (float *)x_packed->d_buf, batch_size, hidden_dim,
     experts_per_token);
+#else
+  const int vec_hidden_dim = hidden_dim / 4;
+  const int total_pairs = batch_size * experts_per_token;
+
+  dim3 block_size(64, 8);
+  dim3 grid_size((vec_hidden_dim + block_size.x - 1) / block_size.x,
+                 (total_pairs + block_size.y - 1) / block_size.y);
+
+  // size_t shmem = block_size.y * sizeof(int);
+
+  gather_inputs_vectorized_kernel<<<grid_size, block_size, 0, stream>>>(
+    (const float4 *)x_in->d_buf, sorted_pair_ids->d_buf, (float4 *)x_packed->d_buf, vec_hidden_dim,
+    total_pairs, experts_per_token);
+
+#endif
 }
 
 // 3) lấy max số hàng trên mỗi expert từ offsets
@@ -938,14 +1007,15 @@ static inline void moe_scatter_aggregate_120b_ep(
   float *e_agg_ptr = (float *)e_agg->d_buf;
 
   const int total_pairs = sorted_pair_ids->shape[0];
+  const int active_rows = end_expert_offset - start_expert_offset;
 
-  dim3 block_size(64, 4, 1);
+  dim3 block_size(256);
   dim3 grid_size((hidden_dim + block_size.x - 1) / block_size.x,
-                 (total_pairs + block_size.y - 1) / block_size.y, 1);
+                 (active_rows + block_size.y - 1) / block_size.y, 1);
 
-  moe_agg_kernel_120b_ep<<<grid_size, block_size, 0, stream>>>(
-    tb3_ptr, sorted_pair_ptr, topk_v_ptr, e_agg_ptr, hidden_dim, experts_per_token, total_pairs,
-    start_expert_offset, end_expert_offset);
+  moe_agg_kernel_120b_ep_optimized<<<grid_size, block_size, 0, stream>>>(
+    tb3_ptr, sorted_pair_ptr, topk_v_ptr, e_agg_ptr, hidden_dim, experts_per_token,
+    start_expert_offset, end_expert_offset, active_rows);
 }
 
 static inline void moe_scatter_aggregate_120b(
