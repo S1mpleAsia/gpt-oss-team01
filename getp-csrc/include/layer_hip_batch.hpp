@@ -204,6 +204,9 @@ static inline void moe_scatter_aggregate_ep_hip(
   TensorI32 *expert_offsets,   // [n_experts+1]
   int hidden_dim, int experts_per_token, int n_experts, int max_rows_per_expert,
   int start_expert_offset, int end_expert_offset, hipStream_t stream);
+
+static inline void tensor_quantize(Tensor *src, Tensor *dst_quantize, hipStream_t stream);
+static inline void tensor_dequantize(Tensor *src, Tensor *dst_quantize, hipStream_t stream);
 /*  --------------  End MoE  --------------------  */
 
 static inline void moe_mlp1_batched(Tensor *t, Tensor *w_mlp1, Tensor *b_mlp1, TensorI32 *topk_idx,

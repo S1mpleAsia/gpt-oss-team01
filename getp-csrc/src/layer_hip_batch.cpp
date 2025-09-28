@@ -1580,6 +1580,44 @@ static inline void moe_scatter_aggregate_ep_hip(
                                 start_expert_offset, end_expert_offset, stream);
 }
 
+__global__ void quantize_kernel(const float *in, bf16 *out, int num_elems) {
+  int idx = blockDim.x * blockIdx.x + threadIdx.x;
+  if (idx >= num_elems) {
+    return;
+  }
+
+  out[idx] = bf16(in[idx]);
+}
+
+__global__ void dequantize_kernel(const bf16 *in, float *out, int num_elems) {
+  int idx = blockDim.x * blockIdx.x + threadIdx.x;
+  if (idx >= num_elems) {
+    return;
+  }
+
+  out[idx] = (float)in[idx];
+}
+
+static inline void tensor_quantize(Tensor *src, Tensor *dst_quantize, hipStream_t stream) {
+  const size_t num_elems = src->num_elem();
+
+  dim3 block_size(256);
+  dim3 grid_size((num_elems + block_size.x - 1) / block_size.x);
+
+  quantize_kernel<<<grid_size, block_size, 0, stream>>>((const float *)src->d_buf,
+                                                        (bf16 *)dst_quantize->d_buf, num_elems);
+}
+
+static inline void tensor_dequantize(Tensor *src, Tensor *dst_quantize, hipStream_t stream) {
+  const size_t num_elems = src->num_elem();
+
+  dim3 block_size(256);
+  dim3 grid_size((num_elems + block_size.x - 1) / block_size.x);
+
+  dequantize_kernel<<<grid_size, block_size, 0, stream>>>((const bf16 *)dst_quantize->d_buf,
+                                                          (float *)src->d_buf, num_elems);
+}
+
 static inline void moe_scatter_aggregate_hip_120b(
   Tensor *tb3,                 // [total_pairs, hidden_dim]
   TensorI32 *sorted_pair_ids,  // [batch_size * experts_per_token]
@@ -1860,6 +1898,7 @@ void max_logits_batched(Tensor *logits, Tensor *logits_max, TensorI32 *logits_id
                         int cur_batch_size, int tp_rank, bool logits_to_device,
                         bool logits_max_from_device, bool logits_id_from_device,
                         hipStream_t stream) {
+  // GpuTimer timer("max_logits");
   if (logits_to_device) {
     logits->to_device(stream);
   }
@@ -1933,6 +1972,8 @@ void reduce_logits_batched(Tensor *logits_max_total, TensorI32 *logits_id_total,
                            bool logits_max_total_to_device, bool logits_id_total_to_device,
                            bool logits_max_from_device, bool logits_id_from_device,
                            hipStream_t stream) {
+  // GpuTimer timer("reduce_logits");
+
   if (logits_max_total_to_device) {
     logits_max_total->to_device(stream);
   }

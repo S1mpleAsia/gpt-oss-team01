@@ -31,6 +31,13 @@ __global__ void add_vector_kernel_direct(float *c, const float *a, const float *
   }
 }
 
+__global__ void add_vector_kernel_bf16(bf16 *y, const bf16 *b, int len) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < len) {
+    y[i] += b[i];
+  }
+}
+
 void all_gather_x(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
                   int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream,
                   hipEvent_t tp_ready, hipEvent_t tp_finish) {
@@ -764,6 +771,61 @@ void ring_all_reduce_tb2(OurRunState *rs_now, OurRunState *rs_leader, int tp_ran
   }
 }
 
+void ring_all_reduce_tb2_quantize(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank,
+                                  int cur_device, int cur_batch_size, pthread_barrier_t *tp_barrier,
+                                  hipStream_t stream) {
+  // GpuTimer timer("ring_all_reduce_tb2", stream);
+
+  bf16 *d_buf_now = (bf16 *)rs_now->tb2_quantize->d_buf;
+  size_t hidden_dim = rs_now->tb2_quantize->shape[1];
+  size_t total_elems = cur_batch_size * hidden_dim;
+  size_t chunk_elems = total_elems / TP;
+  size_t chunk_bytes = chunk_elems * rs_now->tb2_quantize->get_dtype_size();
+
+  int left_peer_rank = (tp_rank - 1 + TP) % TP;
+  OurRunState *rs_left = &rs_leader[left_peer_rank];
+  int left_device = cur_device - tp_rank + left_peer_rank;
+
+  void *tmp_ptr = rs_now->tb2_recv->d_buf;
+
+  const int block_size = 256;
+  const int grid_size = (chunk_elems + block_size - 1) / block_size;
+
+  CHECK_HIP(hipStreamSynchronize(stream));
+  pthread_barrier_wait(tp_barrier);
+
+  for (int i = 0; i < TP - 1; ++i) {
+    int chunk_idx = (tp_rank - i - 1 + TP) % TP;
+    size_t chunk_offset = chunk_idx * chunk_elems;
+
+    const bf16 *left_src_ptr = (const bf16 *)rs_left->tb2_quantize->d_buf + chunk_offset;
+    bf16 *dst_local_ptr = d_buf_now + chunk_offset;
+
+    CHECK_HIP(
+      hipMemcpyPeerAsync(tmp_ptr, cur_device, left_src_ptr, left_device, chunk_bytes, stream));
+
+    add_vector_kernel_bf16<<<grid_size, block_size, 0, stream>>>(
+      dst_local_ptr, (const bf16 *)tmp_ptr, chunk_elems);
+
+    CHECK_HIP(hipStreamSynchronize(stream));
+    pthread_barrier_wait(tp_barrier);
+  }
+
+  for (int i = 0; i < TP - 1; i++) {
+    int send_chunk_idx = (tp_rank - i + TP) % TP;
+    size_t chunk_offset = send_chunk_idx * chunk_elems;
+
+    const bf16 *left_src_ptr = (const bf16 *)rs_left->tb2_quantize->d_buf + chunk_offset;
+    bf16 *dst_local_ptr = d_buf_now + chunk_offset;
+
+    CHECK_HIP(hipMemcpyPeerAsync(dst_local_ptr, cur_device, left_src_ptr, left_device, chunk_bytes,
+                                 stream));
+
+    CHECK_HIP(hipStreamSynchronize(stream));
+    pthread_barrier_wait(tp_barrier);
+  }
+}
+
 void all_gather_classifier_final(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank,
                                  int cur_device, int cur_batch_size, pthread_barrier_t *tp_barrier,
                                  hipStream_t stream, hipEvent_t tp_ready, hipEvent_t tp_finish) {
@@ -832,6 +894,7 @@ void all_gather_classifier_v2(OurRunState *rs_now, OurRunState *rs_leader, int t
 void all_gather_logits_id(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
                           int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream,
                           hipEvent_t tp_ready, hipEvent_t tp_finish) {
+  // GpuTimer timer("all_gather_logits");
   const float *src_max_buf = (const float *)rs_now->logits_max->d_buf;
   size_t dst_max_offset = 1ll * tp_rank * rs_leader->logits_max_total->shape[1];
   float *dst_max_buf = (float *)rs_leader->logits_max_total->d_buf + dst_max_offset;
@@ -1033,6 +1096,61 @@ void ring_reduce_agg(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, i
 
     const float *left_src_ptr = (const float *)rs_left->e_agg->d_buf + chunk_offset;
     float *dst_local_ptr = d_buf_now + chunk_offset;
+
+    CHECK_HIP(hipMemcpyPeerAsync(dst_local_ptr, cur_device, left_src_ptr, left_device, chunk_bytes,
+                                 stream));
+
+    CHECK_HIP(hipStreamSynchronize(stream));
+    pthread_barrier_wait(tp_barrier);
+  }
+}
+
+void ring_reduce_agg_quantize(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank,
+                              int cur_device, int cur_batch_size, pthread_barrier_t *tp_barrier,
+                              hipStream_t stream) {
+  // GpuTimer timer("ring_reduce_agg", stream);
+
+  bf16 *d_buf_now = (bf16 *)rs_now->e_agg_quantize->d_buf;
+  size_t hidden_dim = rs_now->e_agg_quantize->shape[1];
+  size_t total_elems = cur_batch_size * hidden_dim;
+  size_t chunk_elems = total_elems / TP;
+  size_t chunk_bytes = chunk_elems * rs_now->e_agg_quantize->get_dtype_size();
+
+  int left_peer_rank = (tp_rank - 1 + TP) % TP;
+  OurRunState *rs_left = &rs_leader[left_peer_rank];
+  int left_device = cur_device - tp_rank + left_peer_rank;
+
+  void *tmp_ptr = rs_now->e_agg_recv->d_buf;
+
+  const int block_size = 256;
+  const int grid_size = (chunk_elems + block_size - 1) / block_size;
+
+  CHECK_HIP(hipStreamSynchronize(stream));
+  pthread_barrier_wait(tp_barrier);
+
+  for (int i = 0; i < TP - 1; ++i) {
+    int chunk_idx = (tp_rank - i - 1 + TP) % TP;
+    size_t chunk_offset = chunk_idx * chunk_elems;
+
+    const bf16 *left_src_ptr = (const bf16 *)rs_left->e_agg_quantize->d_buf + chunk_offset;
+    bf16 *dst_local_ptr = d_buf_now + chunk_offset;
+
+    CHECK_HIP(
+      hipMemcpyPeerAsync(tmp_ptr, cur_device, left_src_ptr, left_device, chunk_bytes, stream));
+
+    add_vector_kernel_bf16<<<grid_size, block_size, 0, stream>>>(
+      dst_local_ptr, (const bf16 *)tmp_ptr, chunk_elems);
+
+    CHECK_HIP(hipStreamSynchronize(stream));
+    pthread_barrier_wait(tp_barrier);
+  }
+
+  for (int i = 0; i < TP - 1; i++) {
+    int send_chunk_idx = (tp_rank - i + TP) % TP;
+    size_t chunk_offset = send_chunk_idx * chunk_elems;
+
+    const bf16 *left_src_ptr = (const bf16 *)rs_left->e_agg_quantize->d_buf + chunk_offset;
+    bf16 *dst_local_ptr = d_buf_now + chunk_offset;
 
     CHECK_HIP(hipMemcpyPeerAsync(dst_local_ptr, cur_device, left_src_ptr, left_device, chunk_bytes,
                                  stream));

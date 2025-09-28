@@ -265,7 +265,10 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
     reduce_tb2_new(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream,
                    tp_ready, tp_finish);
 #else
-    ring_all_reduce_tb2(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream);
+    tensor_quantize(rs_now->tb2, rs_now->tb2_quantize, stream);
+    ring_all_reduce_tb2_quantize(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier,
+                                 stream);
+    tensor_dequantize(rs_now->tb2, rs_now->tb2_quantize, stream);
     // reduce_tb2_full_tp(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream,
     //                    tp_ready, tp_finish);
 #endif
@@ -399,7 +402,10 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
     reduce_agg(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready,
                tp_finish);
 #else
-    ring_reduce_agg(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream);
+    tensor_quantize(rs_now->e_agg, rs_now->e_agg_quantize, stream);
+    ring_reduce_agg_quantize(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier,
+                             stream);
+    tensor_dequantize(rs_now->e_agg, rs_now->e_agg_quantize, stream);
     // reduce_agg_full_tp(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream,
     //                    tp_ready, tp_finish);
 #endif

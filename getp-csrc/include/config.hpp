@@ -78,6 +78,7 @@ typedef struct {
   Tensor *tb2;  // (hidden_dim, )
   Tensor *tb2_buf;
   Tensor *tb2_recv;
+  Tensor *tb2_quantize;
   Tensor *tb3;  // (BATCH_SIZE, experts_per_token)
   Tensor *tb3_buf;
   Tensor *tb3_recv;
@@ -91,6 +92,7 @@ typedef struct {
   Tensor *e_agg;    // [batch_size, hidden_dim]
   Tensor *e_agg_buf;
   Tensor *e_agg_recv;
+  Tensor *e_agg_quantize;
   Tensor *qkv;  // an additional buffer just for convenience (head_dim *
                 // (n_attn_heads + 2 * n_kv_heads), )
   Tensor *tmp_qkv;
