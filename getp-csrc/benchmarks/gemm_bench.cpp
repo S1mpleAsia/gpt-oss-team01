@@ -10,6 +10,8 @@
 #include <rocblas/rocblas.h>
 #endif
 
+
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -49,6 +51,8 @@ using bf16 = hip_bfloat16;
   } while (0)
 #endif
 
+
+
 // ----------------- Utils -----------------
 struct GemmProblem {
   int M, N, K;
@@ -79,6 +83,15 @@ static float rel_l2_err(const std::vector<float> &a, const std::vector<float> &b
     den += (long double)b[i] * b[i];
   }
   return den > 0 ? (float)std::sqrt((double)(num / den)) : 0.f;
+}
+
+// ----------------- f32 -> bf16 conversion kernel -----------------
+__global__ void fp32_to_bf16_kernel(const float *__restrict__ fp32_in, bf16 *__restrict__ bf16_out,
+                                    size_t n) {
+  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t s = gridDim.x * blockDim.x;
+  for (; i < n; i += s)
+    bf16_out[i] = (bf16)fp32_in[i];
 }
 
 // ----------------- bf16 -> f32 conversion kernel -----------------
@@ -115,41 +128,43 @@ static float bench_custom(const float *dA_f32, const bf16 *dB_bf16, float *dC, i
 }
 
 #if WITH_ROCBLAS
-// ----------------- Bench: rocBLAS FP32 SGEMM -----------------
-// Row-major mapping (safe):
-//   C_r[M,N] = A_r[M,K] * B_r[K,N]
-// Call as column-major NN with swapped m/n and operands:
-//   m=N, n=M, k=K
-//   A := B_r (aliased as col-major N×K), lda=N
-//   B := A_r (aliased as col-major K×M), ldb=K
-//   C ldc=N (interprets C as col-major N×M)
-static float bench_rocblas_sgemm_rowmajor(const float *dA_r, const bf16 *dB_r_bf16, float *dC_r,
-                                          int M, int N, int K, hipStream_t stream,
-                                          rocblas_handle handle, int iters) {
+// ----------------- Bench: rocBLAS BF16 GEMM (A=BF16, B=BF16, C=FP32) -----------------
+static float bench_rocblas_bf16_rowmajor(const float *dA_r_f32, const bf16 *dB_r_bf16, float *dC_r,
+                                         int M, int N, int K, hipStream_t stream,
+                                         rocblas_handle handle, int iters) {
   CHECK_HIP(hipMemsetAsync(dC_r, 0, sizeof(float) * (size_t)M * N, stream));
 
-  // Convert B (bf16) -> f32 once on device
-  float *dB_r_f32 = nullptr;
-  const size_t size_b = (size_t)K * N;
-  CHECK_HIP(hipMalloc(&dB_r_f32, sizeof(float) * size_b));
-  const int tpb = 256, blocks = (int)((size_b + tpb - 1) / tpb);
-  hipLaunchKernelGGL(bf16_to_fp32_kernel, dim3(blocks), dim3(tpb), 0, stream, dB_r_bf16, dB_r_f32,
-                     size_b);
+  // Convert A (fp32) -> bf16 on device
+  bf16 *dA_r_bf16 = nullptr;
+  const size_t size_a = (size_t)M * K;
+  CHECK_HIP(hipMalloc(&dA_r_bf16, sizeof(bf16) * size_a));
+  const int tpb = 256;
+  int blocks_a = (int)((size_a + tpb - 1) / tpb);
+  hipLaunchKernelGGL(fp32_to_bf16_kernel, dim3(blocks_a), dim3(tpb), 0, stream, dA_r_f32, dA_r_bf16, size_a);
   CHECK_HIP(hipStreamSynchronize(stream));
 
   const float alpha = 1.f, beta = 0.f;
-  auto sgemm_nn = [&]() {
-    return rocblas_sgemm(handle, rocblas_operation_none, rocblas_operation_none,
-                         /*m=*/N, /*n=*/M, /*k=*/K, &alpha,
-                         /*A=*/dB_r_f32, /*lda=*/N,  // B_r
-                         /*B=*/dA_r, /*ldb=*/K,      // A_r
-                         &beta,
-                         /*C=*/dC_r, /*ldc=*/N);  // C as col-major N×M (row-major M×N)
+  
+  // BF16 GEMM: C[FP32] = A[BF16] * B[BF16]
+  // Row-major mapping: C_r[M,N] = A_r[M,K] * B_r[K,N]
+  // Call as column-major NN with swapped m/n and operands:
+  auto bf16_gemm_nn = [&]() {
+    return rocblas_gemm_ex(handle, 
+                          rocblas_operation_none, rocblas_operation_none,
+                          /*m=*/N, /*n=*/M, /*k=*/K, 
+                          &alpha,
+                          /*A=*/dB_r_bf16, rocblas_datatype_bf16_r, /*lda=*/N,  // B_r as A
+                          /*B=*/dA_r_bf16, rocblas_datatype_bf16_r, /*ldb=*/K,  // A_r as B
+                          &beta,
+                          /*C=*/dC_r, rocblas_datatype_f32_r, /*ldc=*/N,       // C
+                          /*D=*/dC_r, rocblas_datatype_f32_r, /*ldd=*/N,       // D
+                          rocblas_datatype_f32_r,  // compute type
+                          rocblas_gemm_algo_standard, 0, 0);
   };
 
   // warmup
   for (int i = 0; i < 3; ++i)
-    CHECK_ROCBLAS(sgemm_nn());
+    CHECK_ROCBLAS(bf16_gemm_nn());
   CHECK_HIP(hipStreamSynchronize(stream));
 
   // timed
@@ -158,7 +173,7 @@ static float bench_rocblas_sgemm_rowmajor(const float *dA_r, const bf16 *dB_r_bf
   CHECK_HIP(hipEventCreate(&stop));
   CHECK_HIP(hipEventRecord(start, stream));
   for (int i = 0; i < iters; ++i)
-    CHECK_ROCBLAS(sgemm_nn());
+    CHECK_ROCBLAS(bf16_gemm_nn());
   CHECK_HIP(hipEventRecord(stop, stream));
   CHECK_HIP(hipEventSynchronize(stop));
   float ms = 0.f;
@@ -166,10 +181,12 @@ static float bench_rocblas_sgemm_rowmajor(const float *dA_r, const bf16 *dB_r_bf
 
   CHECK_HIP(hipEventDestroy(start));
   CHECK_HIP(hipEventDestroy(stop));
-  CHECK_HIP(hipFree(dB_r_f32));
+  CHECK_HIP(hipFree(dA_r_bf16));
   return ms / (float)iters;
 }
 #endif
+
+
 
 // ----------------- main -----------------
 int main(int argc, char **argv) {
@@ -232,10 +249,10 @@ int main(int argc, char **argv) {
     // --- custom
     float ms_custom = bench_custom(dA, dB, dC_custom, M, N, K, stream, iters);
 
-    // --- rocBLAS (FP32)
+    // --- rocBLAS (BF16×BF16→FP32)
     float ms_rocblas = NAN;
 #if WITH_ROCBLAS
-    ms_rocblas = bench_rocblas_sgemm_rowmajor(dA, dB, dC_rocblas, M, N, K, stream, handle, iters);
+    ms_rocblas = bench_rocblas_bf16_rowmajor(dA, dB, dC_rocblas, M, N, K, stream, handle, iters);
 #endif
 
     // Copy back & compare
@@ -247,15 +264,15 @@ int main(int argc, char **argv) {
 #endif
 
     const double gflops = (2.0 * (double)M * N * K) * 1e-6;
-    std::cout << "  gemm_mfma_v2            : " << ms_custom << " ms  (" << (gflops / ms_custom)
+    std::cout << "  gemm_mfma_v2 (A=FP32,B=BF16): " << ms_custom << " ms  (" << (gflops / ms_custom)
               << " GFLOP/s)\n";
 #if WITH_ROCBLAS
-    std::cout << "  rocBLAS (SGEMM NN map)  : " << ms_rocblas << " ms  (" << (gflops / ms_rocblas)
+    std::cout << "  rocBLAS (BF16×BF16→FP32)    : " << ms_rocblas << " ms  (" << (gflops / ms_rocblas)
               << " GFLOP/s)\n";
-    std::cout << "  diff custom vs rocBLAS  : max|diff|=" << max_abs_diff(hC_custom, hC_rocblas)
+    std::cout << "  diff custom vs rocBLAS      : max|diff|=" << max_abs_diff(hC_custom, hC_rocblas)
               << ", rel L2=" << rel_l2_err(hC_custom, hC_rocblas) << "\n";
 #else
-    std::cout << "  rocBLAS                 : disabled (compile WITH_ROCBLAS=1)\n";
+    std::cout << "  rocBLAS                     : disabled (compile WITH_ROCBLAS=1)\n";
 #endif
     std::cout << std::string(60, '-') << "\n";
 
