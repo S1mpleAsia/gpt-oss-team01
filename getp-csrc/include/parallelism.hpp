@@ -45,6 +45,9 @@ void ring_all_reduce_tb2(OurRunState *rs_now, OurRunState *rs_leader, int tp_ran
 void ring_all_reduce_tb2_quantize(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank,
                                   int cur_device, int cur_batch_size, pthread_barrier_t *tp_barrier,
                                   hipStream_t stream);
+void ring_all_reduce_tb2_quantize_fp8(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank,
+                                      int cur_device, int cur_batch_size,
+                                      pthread_barrier_t *tp_barrier, hipStream_t stream);
 
 void all_gather_classifier_v2(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank,
                               int cur_device, int cur_batch_size, pthread_barrier_t *tp_barrier,
@@ -72,6 +75,9 @@ void ring_reduce_agg(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, i
 void ring_reduce_agg_quantize(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank,
                               int cur_device, int cur_batch_size, pthread_barrier_t *tp_barrier,
                               hipStream_t stream);
+void ring_reduce_agg_quantize_fp8(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank,
+                                  int cur_device, int cur_batch_size, pthread_barrier_t *tp_barrier,
+                                  hipStream_t stream);
 
 void reduce_agg_full_tp(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
                         int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream,

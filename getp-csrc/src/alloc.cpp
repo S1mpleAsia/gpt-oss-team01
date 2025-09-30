@@ -856,12 +856,12 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   // rs->tb_buf = new Tensor({BATCH_SIZE, (size_t)p->head_dim * p->n_attn_heads / TP}, stream);
 
   rs->tb2 = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
-  rs->tb2_quantize = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream, DType::BF16);
+  rs->tb2_quantize = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream, DType::FP8);
 #if TP == 4
   // rs->tb2_recv = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / TP}, stream);
   rs->tb2_buf = new Tensor({TP / 2, BATCH_SIZE, (size_t)p->hidden_dim}, stream);
 #else
-  rs->tb2_recv = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / TP}, stream, DType::BF16);
+  rs->tb2_recv = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / TP}, stream, DType::FP8);
 // rs->tb2_buf = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
 #endif
 
@@ -883,12 +883,12 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
     new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
 
   rs->e_agg = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
-  rs->e_agg_quantize = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream, DType::BF16);
+  rs->e_agg_quantize = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream, DType::FP8);
   // rs->e_agg_recv = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / TP}, stream, DType::BF16);
 
 #if TP == 8
   // rs->e_agg_buf = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
-  rs->e_agg_recv = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / TP}, stream, DType::BF16);
+  rs->e_agg_recv = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / TP}, stream, DType::FP8);
 #endif
 
   rs->qkv = new Tensor(

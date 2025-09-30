@@ -8,7 +8,14 @@ Tensor::Tensor(const vector<size_t> &shape_, hipStream_t stream, DType::Type dty
   size_t N_ = num_elem();
   buf = (float *)calloc(N_, sizeof(float));
 
-  size_t d_size = (dtype == DType::FP32) ? N_ * sizeof(float) : N_ * sizeof(bf16);
+  size_t d_size = 0;
+  if (dtype == DType::FP32)
+    d_size = N_ * sizeof(float);
+  else if (dtype == DType::BF16)
+    d_size = N_ * sizeof(bf16);
+  else if (dtype == DType::FP8)
+    d_size = N_ * sizeof(fp8);
+  // size_t d_size = (dtype == DType::FP32) ? N_ * sizeof(float) : N_ * sizeof(bf16);
   CHECK_HIP(hipMalloc(&d_buf, d_size));
   CHECK_HIP(hipMemsetAsync(d_buf, 0, d_size, stream));
 }
@@ -19,7 +26,14 @@ Tensor::Tensor(const vector<size_t> &shape_, float *buf_, hipStream_t stream, DT
   ndim = shape_.size();
   size_t N_ = num_elem();
 
-  size_t d_size = (dtype == DType::FP32) ? N_ * sizeof(float) : N_ * sizeof(bf16);
+  size_t d_size = 0;
+  if (dtype == DType::FP32)
+    d_size = N_ * sizeof(float);
+  else if (dtype == DType::BF16)
+    d_size = N_ * sizeof(bf16);
+  else if (dtype == DType::FP8)
+    d_size = N_ * sizeof(fp8);
+  // size_t d_size = (dtype == DType::FP32) ? N_ * sizeof(float) : N_ * sizeof(bf16);
   CHECK_HIP(hipMalloc(&d_buf, d_size));
 
   if (to_device_init)
@@ -79,6 +93,8 @@ size_t Tensor::get_dtype_size() const {
     return sizeof(float);
   } else if (dtype == DType::BF16) {
     return sizeof(bf16);
+  } else if (dtype == DType::FP8) {
+    return sizeof(fp8);
   }
   return 0;  // Or handle as an error
 }

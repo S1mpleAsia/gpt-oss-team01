@@ -1599,6 +1599,7 @@ __global__ void dequantize_kernel(const bf16 *in, float *out, int num_elems) {
 }
 
 static inline void tensor_quantize(Tensor *src, Tensor *dst_quantize, hipStream_t stream) {
+  // GpuTimer timer("tensor_quantize");
   const size_t num_elems = src->num_elem();
 
   dim3 block_size(256);
@@ -1609,6 +1610,7 @@ static inline void tensor_quantize(Tensor *src, Tensor *dst_quantize, hipStream_
 }
 
 static inline void tensor_dequantize(Tensor *src, Tensor *dst_quantize, hipStream_t stream) {
+  // GpuTimer timer("tensor_dequantize");
   const size_t num_elems = src->num_elem();
 
   dim3 block_size(256);
@@ -1617,6 +1619,59 @@ static inline void tensor_dequantize(Tensor *src, Tensor *dst_quantize, hipStrea
   dequantize_kernel<<<grid_size, block_size, 0, stream>>>((const bf16 *)dst_quantize->d_buf,
                                                           (float *)src->d_buf, num_elems);
 }
+
+/* FP8 Quantization */
+__device__ __forceinline__ fp8 convert_float_to_fp8(float in, __hip_fp8_interpretation_t interpret,
+                                                    __hip_saturation_t sat) {
+  return __hip_cvt_float_to_fp8(in, sat, interpret);
+}
+
+__device__ __forceinline__ float convert_fp8_to_float(fp8 in,
+                                                      __hip_fp8_interpretation_t interpret) {
+  __half hf = __hip_cvt_fp8_to_halfraw(in, interpret);
+  return hf;
+}
+
+__global__ void quantize_kernel_fp8(const float *in, fp8 *out, int num_elems) {
+  int idx = blockDim.x * blockIdx.x + threadIdx.x;
+  if (idx >= num_elems) {
+    return;
+  }
+
+  out[idx] = convert_float_to_fp8(in[idx], __HIP_E5M2_FNUZ, __HIP_SATFINITE);
+}
+
+__global__ void dequantize_kernel_fp8(const fp8 *in, float *out, int num_elems) {
+  int idx = blockDim.x * blockIdx.x + threadIdx.x;
+  if (idx >= num_elems) {
+    return;
+  }
+
+  out[idx] = convert_fp8_to_float(in[idx], __HIP_E5M2_FNUZ);
+}
+
+static inline void tensor_quantize_fp8(Tensor *src, Tensor *dst_quantize, hipStream_t stream) {
+  // GpuTimer timer("tensor_quantize_fp8");
+  const size_t num_elems = src->num_elem();
+
+  dim3 block_size(256);
+  dim3 grid_size((num_elems + block_size.x - 1) / block_size.x);
+  quantize_kernel_fp8<<<grid_size, block_size, 0, stream>>>((const float *)src->d_buf,
+                                                            (fp8 *)dst_quantize->d_buf, num_elems);
+}
+
+static inline void tensor_dequantize_fp8(Tensor *src, Tensor *dst_quantize, hipStream_t stream) {
+  // GpuTimer timer("tensor_dequantize_fp8");
+
+  const size_t num_elems = src->num_elem();
+
+  dim3 block_size(256);
+  dim3 grid_size((num_elems + block_size.x - 1) / block_size.x);
+
+  dequantize_kernel_fp8<<<grid_size, block_size, 0, stream>>>((const fp8 *)dst_quantize->d_buf,
+                                                              (float *)src->d_buf, num_elems);
+}
+/* FP8 Quantization */
 
 static inline void moe_scatter_aggregate_hip_120b(
   Tensor *tb3,                 // [total_pairs, hidden_dim]

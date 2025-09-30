@@ -6,13 +6,15 @@
 #include <vector>
 #include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
+#include <hip/hip_fp8.h>
 
 using std::vector;
 
 typedef hip_bfloat16 bf16;
+typedef __hip_fp8_storage_t fp8;
 
 struct DType {
-  enum Type { FP32, BF16 };
+  enum Type { FP32, BF16, FP8 };
 };
 
 #define CHECK_HIP(call)                                                                            \
