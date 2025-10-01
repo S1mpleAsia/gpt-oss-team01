@@ -8,17 +8,17 @@
 // #include "config_run.hpp"
 #include "pipeline.hpp"
 
-#define BATCH_SIZE 3600
+#define BATCH_SIZE 896
 #define PP_SLOT 1
 #define KV16
 // #define PRINT_LOGITS
 #define TIME_GPU
 // #define DEBUG
-// #define RUN_20B
+#define RUN_20B
 #define RUN_EP
 
 #ifdef RUN_20B
-#define DP 8
+#define DP 1
 #define PP 1
 #define TP 1
 #else
@@ -105,6 +105,10 @@ typedef struct {
   // kv cache
   Tensor *key_cache;    // (layer, seq_len, kv_dim)
   Tensor *value_cache;  // (layer, seq_len, kv_dim)
+  Tensor *key_cache_odd;
+  Tensor *value_cache_odd;
+  Tensor *key_cache_even;
+  Tensor *value_cache_even;
   Tensor *mask;
 
   // MoE buffer

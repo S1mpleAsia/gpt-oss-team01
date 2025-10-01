@@ -79,7 +79,7 @@ __global__ FA_WAVES_EU
 __launch_bounds__(FA_THREADS, FA_MIN_BLOCKS_PER_CU) void flash_fused_bf16_kernel_tiled(
   const float *__restrict__ q, const bf16 *__restrict__ K_cache, const bf16 *__restrict__ V_cache,
   const float *__restrict__ attn_sinks, float *__restrict__ tb, int n_q, int kv_mul, int kv_dim,
-  int n_layers, int seq_len, int t_begin, int t_end, int batch_size, int head_stride_out) {
+  int n_layers, int seq_len, int pos_begin, int pos_end, int batch_size, int head_stride_out) {
   static_assert(D == 64, "");
   static_assert(D % G == 0, "");
   static_assert((D / G) % LOAD_ELEMS == 0, "");
@@ -91,7 +91,7 @@ __launch_bounds__(FA_THREADS, FA_MIN_BLOCKS_PER_CU) void flash_fused_bf16_kernel
     return;
 
   const int kv_h = h / kv_mul;
-  const int T_full = t_end - t_begin;
+  const int T_full = pos_end - pos_begin;
   if (T_full <= 0) {
     for (int i = threadIdx.x; i < D; i += blockDim.x)
       tb[b * head_stride_out + h * D + i] = 0.f;
@@ -150,7 +150,7 @@ __launch_bounds__(FA_THREADS, FA_MIN_BLOCKS_PER_CU) void flash_fused_bf16_kernel
       float tmp = 0.f;
 
       if (t < T_tile) {
-        const int tok = t_begin + t0 + t;
+        const int tok = (pos_begin + t0 + t) & (seq_len - 1);
 #pragma unroll
         for (int it = 0; it < groupIters; ++it) {
           const int d0 = (it * G + glane) * LOAD_ELEMS;
@@ -235,7 +235,7 @@ __launch_bounds__(FA_THREADS, FA_MIN_BLOCKS_PER_CU) void flash_fused_bf16_kernel
       const int t = base + gid;
       if (t >= T_tile)
         continue;
-      const int tok = t_begin + t0 + t;
+      const int tok = (pos_begin + t0 + t) & (seq_len - 1);
       const float wP = S_smem[t];
 #pragma unroll
       for (int it = 0; it < groupIters; ++it) {
@@ -304,7 +304,7 @@ template <int TILE_TOKENS, int THREADS, int D, int G, int LOAD_ELEMS>
 __global__ FA_WAVES_EU __launch_bounds__(THREADS) void fd_partial_kernel_bf16_grouped(
   const float *__restrict__ q, const bf16 *__restrict__ K_cache, const bf16 *__restrict__ V_cache,
   float *__restrict__ partial_max, float *__restrict__ partial_sum, float *__restrict__ partial_num,
-  int n_q, int kv_mul, int kv_dim, int n_layers, int seq_len, int t_begin, int t_end,
+  int n_q, int kv_mul, int kv_dim, int n_layers, int seq_len, int pos_begin, int pos_end,
   int batch_size, int chunk) {
   static_assert(D == 64, "");
   static_assert(D % G == 0, "");
@@ -320,8 +320,8 @@ __global__ FA_WAVES_EU __launch_bounds__(THREADS) void fd_partial_kernel_bf16_gr
     return;
 
   const int kv_h = h / kv_mul;
-  const int start = t_begin + cidx * TILE_TOKENS;
-  const int stop = min(t_end, start + TILE_TOKENS);
+  const int start = pos_begin + cidx * TILE_TOKENS;
+  const int stop = min(pos_end, start + TILE_TOKENS);
   const int T = max(0, stop - start);
 
   const size_t qtb_stride = (size_t)n_q * D;
@@ -368,7 +368,8 @@ __global__ FA_WAVES_EU __launch_bounds__(THREADS) void fd_partial_kernel_bf16_gr
 #pragma unroll
       for (int it = 0; it < groupIters; ++it) {
         const int d0 = (it * G + glane) * LOAD_ELEMS;
-        const size_t base_k = (size_t)(start + t) * (size_t)kv_dim + kv_head_off + d0;
+        const size_t base_k =
+          (size_t)((start + t) & (seq_len - 1)) * (size_t)kv_dim + kv_head_off + d0;
 
         const uint32_t w0 = ld_u32(
           reinterpret_cast<const uint32_t *>(reinterpret_cast<const uint16_t *>(Kb) + base_k + 0));
@@ -440,7 +441,8 @@ __global__ FA_WAVES_EU __launch_bounds__(THREADS) void fd_partial_kernel_bf16_gr
 #pragma unroll 8
     for (int t = 0; t < T; ++t) {
       const float w = s_sc[t];
-      const size_t base = (size_t)(start + t) * (size_t)kv_dim + kv_head_off + (size_t)i_out;
+      const size_t base =
+        (size_t)((start + t) & (seq_len - 1)) * (size_t)kv_dim + kv_head_off + (size_t)i_out;
       const uint32_t vp =
         ld_u32(reinterpret_cast<const uint32_t *>(reinterpret_cast<const uint16_t *>(Vb) + base));
       const uint16_t v0 = (uint16_t)(vp & 0xFFFF);
@@ -499,14 +501,18 @@ __global__ void fd_reduce_kernel_stable_v2(const float *__restrict__ partial_max
     out[i] = (float)(num_i / denom);
 }
 
-void single_query_attn_flash_batched(Tensor *q, Tensor *K_cache, Tensor *V_cache, Tensor *mask,
-                                     Tensor *attn_sinks, Tensor *tb, Tensor *g_fa_pmax,
-                                     Tensor *g_fa_psum, Tensor *g_fa_pnum, int cur_batch_size,
-                                     int head_dim, int n_q, int kv_mul, int kv_dim, int seq_len,
-                                     int sliding_window, int pos, long long layer_offset,
-                                     bool q_to_device, bool k_cache_to_device,
-                                     bool v_cache_to_device, bool mask_to_device,
-                                     bool tb_from_device, hipStream_t stream) {
+void single_query_attn_flash_batched(Tensor *q,       /* (batch_size, n_attn_heads * head_dim) */
+                                     Tensor *K_cache, /* (batch_size, n_layers, seq_len, kv_dim)*/
+                                     Tensor *V_cache, /* (batch_size, n_layers, seq_len, kv_dim)*/
+                                     Tensor *mask,    /* (batch_size, seq_len, seq_len)*/
+                                     Tensor *attn_sinks, /* (n_layers, n_attn_heads) */
+                                     Tensor *tb,         /* (batch_size, n_attn_heads * head_dim)*/
+                                     Tensor *g_fa_pmax, Tensor *g_fa_psum, Tensor *g_fa_pnum,
+                                     int cur_batch_size, int head_dim, int n_q, int kv_mul,
+                                     int kv_dim, int seq_len, int sliding_window, int pos,
+                                     long long layer_offset, bool q_to_device,
+                                     bool k_cache_to_device, bool v_cache_to_device,
+                                     bool mask_to_device, bool tb_from_device, hipStream_t stream) {
   if (head_dim != 64) {
     fprintf(stderr, "This kernel only supports head_dim 64, got %d.\n", head_dim);
     abort();
@@ -519,19 +525,22 @@ void single_query_attn_flash_batched(Tensor *q, Tensor *K_cache, Tensor *V_cache
   if (v_cache_to_device)
     V_cache->to_device(stream);
 
-  const size_t n_layers = (size_t)K_cache->shape[1];
-  const size_t layer_span = (size_t)seq_len * kv_dim;
-  const bf16 *K_ptr = ((const bf16 *)K_cache->d_buf) + layer_offset * layer_span;
-  const bf16 *V_ptr = ((const bf16 *)V_cache->d_buf) + layer_offset * layer_span;
+  const size_t cache_seq_len = K_cache->shape[2];
+  const size_t n_layers = K_cache->shape[1];
+  const size_t layer_span = cache_seq_len * kv_dim;
+
+  const long long local_layer_offset = layer_offset / 2;
+  const bf16 *K_ptr = (const bf16 *)K_cache->d_buf + local_layer_offset * layer_span;
+  const bf16 *V_ptr = (const bf16 *)V_cache->d_buf + local_layer_offset * layer_span;
   const float *S_ptr = (const float *)attn_sinks->d_buf + layer_offset * n_q;
 
   const int attn_len = pos + 1;
   const bool use_window = (sliding_window > 0) && ((layer_offset & 1ll) == 0);
-  const int L_eff = use_window ? min(attn_len, sliding_window) : attn_len;
-  const int t_end = attn_len;
-  const int t_begin = t_end - L_eff;
+  const int active_len = use_window ? min(attn_len, sliding_window) : attn_len;
+  const int pos_end = attn_len;
+  const int pos_begin = pos_end - active_len;
 
-  if (L_eff > FA_TILE) {
+  if (active_len > FA_TILE) {
     dim3 grid(n_q, cur_batch_size);
     dim3 block(FA_THREADS);
     const size_t shmem_bytes = (size_t)FA_TILE * sizeof(float);
@@ -539,10 +548,10 @@ void single_query_attn_flash_batched(Tensor *q, Tensor *K_cache, Tensor *V_cache
 
     hipLaunchKernelGGL((flash_fused_bf16_kernel_tiled<64, GROUP_SIZE, ELEMS_PER_LOAD>), grid, block,
                        shmem_bytes, stream, (const float *)q->d_buf, K_ptr, V_ptr, S_ptr,
-                       (float *)tb->d_buf, n_q, kv_mul, kv_dim, (int)n_layers, seq_len, t_begin,
-                       t_end, cur_batch_size, head_stride_out);
+                       (float *)tb->d_buf, n_q, kv_mul, kv_dim, (int)n_layers, cache_seq_len,
+                       pos_begin, pos_end, cur_batch_size, head_stride_out);
   } else {
-    const int chunk = (L_eff + FA_TILE - 1) / FA_TILE;
+    const int chunk = (active_len + FA_TILE - 1) / FA_TILE;
     const int g_fa_C_max = (seq_len + FLASH_ATTN_TILE - 1) / FLASH_ATTN_TILE;
     if (g_fa_C_max < chunk) {
       fprintf(stderr, "C %d > g_fa_C_max %d\n", chunk, g_fa_C_max);
@@ -558,9 +567,9 @@ void single_query_attn_flash_batched(Tensor *q, Tensor *K_cache, Tensor *V_cache
     const size_t shmem_p = (size_t)head_dim * sizeof(float) + (size_t)FA_TILE * sizeof(float);
 
     fd_partial_kernel_bf16_grouped<FA_TILE, FA_THREADS, 64, GROUP_SIZE, ELEMS_PER_LOAD>
-      <<<grid_p, block_p, shmem_p, stream>>>((const float *)q->d_buf, K_ptr, V_ptr, d_pmax, d_psum,
-                                             d_pnum, n_q, kv_mul, kv_dim, (int)n_layers, seq_len,
-                                             t_begin, t_end, cur_batch_size, chunk);
+      <<<grid_p, block_p, shmem_p, stream>>>(
+        (const float *)q->d_buf, K_ptr, V_ptr, d_pmax, d_psum, d_pnum, n_q, kv_mul, kv_dim,
+        (int)n_layers, cache_seq_len, pos_begin, pos_end, cur_batch_size, chunk);
 
     dim3 grid_r(n_q, cur_batch_size);
     dim3 block_r(head_dim);

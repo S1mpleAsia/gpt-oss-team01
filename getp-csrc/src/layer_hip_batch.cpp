@@ -621,7 +621,7 @@ __global__ void qkv_split_rope_store_kernel(
     (char *)K_cache + (size_t)b * kv_batch_stride * (KV_BF16 ? sizeof(bf16) : sizeof(float));
   char *Vb =
     (char *)V_cache + (size_t)b * kv_batch_stride * (KV_BF16 ? sizeof(bf16) : sizeof(float));
-  const size_t t_base = (size_t)pos * (size_t)(n_kv * head_dim);
+  const size_t t_base = (size_t)(pos & (seq_len - 1)) * (size_t)(n_kv * head_dim);
 
   // -------- 1) Q: RoPE in pairs, write to q_out --------
   // treat as (n_q * h2) pairs
@@ -698,8 +698,8 @@ void qkv_split_rope_fused(Tensor *qkv_out,  // Shape: [batch_size, (n_q + 2*n_kv
   const int n_layers = K_cache->shape[1];
 
   const size_t elem_bytes = (K_cache->dtype == DType::BF16) ? sizeof(bf16) : sizeof(float);
-  void *k_ptr = (char *)K_cache->d_buf + layer_offset * seq_len * kv_dim * elem_bytes;
-  void *v_ptr = (char *)V_cache->d_buf + layer_offset * seq_len * kv_dim * elem_bytes;
+  void *k_ptr = (char *)K_cache->d_buf + (layer_offset >> 1) * seq_len * kv_dim * elem_bytes;
+  void *v_ptr = (char *)V_cache->d_buf + (layer_offset >> 1) * seq_len * kv_dim * elem_bytes;
 
   const int half_head = head_dim >> 1;
   const int total_pairs = n_kv > n_q ? n_kv * half_head : n_q * half_head;
@@ -1530,6 +1530,19 @@ static inline void moe_mlp1_forward_hip(Tensor *x_packed,  // [total_pairs, hidd
   // GpuTimer timer("moe_mlp1", stream);
   moe_mlp1_forward(x_packed, w_mlp1, b_mlp1, expert_offsets, mlp1_out, layer_offset, n_experts,
                    hidden_dim, inter_dim, max_rows_per_expert, total_pairs, stream);
+}
+
+static inline void moe_mlp1_swiglu_fused_hip(Tensor *x_packed, Tensor *w_mlp1, Tensor *b_mlp1,
+                                             TensorI32 *expert_offsets, Tensor *gate_up,
+                                             long long layer_offset, int n_experts, int hidden_dim,
+                                             int inter_dim, float clamp_limit,
+                                             int max_rows_per_expert, int total_pairs,
+                                             hipStream_t stream) {
+  // GpuTimer timer("moe_mlp1_swiglu_fused");
+
+  moe_mlp1_swiglu_fused(x_packed, w_mlp1, b_mlp1, expert_offsets, gate_up, layer_offset, n_experts,
+                        hidden_dim, inter_dim, clamp_limit, max_rows_per_expert, total_pairs,
+                        stream);
 }
 
 static inline void moe_swiglu_hip(Tensor *mlp1_out,  // [total_pairs, 2*inter_dim]

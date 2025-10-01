@@ -38,19 +38,21 @@ int *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flow_
                         cur_batch_size, 1ll * l, false, false,
                         stream);  // This kernel diverges the most
 
-    qkv_split_rope_fused(rs_now->qkv, rs_now->q, rs_now->key_cache, rs_now->value_cache,
-                         rs_now->cos_tensor, rs_now->sin_tensor, cur_batch_size, p->head_dim,
-                         p->n_attn_heads, p->n_kv_heads, pos, l, stream);
+    Tensor *key_cache = ((l & 1ll) == 0) ? rs_now->key_cache_even : rs_now->key_cache_odd;
+    Tensor *value_cache = ((l & 1ll) == 0) ? rs_now->value_cache_even : rs_now->value_cache_odd;
+    qkv_split_rope_fused(rs_now->qkv, rs_now->q, key_cache, value_cache, rs_now->cos_tensor,
+                         rs_now->sin_tensor, cur_batch_size, p->head_dim, p->n_attn_heads,
+                         p->n_kv_heads, pos, l, stream);
 
     // multihead attention
     int kv_mul = p->n_attn_heads / p->n_kv_heads;  // integer multiplier for GQA
 
     // FIX single_query_attn_batched later
     single_query_attn_flash_batched(
-      rs_now->q, rs_now->key_cache, rs_now->value_cache, rs_now->mask, weights_now->attn_sinks,
-      rs_now->tb, rs_now->g_fa_pmax, rs_now->g_fa_psum, rs_now->g_fa_pnum, cur_batch_size,
-      p->head_dim, p->n_attn_heads, kv_mul, kv_dim, p->seq_len, p->sliding_window, pos, 1ll * l,
-      false, false, false, false, false, stream);
+      rs_now->q, key_cache, value_cache, rs_now->mask, weights_now->attn_sinks, rs_now->tb,
+      rs_now->g_fa_pmax, rs_now->g_fa_psum, rs_now->g_fa_pnum, cur_batch_size, p->head_dim,
+      p->n_attn_heads, kv_mul, kv_dim, p->seq_len, p->sliding_window, pos, 1ll * l, false, false,
+      false, false, false, stream);
 
     // final matmul to get the output of the attention
     attn_out_project_batched_v2(rs_now->tb, weights_now->w_o, weights_now->b_o, rs_now->tb2, true,
@@ -104,6 +106,11 @@ int *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flow_
 
     moe_swiglu_hip(rs_now->mlp1_out, rs_now->gate_up, cur_batch_size, p->experts_per_token,
                    p->intermediate_dim, p->swiglu_limit, stream);
+
+    // moe_mlp1_swiglu_fused_hip(rs_now->x_packed, weights_now->w_mlp1, weights_now->b_mlp1,
+    //                           rs_now->expert_offsets, rs_now->gate_up, 1ll * l, p->n_experts,
+    //                           p->hidden_dim, p->intermediate_dim, p->swiglu_limit, max_rows,
+    //                           total_pairs, stream);
 
     moe_mlp2_forward_hip(rs_now->gate_up, weights_now->w_mlp2, weights_now->b_mlp2,
                          rs_now->expert_offsets, rs_now->tb3, true, 1ll * l, p->n_experts,
@@ -223,10 +230,13 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
       rs_now->qkv->printDebug("rs_now->qkv", tp_rank, 0, stream);
 #endif
 
+    Tensor *key_cache = ((l & 1ll) == 0) ? rs_now->key_cache_even : rs_now->key_cache_odd;
+    Tensor *value_cache = ((l & 1ll) == 0) ? rs_now->value_cache_even : rs_now->value_cache_odd;
+
     // // Separate q, k, v + RoPE + Store k, v in cache
-    qkv_split_rope_fused(rs_now->qkv, rs_now->q, rs_now->key_cache, rs_now->value_cache,
-                         rs_now->cos_tensor, rs_now->sin_tensor, cur_batch_size, p->head_dim,
-                         p->n_attn_heads / TP, p->n_kv_heads / TP, pos, l, stream);
+    qkv_split_rope_fused(rs_now->qkv, rs_now->q, key_cache, value_cache, rs_now->cos_tensor,
+                         rs_now->sin_tensor, cur_batch_size, p->head_dim, p->n_attn_heads / TP,
+                         p->n_kv_heads / TP, pos, l, stream);
 
 #ifdef DEBUG
     if (flag) {
@@ -241,10 +251,10 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
 
     // FIX single_query_attn_batched later
     single_query_attn_flash_batched(
-      rs_now->q, rs_now->key_cache, rs_now->value_cache, rs_now->mask, weights_now->attn_sinks,
-      rs_now->tb, rs_now->g_fa_pmax, rs_now->g_fa_psum, rs_now->g_fa_pnum, cur_batch_size,
-      p->head_dim, p->n_attn_heads / TP, kv_mul, kv_dim / TP, p->seq_len, p->sliding_window, pos,
-      1ll * l, false, false, false, false, false, stream);
+      rs_now->q, key_cache, value_cache, rs_now->mask, weights_now->attn_sinks, rs_now->tb,
+      rs_now->g_fa_pmax, rs_now->g_fa_psum, rs_now->g_fa_pnum, cur_batch_size, p->head_dim,
+      p->n_attn_heads / TP, kv_mul, kv_dim / TP, p->seq_len, p->sliding_window, pos, 1ll * l, false,
+      false, false, false, false, stream);
 
     // all_gather_tb(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream,
     //               tp_ready, tp_finish);
@@ -342,12 +352,17 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
 #ifdef RUN_EP
     int max_rows = moe_get_max_rows_per_expert_hip(rs_now->expert_offsets_local, rs_now->max_rows,
                                                    p->n_experts / TP, stream);
-    moe_mlp1_forward_hip(rs_now->x_packed_local, weights_now->w_mlp1, weights_now->b_mlp1,
-                         rs_now->expert_offsets_local, rs_now->mlp1_out, 1ll * l, p->n_experts / TP,
-                         p->hidden_dim, p->intermediate_dim, max_rows, total_pairs, stream);
+    // moe_mlp1_forward_hip(rs_now->x_packed_local, weights_now->w_mlp1, weights_now->b_mlp1,
+    //                      rs_now->expert_offsets_local, rs_now->mlp1_out, 1ll * l, p->n_experts / TP,
+    //                      p->hidden_dim, p->intermediate_dim, max_rows, total_pairs, stream);
 
-    moe_swiglu_hip(rs_now->mlp1_out, rs_now->gate_up, cur_batch_size, p->experts_per_token,
-                   p->intermediate_dim, p->swiglu_limit, stream);
+    // moe_swiglu_hip(rs_now->mlp1_out, rs_now->gate_up, cur_batch_size, p->experts_per_token,
+    //                p->intermediate_dim, p->swiglu_limit, stream);
+
+    moe_mlp1_swiglu_fused_hip(rs_now->x_packed_local, weights_now->w_mlp1, weights_now->b_mlp1,
+                              rs_now->expert_offsets_local, rs_now->gate_up, 1ll * l,
+                              p->n_experts / TP, p->hidden_dim, p->intermediate_dim,
+                              p->swiglu_limit, max_rows, total_pairs, stream);
 
 #else
     int max_rows = moe_get_max_rows_per_expert_hip(rs_now->expert_offsets, rs_now->max_rows,

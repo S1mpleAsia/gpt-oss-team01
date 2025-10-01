@@ -51,6 +51,16 @@ static inline void moe_swiglu(Tensor *mlp1_out,  // [total_pairs, 2*inter_dim]
                               int batch_size, int experts_per_token, int inter_dim,
                               float clamp_limit, hipStream_t stream);
 
+static inline void moe_mlp1_swiglu_fused(
+  Tensor *x_packed,           // [total_pairs, hidden_dim]
+  Tensor *w_mlp1,             // [n_layers, n_experts, hidden_dim, 2*inter_dim]
+  Tensor *b_mlp1,             // [n_layers, n_experts, 2*inter_dim]
+  TensorI32 *expert_offsets,  // [n_experts+1]
+  Tensor *gate_up,            // [total_pairs, inter_dim]
+  long long layer_offset, int n_experts, int hidden_dim, int inter_dim,
+  float clamp_limit,  // << Tham số từ swiglu
+  int max_rows_per_expert, int total_pairs, hipStream_t stream);
+
 // 6) MLP2: (gate_up @ W2 + b2) -> tb3  (hidden_dim)
 // w_mlp2: [n_layers, n_experts, inter_dim, hidden_dim]
 // b_mlp2: [n_layers, n_experts, hidden_dim]

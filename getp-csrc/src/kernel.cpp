@@ -915,6 +915,34 @@ static inline void moe_swiglu(Tensor *mlp1_out,  // [total_pairs, 2*inter_dim]
     batch_size * experts_per_token, clamp_limit);
 }
 
+static inline void moe_mlp1_swiglu_fused(
+  Tensor *x_packed,           // [total_pairs, hidden_dim]
+  Tensor *w_mlp1,             // [n_layers, n_experts, hidden_dim, 2*inter_dim]
+  Tensor *b_mlp1,             // [n_layers, n_experts, 2*inter_dim]
+  TensorI32 *expert_offsets,  // [n_experts+1]
+  Tensor *gate_up,            // [total_pairs, inter_dim]
+  long long layer_offset, int n_experts, int hidden_dim, int inter_dim, float clamp_limit,
+  int max_rows_per_expert, int total_pairs, hipStream_t stream) {
+  const bf16 *w1_ptr =
+    (const bf16 *)w_mlp1->d_buf + (size_t)layer_offset * n_experts * hidden_dim * 2 * inter_dim;
+  const bf16 *b1_ptr =
+    (const bf16 *)b_mlp1->d_buf + (size_t)layer_offset * n_experts * 2 * inter_dim;
+
+  constexpr int BM = 64;
+  constexpr int BN = 128;
+  constexpr int BK = 64;
+  constexpr int TM = 32;
+  constexpr int TN = 32;
+  constexpr int blockDim = 512;
+
+  dim3 block_size(blockDim);
+  dim3 grid_size((2 * inter_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
+
+  gemm_mfma_moe_fused<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+    (const float *)x_packed->d_buf, w1_ptr, (float *)gate_up->d_buf, b1_ptr, expert_offsets->d_buf,
+    total_pairs, 2 * inter_dim, hidden_dim, clamp_limit);
+}
+
 // 6) MLP2: (gate_up @ W2 + b2) -> tb3  (hidden_dim)
 // w_mlp2: [n_layers, n_experts, inter_dim, hidden_dim]
 // b_mlp2: [n_layers, n_experts, hidden_dim]

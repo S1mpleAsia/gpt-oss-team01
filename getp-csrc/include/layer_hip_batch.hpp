@@ -179,6 +179,13 @@ static inline void moe_swiglu_hip(Tensor *mlp1_out,  // [total_pairs, 2*inter_di
                                   int batch_size, int experts_per_token, int inter_dim,
                                   float clamp_limit, hipStream_t stream);
 
+static inline void moe_mlp1_swiglu_fused_hip(Tensor *x_packed, Tensor *w_mlp1, Tensor *b_mlp1,
+                                             TensorI32 *expert_offsets, Tensor *gate_up,
+                                             long long layer_offset, int n_experts, int hidden_dim,
+                                             int inter_dim, float clamp_limit,
+                                             int max_rows_per_expert, int total_pairs,
+                                             hipStream_t stream);
+
 static inline void moe_mlp2_forward_hip(Tensor *gate_up,  // [total_pairs, inter_dim]
                                         Tensor *w_mlp2, Tensor *b_mlp2,
                                         TensorI32 *expert_offsets,  // [n_experts+1]
