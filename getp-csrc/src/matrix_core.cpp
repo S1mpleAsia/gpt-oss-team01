@@ -2,16 +2,128 @@
 #include <hip/hip_runtime.h>
 #include <cassert>
 
+using bf16 = hip_bfloat16;
 using f32x4 = float __attribute__((ext_vector_type(4)));
-using bf16x4 = __bf16 __attribute__((__vector_size__(4 * sizeof(__bf16))));
+using bf16_isa = __bf16;
+using bf16x4 = bf16_isa __attribute__((__vector_size__(4 * sizeof(bf16_isa))));
+using bf16x8 = bf16_isa __attribute__((__vector_size__(8 * sizeof(bf16_isa))));
+using i32x4 = int32_t __attribute__((ext_vector_type(4)));
+
+#define BF16_MFMA_KSTEP 16
 #define MFMA_BF16_16x16(a, b, c) __builtin_amdgcn_mfma_f32_16x16x16bf16_1k((a), (b), (c), 0, 0, 0)
+
+// Buffer load intrinsics
+__device__ uint8_t llvm_amdgcn_raw_buffer_load_b8(i32x4 srsrc, uint32_t voffset, uint32_t soffset, uint32_t coherency)
+    __asm("llvm.amdgcn.raw.buffer.load.i8");
+
+__device__ uint16_t llvm_amdgcn_raw_buffer_load_b16(i32x4 srsrc, uint32_t voffset, uint32_t soffset, uint32_t coherency)
+    __asm("llvm.amdgcn.raw.buffer.load.i16");
+
+__device__ uint32_t llvm_amdgcn_raw_buffer_load_b32(i32x4 srsrc, uint32_t voffset, uint32_t soffset, uint32_t coherency)
+    __asm("llvm.amdgcn.raw.buffer.load.i32");
+
+__device__ uint64_t llvm_amdgcn_raw_buffer_load_b64(i32x4 srsrc, uint32_t voffset, uint32_t soffset, uint32_t coherency)
+    __asm("llvm.amdgcn.raw.buffer.load.i64");
+
+__device__ __uint128_t llvm_amdgcn_raw_buffer_load_b128(i32x4 srsrc, uint32_t voffset, uint32_t soffset, uint32_t coherency)
+    __asm("llvm.amdgcn.raw.buffer.load.i128");
+
+enum class coherency {
+    cache_all = 0,
+    cache_global = 1,
+    cache_stream = 2,
+    non_temporal = 3
+};
+
+template <typename T>
+struct buffer {
+    struct buffer_resource {
+        const void* ptr;
+        uint32_t range;
+        uint32_t config;
+    };
+
+    using elem_type = std::remove_cv_t<T>;
+    i32x4 srsrc;
+
+    __device__ __forceinline__
+    buffer(const T* pointer, size_t size) {
+        buffer_resource res{
+            reinterpret_cast<const void*>(pointer),
+            static_cast<uint32_t>(size * sizeof(elem_type)),
+            0x00020000U  // DATA_FORMAT = 32 bit
+        };
+        i32x4 raw = __builtin_bit_cast(i32x4, res);
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            raw[i] = __builtin_amdgcn_readfirstlane(raw[i]);
+        srsrc = raw;
+    }
+
+    template<size_t N, coherency c = coherency::cache_all>
+    __device__ __forceinline__
+    std::array<elem_type, N> load(
+        uint32_t wave_offset,
+        uint32_t thread_offset,
+        bool in_bounds = true
+    ) const {
+        using result_type = std::array<elem_type, N>;
+        constexpr const int load_size = sizeof(elem_type) * N;
+
+        wave_offset *= sizeof(elem_type);
+        thread_offset *= sizeof(elem_type);
+        thread_offset = in_bounds ? thread_offset : 0xFFFF'FFFF;
+        const int cc = static_cast<int>(c);
+
+        i32x4 resource = srsrc;
+
+        if constexpr (load_size == 1) {
+            return __builtin_bit_cast(result_type, llvm_amdgcn_raw_buffer_load_b8(
+                resource,
+                thread_offset,
+                wave_offset,
+                cc
+            ));
+        } else if constexpr (load_size == 2) {
+            return __builtin_bit_cast(result_type, llvm_amdgcn_raw_buffer_load_b16(
+                resource,
+                thread_offset,
+                wave_offset,
+                cc
+            ));
+        } else if constexpr (load_size == 4) {
+            return __builtin_bit_cast(result_type, llvm_amdgcn_raw_buffer_load_b32(
+                resource,
+                thread_offset,
+                wave_offset,
+                cc
+            ));
+        } else if constexpr (load_size == 8) {
+            return __builtin_bit_cast(result_type, llvm_amdgcn_raw_buffer_load_b64(
+                resource,
+                thread_offset,
+                wave_offset,
+                cc
+            ));
+        } else if constexpr (load_size == 16) {
+            return __builtin_bit_cast(result_type, llvm_amdgcn_raw_buffer_load_b128(
+                resource,
+                thread_offset,
+                wave_offset,
+                cc
+            ));
+        } else {
+            static_assert(load_size == -1, "load size not implemented");
+        }
+    }
+};
 
 __device__ __forceinline__ bf16x4 pack_f4_to_bf16x4(const float4 &v) {
   bf16x4 r;
-  r[0] = (__bf16)v.x;
-  r[1] = (__bf16)v.y;
-  r[2] = (__bf16)v.z;
-  r[3] = (__bf16)v.w;
+  r[0] = (bf16_isa)v.x;
+  r[1] = (bf16_isa)v.y;
+  r[2] = (bf16_isa)v.z;
+  r[3] = (bf16_isa)v.w;
   return r;
 }
 
@@ -694,7 +806,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void gemm_mfma_moe_fused(
 }
 
 template <int BM, int BN, int BK, int TM, int TN, int BLOCK_THREADS>
-__global__ __launch_bounds__(BLOCK_THREADS) void gemm_mfma_moe_no_prefetch(
+__global__ __launch_bounds__(BLOCK_THREADS) void dangerous_moe(
   const float *__restrict__ A, const bf16 *__restrict__ B, float *__restrict__ C,
   const bf16 *__restrict__ bias, const int *__restrict__ expert_offsets, int M_total, int N,
   int K) {
@@ -711,6 +823,10 @@ __global__ __launch_bounds__(BLOCK_THREADS) void gemm_mfma_moe_no_prefetch(
 
   const bf16 *__restrict__ B_ptr = B + (size_t)expert_id * N * K;
   const bf16 *__restrict__ bias_ptr = bias ? (bias + (size_t)expert_id * N) : nullptr;
+
+  // Create buffer objects
+  buffer<const float> A_buf(A, static_cast<size_t>(M_total) * K);
+  buffer<const bf16> B_buf(B_ptr, static_cast<size_t>(K) * N);
 
   const int tid = threadIdx.x;
   const int wave_id = tid >> 6;
@@ -752,54 +868,80 @@ __global__ __launch_bounds__(BLOCK_THREADS) void gemm_mfma_moe_no_prefetch(
   const int lx = lane_id & 15;
   const int ly = lane_id >> 4;
 
+  // Initial load of A tile
+#pragma unroll
+  for (int i = 0; i < A_VEC_PER_THR; i++) {
+    const int vec_idx = tid + i * BLOCK_THREADS;
+    const int elem_idx = vec_idx * VEC_A_SIZE;
+    const int r_local = elem_idx / BK;
+    const int c = elem_idx % BK;
+    const int g_row_local = r_local;
+    const int g_row_global = block_row_global_start + g_row_local;
+    const int g_col = 0 + c;
+
+    const bool in_bounds = (block_row_local_start + g_row_local) < M && (g_col + VEC_A_SIZE - 1) < K;
+    auto vals = A_buf.template load<VEC_A_SIZE>(0, static_cast<uint32_t>((size_t)g_row_global * K + g_col), in_bounds);
+    const float4 v = __builtin_bit_cast(float4, vals);
+    const bf16x4 p = pack_f4_to_bf16x4(v);
+    *reinterpret_cast<bf16x4 *>(&As[r_local][c]) = p;
+  }
+
+  // Initial load of B tile
+#pragma unroll
+  for (int i = 0; i < B_VEC_PER_THR; ++i) {
+    const int vec_idx = tid + i * BLOCK_THREADS;
+    const int elem_idx = vec_idx * VEC_B_SIZE;
+    const int r = elem_idx / BN;
+    const int c = elem_idx % BN;
+    const int g_row = 0 + r;
+    const int g_col = block_col_start + c;
+
+    const bool in_bounds = g_row < K && (g_col + VEC_B_SIZE - 1) < N;
+    auto vals = B_buf.template load<VEC_B_SIZE>(0, static_cast<uint32_t>((size_t)g_row * N + g_col), in_bounds);
+    const bf16x8 packed = __builtin_bit_cast(bf16x8, vals);
+    *reinterpret_cast<bf16x8 *>(&Bs[r][c]) = packed;
+  }
+  __syncthreads();
+
+  // Main loop
   for (int k_base = 0; k_base < K; k_base += BK) {
-#pragma unroll
-    for (int i = 0; i < A_VEC_PER_THR; i++) {
-      const int vec_idx = tid + i * BLOCK_THREADS;
-      const int elem_idx = vec_idx * VEC_A_SIZE;
-      const int r_local = elem_idx / BK;
-      const int c = elem_idx % BK;
-      const int g_row_local = r_local;
-      const int g_row_global = block_row_global_start + g_row_local;
-      const int g_col = k_base + c;
+    float4 regA[A_VEC_PER_THR];
+    bf16x8 regB[B_VEC_PER_THR];
+    const bool has_next = (k_base + BK) < K;
 
-      if (g_row_local < M && (g_col + VEC_A_SIZE - 1) < K) {
-        const float4 v = *reinterpret_cast<const float4 *>(&A[(size_t)g_row_global * K + g_col]);
-        const bf16x4 p = pack_f4_to_bf16x4(v);
-        As[r_local][c + 0] = p[0];
-        As[r_local][c + 1] = p[1];
-        As[r_local][c + 2] = p[2];
-        As[r_local][c + 3] = p[3];
-      } else {
+    // Prefetch next tiles
+    if (has_next) {
 #pragma unroll
-        for (int j = 0; j < VEC_A_SIZE; j++) {
-          const float v =
-            (g_row_local < M && (g_col + j) < K) ? A[(size_t)g_row_global * K + (g_col + j)] : 0.0f;
-          As[r_local][c + j] = (__bf16)v;
-        }
+      for (int i = 0; i < A_VEC_PER_THR; i++) {
+        const int vec_idx = tid + i * BLOCK_THREADS;
+        const int elem_idx = vec_idx * VEC_A_SIZE;
+        const int r_local = elem_idx / BK;
+        const int c = elem_idx % BK;
+        const int g_row_local = r_local;
+        const int g_row_global = block_row_global_start + g_row_local;
+        const int g_col = (k_base + BK) + c;
+
+        const bool in_bounds = (block_row_local_start + g_row_local) < M && (g_col + VEC_A_SIZE - 1) < K;
+        auto vals = A_buf.template load<VEC_A_SIZE>(0, static_cast<uint32_t>((size_t)g_row_global * K + g_col), in_bounds);
+        regA[i] = __builtin_bit_cast(float4, vals);
+      }
+
+#pragma unroll
+      for (int i = 0; i < B_VEC_PER_THR; ++i) {
+        const int vec_idx = tid + i * BLOCK_THREADS;
+        const int elem_idx = vec_idx * VEC_B_SIZE;
+        const int r = elem_idx / BN;
+        const int c = elem_idx % BN;
+        const int g_row = (k_base + BK) + r;
+        const int g_col = block_col_start + c;
+
+        const bool in_bounds = g_row < K && (g_col + VEC_B_SIZE - 1) < N;
+        auto vals = B_buf.template load<VEC_B_SIZE>(0, static_cast<uint32_t>((size_t)g_row * N + g_col), in_bounds);
+        regB[i] = __builtin_bit_cast(bf16x8, vals);
       }
     }
 
-#pragma unroll
-    for (int i = 0; i < B_VEC_PER_THR; ++i) {
-      const int vec_idx = tid + i * BLOCK_THREADS;
-      const int elem_idx = vec_idx * VEC_B_SIZE;
-      const int r = elem_idx / BN;
-      const int c = elem_idx % BN;
-      const int g_row = k_base + r;
-      const int g_col = block_col_start + c;
-
-      if (g_row < K && (g_col + VEC_B_SIZE - 1) < N) {
-        *reinterpret_cast<uint4 *>(&Bs[r][c]) =
-          *reinterpret_cast<const uint4 *>(&B_ptr[(size_t)g_row * N + g_col]);
-      } else {
-        uint4 z = {0, 0, 0, 0};
-        *reinterpret_cast<uint4 *>(&Bs[r][c]) = z;
-      }
-    }
-
-    __syncthreads();
-
+    // Compute with current tiles
 #pragma unroll
     for (int kk = 0; kk < BK; kk += WK) {
 #pragma unroll
@@ -822,8 +964,31 @@ __global__ __launch_bounds__(BLOCK_THREADS) void gemm_mfma_moe_no_prefetch(
     }
 
     __syncthreads();
+
+    // Write prefetched tiles to shared memory
+    if (has_next) {
+#pragma unroll
+      for (int i = 0; i < A_VEC_PER_THR; i++) {
+        const int elem_idx = (tid + i * BLOCK_THREADS) * VEC_A_SIZE;
+        const int r_local = elem_idx / BK;
+        const int c = elem_idx % BK;
+        const bf16x4 p = pack_f4_to_bf16x4(regA[i]);
+        *reinterpret_cast<bf16x4 *>(&As[r_local][c]) = p;
+      }
+
+#pragma unroll
+      for (int i = 0; i < B_VEC_PER_THR; ++i) {
+        const int elem_idx = (tid + i * BLOCK_THREADS) * VEC_B_SIZE;
+        const int r = elem_idx / BN;
+        const int c = elem_idx % BN;
+        *reinterpret_cast<bf16x8 *>(&Bs[r][c]) = regB[i];
+      }
+
+      __syncthreads();
+    }
   }
 
+  // Write results
 #pragma unroll
   for (int mt = 0; mt < M_TILES; ++mt) {
 #pragma unroll
@@ -844,26 +1009,19 @@ __global__ __launch_bounds__(BLOCK_THREADS) void gemm_mfma_moe_no_prefetch(
   }
 }
 
-
 template <int BM, int BN, int BK, int TM, int TN, int BLOCK_THREADS>
 __global__ __launch_bounds__(BLOCK_THREADS) void dangerous_gemm(const float *__restrict__ A,
                                                               const bf16 *__restrict__ B,
                                                               float *__restrict__ C,
                                                               const bf16 *__restrict__ bias, int M,
                                                               int N, int K) {
-  static_assert((BM % TM) == 0, "BM must be divisible by TM");
-  static_assert((BN % TN) == 0, "BN must be divisible by TN");
-  static_assert(BLOCK_THREADS == 64 * (BM / TM) * (BN / TN),
-                "BLOCK_THREADS must equal 64 * (BM / TM) * (BN / TN)");
-
-#ifndef NDEBUG
-  assert((M % BM) == 0 && "M must be divisible by BM");
-  assert((N % BN) == 0 && "N must be divisible by BN");
-#endif
 
   constexpr int WM = 16, WN = 16, WK = 16;
   constexpr int VEC_B_SIZE = 8;
   constexpr int VEC_A_SIZE = 4;
+
+  buffer<const float> A_buf(A, static_cast<size_t>(M) * K);
+  buffer<const bf16> B_buf(B, static_cast<size_t>(K) * N);
 
   const int tid = threadIdx.x;
   const int wave_id = tid >> 6;
@@ -910,21 +1068,10 @@ __global__ __launch_bounds__(BLOCK_THREADS) void dangerous_gemm(const float *__r
     const int g_row = block_row_start + r;
     const int g_col = 0 + c;
 
-   //if (g_row < M && (g_col + VEC_A_SIZE - 1) < K) {
-      const float4 v = *reinterpret_cast<const float4 *>(&A[(size_t)g_row * K + g_col]);
+      auto vals = A_buf.template load<VEC_A_SIZE>(0, static_cast<uint32_t>((size_t)g_row * K + g_col));
+      const float4 v = __builtin_bit_cast(float4, vals);
       const bf16x4 p = pack_f4_to_bf16x4(v);
-      As[r][c + 0] = p[0];
-      As[r][c + 1] = p[1];
-      As[r][c + 2] = p[2];
-      As[r][c + 3] = p[3];
-//     } 
-//      else {
-//  #pragma unroll
-//        for (int j = 0; j < VEC_A_SIZE; ++j) {
-//          const float v = (g_row < M && (g_col + j) < K) ? A[(size_t)g_row * K + (g_col + j)] : 0.0f;
-//          As[r][c + j] = (__bf16)v;
-//        }
-//      }
+      *reinterpret_cast<bf16x4 *>(&As[r][c]) = p;
   }
 
 #pragma unroll
@@ -936,20 +1083,15 @@ __global__ __launch_bounds__(BLOCK_THREADS) void dangerous_gemm(const float *__r
     const int g_row = 0 + r;
     const int g_col = block_col_start + c;
 
-   //if (g_row < K && (g_col + VEC_B_SIZE - 1) < N) {
-      *reinterpret_cast<uint4 *>(&Bs[r][c]) =
-        *reinterpret_cast<const uint4 *>(&B[(size_t)g_row * N + g_col]);
-    // } 
-    //  else {
-    //    uint4 z = {0, 0, 0, 0};
-    //    *reinterpret_cast<uint4 *>(&Bs[r][c]) = z;
-    //  }
+      auto vals = B_buf.template load<VEC_B_SIZE>(0, static_cast<uint32_t>((size_t)g_row * N + g_col));
+      const bf16x8 packed = __builtin_bit_cast(bf16x8, vals);
+      *reinterpret_cast<bf16x8 *>(&Bs[r][c]) = packed;
   }
   __syncthreads();
 
   for (int k_base = 0; k_base < K; k_base += BK) {
     float4 regA[A_VEC_PER_THR];
-    uint4 regB[B_VEC_PER_THR];
+    bf16x8 regB[B_VEC_PER_THR];
     const bool has_next = (k_base + BK) < K;
 
     if (has_next) {
@@ -962,16 +1104,8 @@ __global__ __launch_bounds__(BLOCK_THREADS) void dangerous_gemm(const float *__r
         const int g_row = block_row_start + r;
         const int g_col = (k_base + BK) + c;
 
-       //if (g_row < M && (g_col + VEC_A_SIZE - 1) < K) {
-          regA[i] = *reinterpret_cast<const float4 *>(&A[(size_t)g_row * K + g_col]);
-//        } else {
-//            float tmp[4] = {0, 0, 0, 0};
-//  #pragma unroll
-//            for (int j = 0; j < 4; ++j)
-//              if (g_row < M && (g_col + j) < K)
-//                tmp[j] = A[(size_t)g_row * K + (g_col + j)];
-//            regA[i] = *reinterpret_cast<float4 *>(tmp);
-//          }
+          auto vals = A_buf.template load<VEC_A_SIZE>(0, static_cast<uint32_t>((size_t)g_row * K + g_col));
+          regA[i] = __builtin_bit_cast(float4, vals);
       }
 
 #pragma unroll
@@ -983,12 +1117,8 @@ __global__ __launch_bounds__(BLOCK_THREADS) void dangerous_gemm(const float *__r
         const int g_row = (k_base + BK) + r;
         const int g_col = block_col_start + c;
 
-        //if (g_row < K && (g_col + VEC_B_SIZE - 1) < N) {
-          regB[i] = *reinterpret_cast<const uint4 *>(&B[(size_t)g_row * N + g_col]);
-        // } 
-        //  else {
-        //    regB[i] = uint4{0, 0, 0, 0};
-        //  }
+          auto vals = B_buf.template load<VEC_B_SIZE>(0, static_cast<uint32_t>((size_t)g_row * N + g_col));
+          regB[i] = __builtin_bit_cast(bf16x8, vals);
       }
     }
 
@@ -1033,7 +1163,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void dangerous_gemm(const float *__r
         const int elem_idx = (tid + i * BLOCK_THREADS) * VEC_B_SIZE;
         const int r = elem_idx / BN;
         const int c = elem_idx % BN;
-        *reinterpret_cast<uint4 *>(&Bs[r][c]) = regB[i];
+        *reinterpret_cast<bf16x8 *>(&Bs[r][c]) = regB[i];
       }
 
       __syncthreads();
