@@ -1,5 +1,6 @@
 #include "../include/tensor.hpp"
 #include <hip/hip_runtime.h>
+#include <cassert>
 
 using f32x4 = float __attribute__((ext_vector_type(4)));
 using bf16x4 = __bf16 __attribute__((__vector_size__(4 * sizeof(__bf16))));
@@ -850,6 +851,16 @@ __global__ __launch_bounds__(BLOCK_THREADS) void dangerous_gemm(const float *__r
                                                               float *__restrict__ C,
                                                               const bf16 *__restrict__ bias, int M,
                                                               int N, int K) {
+  static_assert((BM % TM) == 0, "BM must be divisible by TM");
+  static_assert((BN % TN) == 0, "BN must be divisible by TN");
+  static_assert(BLOCK_THREADS == 64 * (BM / TM) * (BN / TN),
+                "BLOCK_THREADS must equal 64 * (BM / TM) * (BN / TN)");
+
+#ifndef NDEBUG
+  assert((M % BM) == 0 && "M must be divisible by BM");
+  assert((N % BN) == 0 && "N must be divisible by BN");
+#endif
+
   constexpr int WM = 16, WN = 16, WK = 16;
   constexpr int VEC_B_SIZE = 8;
   constexpr int VEC_A_SIZE = 4;
