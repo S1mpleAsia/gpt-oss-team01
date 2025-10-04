@@ -557,6 +557,21 @@ __global__ void gather_inputs_by_sorted_kernel(
   x_packed[packed_row * hidden_dim + col] = x_in[token_id * hidden_dim + col];
 }
 
+__global__ void gather_inputs_by_sorted_kernel_bf16(
+  const bf16 *x_in,  // [batch_size, hidden_dim]
+  const int *sorted_pair_ids,
+  bf16 *x_packed,  // [batch_size * experts_per_token, hidden_dim]
+  int batch_size, int hidden_dim, int experts_per_token) {
+  int packed_row = blockIdx.y;
+  int col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (packed_row >= batch_size * experts_per_token || col >= hidden_dim)
+    return;
+
+  int pair_id = sorted_pair_ids[packed_row];  // 0..B*k-1
+  int token_id = pair_id / experts_per_token;
+  x_packed[packed_row * hidden_dim + col] = x_in[token_id * hidden_dim + col];
+}
+
 __global__ void gather_inputs_vectorized_kernel(const float4 *x_in, const int *sorted_pair_ids,
                                                 float4 *x_packed, int vec_hidden_dim,
                                                 int total_pairs, int experts_per_token) {
@@ -616,6 +631,57 @@ __global__ void swiglu_interleaved_batched_fast_v2(
 
   float4 result = silu * (u + 1.f);
   gate_up_ptr[idx] = result;
+}
+
+__global__ void swiglu_interleaved_batched_fast_v2_bf16(
+  const float *__restrict__ mlp1_out,  // [total_pairs, 2 * inter_dim]  (G,U interleaved)
+  bf16 *__restrict__ gate_up,          // [total_pairs, inter_dim]
+  int inter_dim, int total_pairs, float clamp_limit) {
+  const float4 *mlp1_out_ptr = reinterpret_cast<const float4 *>(mlp1_out);
+  bf16x4 *gate_up_ptr = reinterpret_cast<bf16x4 *>(gate_up);
+
+  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t N = (size_t)total_pairs * (size_t)inter_dim / 4;
+  if (idx >= N)
+    return;
+
+  const float4 val1 = mlp1_out_ptr[idx * 2 + 0];
+  const float4 val2 = mlp1_out_ptr[idx * 2 + 1];
+
+  float4 g = {val1.x, val1.z, val2.x, val2.z};
+  float4 u = {val1.y, val1.w, val2.y, val2.w};
+
+  // clamp giống bản float
+  g.x = fminf(g.x, clamp_limit);
+  g.y = fminf(g.y, clamp_limit);
+  g.z = fminf(g.z, clamp_limit);
+  g.w = fminf(g.w, clamp_limit);
+
+  u.x = fminf(fmaxf(u.x, -clamp_limit), clamp_limit);
+  u.y = fminf(fmaxf(u.y, -clamp_limit), clamp_limit);
+  u.z = fminf(fmaxf(u.z, -clamp_limit), clamp_limit);
+  u.w = fminf(fmaxf(u.w, -clamp_limit), clamp_limit);
+
+  constexpr float alpha = 1.702f;
+  float4 silu;
+  silu.x = g.x * (1.f / (1.f + expf(-alpha * g.x)));
+  silu.y = g.y * (1.f / (1.f + expf(-alpha * g.y)));
+  silu.z = g.z * (1.f / (1.f + expf(-alpha * g.z)));
+  silu.w = g.w * (1.f / (1.f + expf(-alpha * g.w)));
+
+  float4 res;
+  res.x = silu.x * (u.x + 1.f);
+  res.y = silu.y * (u.y + 1.f);
+  res.z = silu.z * (u.z + 1.f);
+  res.w = silu.w * (u.w + 1.f);
+
+  bf16x4 outv;
+  ((__bf16 *)&outv)[0] = (__bf16)res.x;
+  ((__bf16 *)&outv)[1] = (__bf16)res.y;
+  ((__bf16 *)&outv)[2] = (__bf16)res.z;
+  ((__bf16 *)&outv)[3] = (__bf16)res.w;
+
+  gate_up_ptr[idx] = outv;
 }
 
 __global__ void scale_scatter_add_kernel_sorted(
@@ -798,6 +864,22 @@ static inline void moe_build_offsets(
     n_experts);
 }
 
+static inline void moe_pack_inputs_bf16(
+  Tensor *x_in,                // [batch_size, hidden_dim]
+  TensorI32 *sorted_pair_ids,  // [batch_size * experts_per_token]
+  Tensor *x_packed,            // [batch_size * experts_per_token, hidden_dim]
+  int batch_size, int hidden_dim, int experts_per_token, hipStream_t stream) {
+  const bf16 *x_ptr = (const bf16 *)x_in->d_buf;
+
+  const int total_pairs = batch_size * experts_per_token;
+  dim3 block_size(256, 1);
+  dim3 grid_size((hidden_dim + block_size.x - 1) / block_size.x, total_pairs);
+
+  gather_inputs_by_sorted_kernel_bf16<<<grid_size, block_size, 0, stream>>>(
+    x_ptr, sorted_pair_ids->d_buf, (bf16 *)x_packed->d_buf, batch_size, hidden_dim,
+    experts_per_token);
+}
+
 // 2) pack X theo sorted ids
 static inline void moe_pack_inputs(
   Tensor *x_in,                // [batch_size, hidden_dim]
@@ -843,6 +925,33 @@ static inline int moe_get_max_rows_per_expert(TensorI32 *expert_offsets, int *d_
   return max_rows_per_expert;
 }
 
+static inline void moe_mlp1_forward_bf16(Tensor *x_packed,  // [total_pairs, hidden_dim]
+                                         Tensor *w_mlp1, Tensor *b_mlp1,
+                                         TensorI32 *expert_offsets,  // [n_experts+1]
+                                         Tensor *mlp1_out,           // [total_pairs, 2*inter_dim]
+                                         long long layer_offset, int n_experts, int hidden_dim,
+                                         int inter_dim, int max_rows_per_expert, int total_pairs,
+                                         hipStream_t stream) {
+  const bf16 *w1_ptr =
+    (const bf16 *)w_mlp1->d_buf + (size_t)layer_offset * n_experts * hidden_dim * 2 * inter_dim;
+  const bf16 *b1_ptr =
+    (const bf16 *)b_mlp1->d_buf + (size_t)layer_offset * n_experts * 2 * inter_dim;
+
+  constexpr int BM = 64;
+  constexpr int BN = 128;
+  constexpr int BK = 64;
+  constexpr int TM = 32;
+  constexpr int TN = 32;
+  constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
+
+  dim3 block_size(blockDim);
+  dim3 grid_size((2 * inter_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
+
+  gemm_mfma_moe_v2_bf16<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+    (const bf16 *)x_packed->d_buf, w1_ptr, (float *)mlp1_out->d_buf, b1_ptr, expert_offsets->d_buf,
+    total_pairs, 2 * inter_dim, hidden_dim);
+}
+
 // 4) MLP1: (x_packed @ W1 + b1) -> mlp1_out  (2*inter_dim)
 // w_mlp1: [n_layers, n_experts, hidden_dim, 2*inter_dim]
 // b_mlp1: [n_layers, n_experts, 2*inter_dim]
@@ -857,14 +966,6 @@ static inline void moe_mlp1_forward(Tensor *x_packed,  // [total_pairs, hidden_d
     (const bf16 *)w_mlp1->d_buf + (size_t)layer_offset * n_experts * hidden_dim * 2 * inter_dim;
   const bf16 *b1_ptr =
     (const bf16 *)b_mlp1->d_buf + (size_t)layer_offset * n_experts * 2 * inter_dim;
-
-  // constexpr int BM = 16, BN = 128, BK = 16, TM = 2, TN = 8;
-  // dim3 block_size(BN / TN, BM / TM);
-  // dim3 grid_size((2 * inter_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
-
-  // matmul_kernel_bf16_moe<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
-  //   (const float *)x_packed->d_buf, w1_ptr, (float *)mlp1_out->d_buf, b1_ptr, expert_offsets->d_buf,
-  //   total_pairs, 2 * inter_dim, hidden_dim);
 
   {
 #if defined(RUN_20B) || defined(RUN_EP)
@@ -897,6 +998,21 @@ static inline void moe_mlp1_forward(Tensor *x_packed,  // [total_pairs, hidden_d
       expert_offsets->d_buf, total_pairs, 2 * inter_dim, hidden_dim);
 #endif
   }
+}
+
+static inline void moe_swiglu_bf16(Tensor *mlp1_out,  // [total_pairs, 2*inter_dim]
+                                   Tensor *gate_up,   // [total_pairs, inter_dim]
+                                   int batch_size, int experts_per_token, int inter_dim,
+                                   float clamp_limit, hipStream_t stream) {
+  size_t total = (size_t)batch_size * experts_per_token * inter_dim;
+  size_t total_vec = total / 4;
+
+  dim3 block_size(256);
+  dim3 grid_size((total_vec + 255) / 256);
+
+  swiglu_interleaved_batched_fast_v2_bf16<<<grid_size, block_size, 0, stream>>>(
+    (const float *)mlp1_out->d_buf, (bf16 *)gate_up->d_buf, inter_dim,
+    batch_size * experts_per_token, clamp_limit);
 }
 
 // 5) SwiGLU (interleaved) & clamp
@@ -938,9 +1054,39 @@ static inline void moe_mlp1_swiglu_fused(
   dim3 block_size(blockDim);
   dim3 grid_size((2 * inter_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
 
-  gemm_mfma_moe_fused<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
-    (const float *)x_packed->d_buf, w1_ptr, (float *)gate_up->d_buf, b1_ptr, expert_offsets->d_buf,
+  gemm_mfma_moe_fused_bf16<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+    (const bf16 *)x_packed->d_buf, w1_ptr, (bf16 *)gate_up->d_buf, b1_ptr, expert_offsets->d_buf,
     total_pairs, 2 * inter_dim, hidden_dim, clamp_limit);
+}
+
+static inline void moe_mlp2_forward_bf16(Tensor *gate_up,  // [total_pairs, inter_dim]
+                                         Tensor *w_mlp2, Tensor *b_mlp2,
+                                         TensorI32 *expert_offsets,  // [n_experts+1]
+                                         Tensor *tb3,                // [total_pairs, hidden_dim]
+                                         bool has_bias, long long layer_offset, int n_experts,
+                                         int inter_dim, int hidden_dim, int max_rows_per_expert,
+                                         int total_pairs, hipStream_t stream) {
+  const bf16 *w2_ptr =
+    (const bf16 *)w_mlp2->d_buf + (size_t)layer_offset * n_experts * inter_dim * hidden_dim;
+  const bf16 *b2_ptr =
+    has_bias ? (const bf16 *)b_mlp2->d_buf + (size_t)layer_offset * n_experts * hidden_dim
+             : nullptr;
+
+  {
+    constexpr int BM = 64;
+    constexpr int BN = 128;
+    constexpr int BK = 64;
+    constexpr int TM = 32;
+    constexpr int TN = 32;
+    constexpr int blockDim = 512;  // = 64 * (BM / TM) * (BN / TN)
+
+    dim3 block_size(blockDim);
+    dim3 grid_size((hidden_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
+
+    gemm_mfma_moe_v2_bf16<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+      (const bf16 *)gate_up->d_buf, w2_ptr, (float *)tb3->d_buf, b2_ptr, expert_offsets->d_buf,
+      total_pairs, hidden_dim, inter_dim);
+  }
 }
 
 // 6) MLP2: (gate_up @ W2 + b2) -> tb3  (hidden_dim)
@@ -958,14 +1104,6 @@ static inline void moe_mlp2_forward(Tensor *gate_up,  // [total_pairs, inter_dim
   const bf16 *b2_ptr =
     has_bias ? (const bf16 *)b_mlp2->d_buf + (size_t)layer_offset * n_experts * hidden_dim
              : nullptr;
-
-  // constexpr int BM = 16, BN = 128, BK = 16, TM = 2, TN = 8;
-  // dim3 block_size(BN / TN, BM / TM);
-  // dim3 grid_size((hidden_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
-
-  // matmul_kernel_bf16_moe<BM, BN, BK, TM, TN><<<grid_size, block_size, 0, stream>>>(
-  //   (const float *)gate_up->d_buf, w2_ptr, (float *)tb3->d_buf, b2_ptr, expert_offsets->d_buf,
-  //   total_pairs, hidden_dim, inter_dim);
 
   {
 #if defined(RUN_20B) || defined(RUN_EP)
@@ -989,8 +1127,8 @@ static inline void moe_mlp2_forward(Tensor *gate_up,  // [total_pairs, inter_dim
     dim3 grid_size((hidden_dim + BN - 1) / BN, (max_rows_per_expert + BM - 1) / BM, n_experts);
 
 #if defined(RUN_20B) || defined(RUN_EP)
-    gemm_mfma_moe_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
-      (const float *)gate_up->d_buf, w2_ptr, (float *)tb3->d_buf, b2_ptr, expert_offsets->d_buf,
+    gemm_mfma_moe_v2_bf16<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(
+      (const bf16 *)gate_up->d_buf, w2_ptr, (float *)tb3->d_buf, b2_ptr, expert_offsets->d_buf,
       total_pairs, hidden_dim, inter_dim);
 #else
     gemm_mfma_moe_v2<BM, BN, BK, TM, TN, blockDim><<<grid_size, block_size, 0, stream>>>(

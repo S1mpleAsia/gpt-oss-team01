@@ -321,19 +321,435 @@ __global__ __launch_bounds__(BLOCK_THREADS) void gemm_mfma_v2(
   }
 }
 
+template <int BM, int BN, int BK, int TM, int TN, int BLOCK_THREADS>
+__global__ __launch_bounds__(BLOCK_THREADS) void gemm_mfma_v2_origin(const float *__restrict__ A,
+                                                                     const bf16 *__restrict__ B,
+                                                                     float *__restrict__ C,
+                                                                     const bf16 *__restrict__ bias,
+                                                                     int M, int N, int K) {
+  constexpr int WM = 16, WN = 16, WK = 16;
+  constexpr int VEC_B_SIZE = 8;
+  constexpr int VEC_A_SIZE = 4;
+
+  const int tid = threadIdx.x;
+  const int wave_id = tid >> 6;
+  const int lane_id = tid & 63;
+
+  const int block_row_start = blockIdx.y * BM;
+  const int block_col_start = blockIdx.x * BN;
+
+  const int waves_per_block_m = BM / TM;
+  const int waves_per_block_n = BN / TN;
+  const int wave_row = wave_id / waves_per_block_n;
+  const int wave_col = wave_id % waves_per_block_n;
+
+  const int wave_row_start = block_row_start + wave_row * TM;
+  const int wave_col_start = block_col_start + wave_col * TN;
+
+  __shared__ __bf16 As[BM][BK + 2];
+  __shared__ __bf16 Bs[BK][BN + 2];
+
+  constexpr int M_TILES = TM / WM;
+  constexpr int N_TILES = TN / WN;
+  f32x4 acc[M_TILES][N_TILES];
+#pragma unroll
+  for (int i = 0; i < M_TILES; ++i)
+#pragma unroll
+    for (int j = 0; j < N_TILES; ++j)
+      acc[i][j] = {0.f, 0.f, 0.f, 0.f};
+
+  constexpr int A_ELEMS_TILE = BM * BK;
+  constexpr int B_ELEMS_TILE = BK * BN;
+  constexpr int A_VEC_PER_THR = A_ELEMS_TILE / VEC_A_SIZE / BLOCK_THREADS;
+  constexpr int B_VEC_ELEMS = B_ELEMS_TILE / VEC_B_SIZE;
+  constexpr int B_VEC_PER_THR = B_VEC_ELEMS / BLOCK_THREADS;
+
+  const int lx = lane_id & 15;
+  const int ly = lane_id >> 4;
+
+#pragma unroll
+  for (int i = 0; i < A_VEC_PER_THR; i++) {
+    const int vec_idx = tid + i * BLOCK_THREADS;
+    const int elem_idx = vec_idx * VEC_A_SIZE;
+    const int r = elem_idx / BK;
+    const int c = elem_idx % BK;
+    const int g_row = block_row_start + r;
+    const int g_col = 0 + c;
+
+    if (g_row < M && (g_col + VEC_A_SIZE - 1) < K) {
+      const float4 v = *reinterpret_cast<const float4 *>(&A[(size_t)g_row * K + g_col]);
+      const bf16x4 p = pack_f4_to_bf16x4(v);
+      As[r][c + 0] = p[0];
+      As[r][c + 1] = p[1];
+      As[r][c + 2] = p[2];
+      As[r][c + 3] = p[3];
+    } else {
+#pragma unroll
+      for (int j = 0; j < VEC_A_SIZE; ++j) {
+        const float v = (g_row < M && (g_col + j) < K) ? A[(size_t)g_row * K + (g_col + j)] : 0.0f;
+        As[r][c + j] = (__bf16)v;
+      }
+    }
+  }
+
+#pragma unroll
+  for (int i = 0; i < B_VEC_PER_THR; ++i) {
+    const int vec_idx = tid + i * BLOCK_THREADS;
+    const int elem_idx = vec_idx * VEC_B_SIZE;
+    const int r = elem_idx / BN;
+    const int c = elem_idx % BN;
+    const int g_row = 0 + r;
+    const int g_col = block_col_start + c;
+
+    if (g_row < K && (g_col + VEC_B_SIZE - 1) < N) {
+      *reinterpret_cast<uint4 *>(&Bs[r][c]) =
+        *reinterpret_cast<const uint4 *>(&B[(size_t)g_row * N + g_col]);
+    } else {
+      uint4 z = {0, 0, 0, 0};
+      *reinterpret_cast<uint4 *>(&Bs[r][c]) = z;
+    }
+  }
+  __syncthreads();
+
+  for (int k_base = 0; k_base < K; k_base += BK) {
+    float4 regA[A_VEC_PER_THR];
+    uint4 regB[B_VEC_PER_THR];
+    const bool has_next = (k_base + BK) < K;
+
+    if (has_next) {
+#pragma unroll
+      for (int i = 0; i < A_VEC_PER_THR; i++) {
+        const int vec_idx = tid + i * BLOCK_THREADS;
+        const int elem_idx = vec_idx * VEC_A_SIZE;
+        const int r = elem_idx / BK;
+        const int c = elem_idx % BK;
+        const int g_row = block_row_start + r;
+        const int g_col = (k_base + BK) + c;
+
+        if (g_row < M && (g_col + VEC_A_SIZE - 1) < K) {
+          regA[i] = *reinterpret_cast<const float4 *>(&A[(size_t)g_row * K + g_col]);
+        } else {
+          float tmp[4] = {0, 0, 0, 0};
+#pragma unroll
+          for (int j = 0; j < 4; ++j)
+            if (g_row < M && (g_col + j) < K)
+              tmp[j] = A[(size_t)g_row * K + (g_col + j)];
+          regA[i] = *reinterpret_cast<float4 *>(tmp);
+        }
+      }
+
+#pragma unroll
+      for (int i = 0; i < B_VEC_PER_THR; ++i) {
+        const int vec_idx = tid + i * BLOCK_THREADS;
+        const int elem_idx = vec_idx * VEC_B_SIZE;
+        const int r = elem_idx / BN;
+        const int c = elem_idx % BN;
+        const int g_row = (k_base + BK) + r;
+        const int g_col = block_col_start + c;
+
+        if (g_row < K && (g_col + VEC_B_SIZE - 1) < N) {
+          regB[i] = *reinterpret_cast<const uint4 *>(&B[(size_t)g_row * N + g_col]);
+        } else {
+          regB[i] = uint4{0, 0, 0, 0};
+        }
+      }
+    }
+
+#pragma unroll
+    for (int kk = 0; kk < BK; kk += WK) {
+#pragma unroll
+      for (int mt = 0; mt < M_TILES; ++mt) {
+#pragma unroll
+        for (int nt = 0; nt < N_TILES; ++nt) {
+          const int a_row = wave_row * TM + mt * WM + lx;
+          const int b_col = wave_col * TN + nt * WN + lx;
+
+          bf16x4 a_vec, b_vec;
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            const int kcol = i + ly * 4;
+            a_vec[i] = As[a_row][kk + kcol];
+            b_vec[i] = Bs[kk + kcol][b_col];
+          }
+          acc[mt][nt] = MFMA_BF16_16x16(a_vec, b_vec, acc[mt][nt]);
+        }
+      }
+    }
+
+    __syncthreads();
+
+    if (has_next) {
+#pragma unroll
+      for (int i = 0; i < A_VEC_PER_THR; i++) {
+        const int elem_idx = (tid + i * BLOCK_THREADS) * VEC_A_SIZE;
+        const int r = elem_idx / BK;
+        const int c = elem_idx % BK;
+        const bf16x4 p = pack_f4_to_bf16x4(regA[i]);
+        As[r][c + 0] = p[0];
+        As[r][c + 1] = p[1];
+        As[r][c + 2] = p[2];
+        As[r][c + 3] = p[3];
+      }
+
+#pragma unroll
+      for (int i = 0; i < B_VEC_PER_THR; ++i) {
+        const int elem_idx = (tid + i * BLOCK_THREADS) * VEC_B_SIZE;
+        const int r = elem_idx / BN;
+        const int c = elem_idx % BN;
+        *reinterpret_cast<uint4 *>(&Bs[r][c]) = regB[i];
+      }
+
+      __syncthreads();
+    }
+  }
+
+#pragma unroll
+  for (int mt = 0; mt < M_TILES; ++mt) {
+#pragma unroll
+    for (int nt = 0; nt < N_TILES; ++nt) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int row = wave_row_start + mt * WM + (i + 4 * ly);
+        const int col = wave_col_start + nt * WN + lx;
+        if (row < M && col < N) {
+          float out = acc[mt][nt][i];
+          if (bias)
+            out += (float)bias[col];
+          C[(size_t)row * N + col] = out;
+        }
+      }
+    }
+  }
+}
+
+template <int BM, int BN, int BK, int TM, int TN, int BLOCK_THREADS>
+__global__ __launch_bounds__(BLOCK_THREADS) void gemm_mfma_v2_bf16(const bf16 *__restrict__ A,
+                                                                   const bf16 *__restrict__ B,
+                                                                   float *__restrict__ C,
+                                                                   const bf16 *__restrict__ bias,
+                                                                   int M, int N, int K) {
+  constexpr int WM = 16, WN = 16, WK = 16;
+  constexpr int VEC_B_SIZE = 8;
+  constexpr int VEC_A_SIZE = 8;
+
+  const int tid = threadIdx.x;
+  const int wave_id = tid >> 6;
+  const int lane_id = tid & 63;
+
+  const int block_row_start = blockIdx.y * BM;
+  const int block_col_start = blockIdx.x * BN;
+
+  const int waves_per_block_m = BM / TM;
+  const int waves_per_block_n = BN / TN;
+  const int wave_row = wave_id / waves_per_block_n;
+  const int wave_col = wave_id % waves_per_block_n;
+
+  const int wave_row_start = block_row_start + wave_row * TM;
+  const int wave_col_start = block_col_start + wave_col * TN;
+
+  // Khai báo shared memory
+  __shared__ __bf16 As[BM][BK + 2];
+  __shared__ __bf16 Bs[BK][BN + 2];
+
+  // Khai báo thanh ghi tích lũy (accumulator)
+  constexpr int M_TILES = TM / WM;
+  constexpr int N_TILES = TN / WN;
+  f32x4 acc[M_TILES][N_TILES];
+#pragma unroll
+  for (int i = 0; i < M_TILES; ++i)
+#pragma unroll
+    for (int j = 0; j < N_TILES; ++j)
+      acc[i][j] = {0.f, 0.f, 0.f, 0.f};
+
+  constexpr int A_ELEMS_TILE = BM * BK;
+  constexpr int B_ELEMS_TILE = BK * BN;
+  constexpr int A_VEC_PER_THR = (A_ELEMS_TILE / VEC_A_SIZE) / BLOCK_THREADS;
+  constexpr int B_VEC_PER_THR = (B_ELEMS_TILE / VEC_B_SIZE) / BLOCK_THREADS;
+
+  const int lx = lane_id & 15;
+  const int ly = lane_id >> 4;
+
+#pragma unroll
+  for (int i = 0; i < A_VEC_PER_THR; i++) {
+    const int vec_idx = tid + i * BLOCK_THREADS;
+    const int elem_idx = vec_idx * VEC_A_SIZE;
+    const int r = elem_idx / BK;
+    const int c = elem_idx % BK;
+    const int g_row = block_row_start + r;
+    const int g_col = 0 + c;
+
+    // THAY ĐỔI: Tải 8 phần tử bf16 (16 bytes) bằng uint4
+    if (g_row < M && (g_col + VEC_A_SIZE - 1) < K) {
+      *reinterpret_cast<uint4 *>(&As[r][c]) =
+        *reinterpret_cast<const uint4 *>(&A[(size_t)g_row * K + g_col]);
+    } else {
+      // Xử lý vùng biên, điền 0
+      uint4 z = {0, 0, 0, 0};
+      *reinterpret_cast<uint4 *>(&As[r][c]) = z;
+    }
+  }
+
+  // Tải tile đầu tiên của B vào shared memory
+#pragma unroll
+  for (int i = 0; i < B_VEC_PER_THR; ++i) {
+    const int vec_idx = tid + i * BLOCK_THREADS;
+    const int elem_idx = vec_idx * VEC_B_SIZE;
+    const int r = elem_idx / BN;
+    const int c = elem_idx % BN;
+    const int g_row = 0 + r;
+    const int g_col = block_col_start + c;
+
+    if (g_row < K && (g_col + VEC_B_SIZE - 1) < N) {
+      *reinterpret_cast<uint4 *>(&Bs[r][c]) =
+        *reinterpret_cast<const uint4 *>(&B[(size_t)g_row * N + g_col]);
+    } else {
+      uint4 z = {0, 0, 0, 0};
+      *reinterpret_cast<uint4 *>(&Bs[r][c]) = z;
+    }
+  }
+  __syncthreads();
+
+  // Vòng lặp chính - Software Pipelining
+  for (int k_base = 0; k_base < K; k_base += BK) {
+    // THAY ĐỔI: Thanh ghi cho A bây giờ là uint4 để chứa 8 phần tử bf16
+    uint4 regA[A_VEC_PER_THR];
+    uint4 regB[B_VEC_PER_THR];
+    const bool has_next = (k_base + BK) < K;
+
+    if (has_next) {
+      // Tải trước (prefetch) tile tiếp theo của A vào thanh ghi
+#pragma unroll
+      for (int i = 0; i < A_VEC_PER_THR; i++) {
+        const int vec_idx = tid + i * BLOCK_THREADS;
+        const int elem_idx = vec_idx * VEC_A_SIZE;
+        const int r = elem_idx / BK;
+        const int c = elem_idx % BK;
+        const int g_row = block_row_start + r;
+        const int g_col = (k_base + BK) + c;
+
+        // THAY ĐỔI: Tải trực tiếp bf16 vào regA, không cần chuyển đổi
+        if (g_row < M && (g_col + VEC_A_SIZE - 1) < K) {
+          regA[i] = *reinterpret_cast<const uint4 *>(&A[(size_t)g_row * K + g_col]);
+        } else {
+          regA[i] = uint4{0, 0, 0, 0};
+        }
+      }
+
+      // Tải trước (prefetch) tile tiếp theo của B vào thanh ghi
+#pragma unroll
+      for (int i = 0; i < B_VEC_PER_THR; ++i) {
+        const int vec_idx = tid + i * BLOCK_THREADS;
+        const int elem_idx = vec_idx * VEC_B_SIZE;
+        const int r = elem_idx / BN;
+        const int c = elem_idx % BN;
+        const int g_row = (k_base + BK) + r;
+        const int g_col = block_col_start + c;
+
+        if (g_row < K && (g_col + VEC_B_SIZE - 1) < N) {
+          regB[i] = *reinterpret_cast<const uint4 *>(&B[(size_t)g_row * N + g_col]);
+        } else {
+          regB[i] = uint4{0, 0, 0, 0};
+        }
+      }
+    }
+
+    // Vòng lặp tính toán MFMA
+#pragma unroll
+    for (int kk = 0; kk < BK; kk += WK) {
+#pragma unroll
+      for (int mt = 0; mt < M_TILES; ++mt) {
+#pragma unroll
+        for (int nt = 0; nt < N_TILES; ++nt) {
+          const int a_row = wave_row * TM + mt * WM + lx;
+          const int b_col = wave_col * TN + nt * WN + lx;
+
+          bf16x4 a_vec, b_vec;
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            const int kcol = i + ly * 4;
+            a_vec[i] = As[a_row][kk + kcol];
+            b_vec[i] = Bs[kk + kcol][b_col];
+          }
+          acc[mt][nt] = MFMA_BF16_16x16(a_vec, b_vec, acc[mt][nt]);
+        }
+      }
+    }
+
+    __syncthreads();
+
+    // Ghi dữ liệu đã tải trước từ thanh ghi vào shared memory cho lần lặp tiếp theo
+    if (has_next) {
+#pragma unroll
+      for (int i = 0; i < A_VEC_PER_THR; i++) {
+        const int elem_idx = (tid + i * BLOCK_THREADS) * VEC_A_SIZE;
+        const int r = elem_idx / BK;
+        const int c = elem_idx % BK;
+        // THAY ĐỔI: Ghi trực tiếp từ regA (uint4) vào As
+        *reinterpret_cast<uint4 *>(&As[r][c]) = regA[i];
+      }
+
+#pragma unroll
+      for (int i = 0; i < B_VEC_PER_THR; ++i) {
+        const int elem_idx = (tid + i * BLOCK_THREADS) * VEC_B_SIZE;
+        const int r = elem_idx / BN;
+        const int c = elem_idx % BN;
+        *reinterpret_cast<uint4 *>(&Bs[r][c]) = regB[i];
+      }
+
+      __syncthreads();
+    }
+  }
+
+  // Ghi kết quả cuối cùng từ thanh ghi tích lũy ra global memory
+#pragma unroll
+  for (int mt = 0; mt < M_TILES; ++mt) {
+#pragma unroll
+    for (int nt = 0; nt < N_TILES; ++nt) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int row = wave_row_start + mt * WM + (i + 4 * ly);
+        const int col = wave_col_start + nt * WN + lx;
+        if (row < M && col < N) {
+          float out = acc[mt][nt][i];
+          if (bias)
+            out += (float)bias[col];
+          C[(size_t)row * N + col] = out;
+        }
+      }
+    }
+  }
+}
+
 // ===== Launcher =====
-inline void launch_gemm_mfma_v2(const float *A, const bf16 *B, float *C, int M, int N, int K,
-                                hipStream_t stream = nullptr, const bf16 *bias = nullptr) {
-  constexpr int BM = 64;
-  constexpr int BN = 128;
-  constexpr int BK = 64;  // multiple of 16; try 64 for big-K
-  constexpr int TM = 32;
-  constexpr int TN = 32;
+inline void launch_gemm_mfma_v2_bf16(const bf16 *A, const bf16 *B, float *C, int M, int N, int K,
+                                     hipStream_t stream = nullptr, const bf16 *bias = nullptr) {
+  constexpr int BM = 128;
+  constexpr int BN = 256;
+  constexpr int BK = 32;  // multiple of 16; try 64 for big-K
+  constexpr int TM = 64;
+  constexpr int TN = 64;
   constexpr int BLOCK_THREADS = 512;
 
   dim3 block_dim(BLOCK_THREADS);
   dim3 grid_dim((N + BN - 1) / BN, (M + BM - 1) / BM);
 
-  hipLaunchKernelGGL((gemm_mfma_v2<BM, BN, BK, TM, TN, BLOCK_THREADS>), grid_dim, block_dim, 0,
+  hipLaunchKernelGGL((gemm_mfma_v2_bf16<BM, BN, BK, TM, TN, BLOCK_THREADS>), grid_dim, block_dim, 0,
                      stream, A, B, C, bias, M, N, K);
+}
+
+// ===== Launcher =====
+inline void launch_gemm_mfma_v2(const float *A, const bf16 *B, float *C, int M, int N, int K,
+                                hipStream_t stream = nullptr, const bf16 *bias = nullptr) {
+  constexpr int BM = 128;
+  constexpr int BN = 256;
+  constexpr int BK = 32;  // multiple of 16; try 64 for big-K
+  constexpr int TM = 64;
+  constexpr int TN = 64;
+  constexpr int BLOCK_THREADS = 512;
+
+  dim3 block_dim(BLOCK_THREADS);
+  dim3 grid_dim((N + BN - 1) / BN, (M + BM - 1) / BM);
+
+  hipLaunchKernelGGL((gemm_mfma_v2_origin<BM, BN, BK, TM, TN, BLOCK_THREADS>), grid_dim, block_dim,
+                     0, stream, A, B, C, bias, M, N, K);
 }

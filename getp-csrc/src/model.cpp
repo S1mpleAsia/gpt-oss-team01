@@ -27,16 +27,16 @@ int *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flow_
     fflush(stdout);
 #endif
     // attention rmsnorm
-    rmsnorm_batched(rs_now->x, weights_now->rms_attn_w, rs_now->t, cur_batch_size, 1ll * l, false,
-                    false, 1e-5f, stream);
+    rmsnorm_batched_quantize(rs_now->x, weights_now->rms_attn_w, rs_now->t, cur_batch_size, 1ll * l,
+                             false, false, 1e-5f, stream);
 
     // key and value point to the kv cache
     long long loff = 1ll * l * loff_one;  // kv cache layer offset
 
     // QKV projection
-    qkv_gemm_batched_v2(rs_now->t, weights_now->w_qkv, weights_now->b_qkv, rs_now->qkv,
-                        cur_batch_size, 1ll * l, false, false,
-                        stream);  // This kernel diverges the most
+    qkv_gemm_batched_v2_quantize(rs_now->t, weights_now->w_qkv, weights_now->b_qkv, rs_now->qkv,
+                                 cur_batch_size, 1ll * l, false, false,
+                                 stream);  // This kernel diverges the most
 
     Tensor *key_cache = ((l & 1ll) == 0) ? rs_now->key_cache_even : rs_now->key_cache_odd;
     Tensor *value_cache = ((l & 1ll) == 0) ? rs_now->value_cache_even : rs_now->value_cache_odd;
@@ -48,15 +48,16 @@ int *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flow_
     int kv_mul = p->n_attn_heads / p->n_kv_heads;  // integer multiplier for GQA
 
     // FIX single_query_attn_batched later
-    single_query_attn_flash_batched(
+    single_query_attn_flash_batched_quantize(
       rs_now->q, key_cache, value_cache, rs_now->mask, weights_now->attn_sinks, rs_now->tb,
       rs_now->g_fa_pmax, rs_now->g_fa_psum, rs_now->g_fa_pnum, cur_batch_size, p->head_dim,
       p->n_attn_heads, kv_mul, kv_dim, p->seq_len, p->sliding_window, pos, 1ll * l, false, false,
       false, false, false, stream);
 
     // final matmul to get the output of the attention
-    attn_out_project_batched_v2(rs_now->tb, weights_now->w_o, weights_now->b_o, rs_now->tb2, true,
-                                cur_batch_size, 1ll * l, false, false, stream);
+    attn_out_project_batched_v2_quantize(rs_now->tb, weights_now->w_o, weights_now->b_o,
+                                         rs_now->tb2, true, cur_batch_size, 1ll * l, false, false,
+                                         stream);
 
     // residual connection back into x
     // add_vector_batched(rs_now->x, rs_now->tb2, false, false, false);  // equals residual add
@@ -64,16 +65,17 @@ int *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flow_
     // ffn rmsnorm
     // rmsnorm_batched(rs_now->x, weights_now->rms_ffn_w, rs_now->t, 1ll * l, false, false);
 
-    residual_rmsnorm_batched(rs_now->tb2, rs_now->x, weights_now->rms_ffn_w, rs_now->t,
-                             cur_batch_size, 1ll * l, 1e-5f, stream);
+    residual_rmsnorm_batched_quantize(rs_now->tb2, rs_now->x, weights_now->rms_ffn_w, rs_now->t,
+                                      cur_batch_size, 1ll * l, 1e-5f, stream);
 
 #ifdef DEBUG
     rs_now->x->printDebug("rs_now->x", 0, 0, stream);
 #endif
 
     // MoE routing
-    router_gemm_batched(weights_now->w_router, rs_now->t, weights_now->b_router,
-                        rs_now->router_score, cur_batch_size, 1ll * l, false, false, stream);
+    router_gemm_batched_quantize(weights_now->w_router, rs_now->t, weights_now->b_router,
+                                 rs_now->router_score, cur_batch_size, 1ll * l, false, false,
+                                 stream);
 
 #ifdef DEBUG
     rs_now->router_score->printDebug("rs_now->router_score", 0, 0, stream);
@@ -95,26 +97,28 @@ int *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flow_
     moe_build_offsets_hip(rs_now->topk_i, rs_now->sorted_pair_ids, rs_now->expert_offsets,
                           cur_batch_size, p->experts_per_token, p->n_experts, stream);
 
-    moe_pack_inputs_hip(rs_now->t, rs_now->sorted_pair_ids, rs_now->x_packed, cur_batch_size,
-                        p->hidden_dim, p->experts_per_token, stream);
+    moe_pack_inputs_hip_quantize(rs_now->t, rs_now->sorted_pair_ids, rs_now->x_packed,
+                                 cur_batch_size, p->hidden_dim, p->experts_per_token, stream);
 
     int max_rows = moe_get_max_rows_per_expert_hip(rs_now->expert_offsets, rs_now->max_rows,
                                                    p->n_experts, stream);
-    moe_mlp1_forward_hip(rs_now->x_packed, weights_now->w_mlp1, weights_now->b_mlp1,
-                         rs_now->expert_offsets, rs_now->mlp1_out, 1ll * l, p->n_experts,
-                         p->hidden_dim, p->intermediate_dim, max_rows, total_pairs, stream);
+    moe_mlp1_forward_hip_quantize(rs_now->x_packed, weights_now->w_mlp1, weights_now->b_mlp1,
+                                  rs_now->expert_offsets, rs_now->mlp1_out, 1ll * l, p->n_experts,
+                                  p->hidden_dim, p->intermediate_dim, max_rows, total_pairs,
+                                  stream);
 
-    moe_swiglu_hip(rs_now->mlp1_out, rs_now->gate_up, cur_batch_size, p->experts_per_token,
-                   p->intermediate_dim, p->swiglu_limit, stream);
+    moe_swiglu_hip_quantize(rs_now->mlp1_out, rs_now->gate_up, cur_batch_size, p->experts_per_token,
+                            p->intermediate_dim, p->swiglu_limit, stream);
 
     // moe_mlp1_swiglu_fused_hip(rs_now->x_packed, weights_now->w_mlp1, weights_now->b_mlp1,
     //                           rs_now->expert_offsets, rs_now->gate_up, 1ll * l, p->n_experts,
     //                           p->hidden_dim, p->intermediate_dim, p->swiglu_limit, max_rows,
     //                           total_pairs, stream);
 
-    moe_mlp2_forward_hip(rs_now->gate_up, weights_now->w_mlp2, weights_now->b_mlp2,
-                         rs_now->expert_offsets, rs_now->tb3, true, 1ll * l, p->n_experts,
-                         p->intermediate_dim, p->hidden_dim, max_rows, total_pairs, stream);
+    moe_mlp2_forward_hip_quantize(rs_now->gate_up, weights_now->w_mlp2, weights_now->b_mlp2,
+                                  rs_now->expert_offsets, rs_now->tb3, true, 1ll * l, p->n_experts,
+                                  p->intermediate_dim, p->hidden_dim, max_rows, total_pairs,
+                                  stream);
 
     moe_scatter_aggregate_hip_120b(rs_now->tb3, rs_now->sorted_pair_ids, rs_now->topk_v,
                                    rs_now->e_agg, rs_now->expert_offsets, p->hidden_dim,
@@ -135,12 +139,12 @@ int *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flow_
   }
 
   // final rmsnorm
-  rmsnorm_batched(rs_now->x, weights_now->rms_out_w, rs_now->x, cur_batch_size, 0ll, false, false,
-                  1e-5f, stream);
+  rmsnorm_batched_quantize(rs_now->x, weights_now->rms_out_w, rs_now->x_quantize, cur_batch_size,
+                           0ll, false, false, 1e-5f, stream);
 
   // classifier into logits
-  classifier_gemm_batched_v2(weights_now->out, rs_now->x, rs_now->logits, cur_batch_size, false,
-                             false, stream);
+  classifier_gemm_batched_v2_quantize(weights_now->out, rs_now->x_quantize, rs_now->logits,
+                                      cur_batch_size, false, false, stream);
 
   max_logits_batched(rs_now->logits, rs_now->logits_max, rs_now->logits_id, cur_batch_size, 0,
                      false, false, true, stream);
@@ -207,8 +211,8 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
 #endif
 
     // attention rmsnorm
-    rmsnorm_batched(rs_now->x, weights_now->rms_attn_w, rs_now->t, cur_batch_size, 1ll * l, false,
-                    false, 1e-5f, stream);
+    rmsnorm_batched_quantize(rs_now->x, weights_now->rms_attn_w, rs_now->t, cur_batch_size, 1ll * l,
+                             false, false, 1e-5f, stream);
 
 #ifdef DEBUG
     if (flag)
@@ -250,7 +254,7 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
     int kv_mul = p->n_attn_heads / p->n_kv_heads;  // integer multiplier for GQA
 
     // FIX single_query_attn_batched later
-    single_query_attn_flash_batched(
+    single_query_attn_flash_batched_quantize(
       rs_now->q, key_cache, value_cache, rs_now->mask, weights_now->attn_sinks, rs_now->tb,
       rs_now->g_fa_pmax, rs_now->g_fa_psum, rs_now->g_fa_pnum, cur_batch_size, p->head_dim,
       p->n_attn_heads / TP, kv_mul, kv_dim / TP, p->seq_len, p->sliding_window, pos, 1ll * l, false,
@@ -289,8 +293,8 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
 #endif
 
     // residual connection back into x + ffn rmsnorm
-    residual_rmsnorm_batched(rs_now->tb2, rs_now->x, weights_now->rms_ffn_w, rs_now->t,
-                             cur_batch_size, 1ll * l, 1e-5f, stream);
+    residual_rmsnorm_batched_quantize(rs_now->tb2, rs_now->x, weights_now->rms_ffn_w, rs_now->t,
+                                      cur_batch_size, 1ll * l, 1e-5f, stream);
 
 #ifdef DEBUG
     if (flag)
@@ -336,8 +340,8 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
     }
 #endif
 
-    moe_pack_inputs_hip(rs_now->t, rs_now->sorted_pair_ids, rs_now->x_packed, cur_batch_size,
-                        p->hidden_dim, p->experts_per_token, stream);
+    moe_pack_inputs_hip_quantize(rs_now->t, rs_now->sorted_pair_ids, rs_now->x_packed,
+                                 cur_batch_size, p->hidden_dim, p->experts_per_token, stream);
 
 #ifdef RUN_EP
     rs_now->expert_offsets->from_device(stream);
@@ -452,11 +456,11 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
 
   if ((pp_rank + 1) % PP == 0) {
     // final rmsnorm
-    rmsnorm_batched(rs_now->x, weights_now->rms_out_w, rs_now->x, cur_batch_size, 0ll, false, false,
-                    1e-5f, stream);
+    rmsnorm_batched_quantize(rs_now->x, weights_now->rms_out_w, rs_now->x_quantize, cur_batch_size,
+                             0ll, false, false, 1e-5f, stream);
 
     // classifier into logits
-    classifier_gemm_batched_v2(weights_now->out_buffer, rs_now->x, rs_now->tmp_logits,
+    classifier_gemm_batched_v2(weights_now->out_buffer, rs_now->x_quantize, rs_now->tmp_logits,
                                cur_batch_size, false, false, stream);
 
     // all_gather_classifier_final(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream, tp_ready, tp_finish);

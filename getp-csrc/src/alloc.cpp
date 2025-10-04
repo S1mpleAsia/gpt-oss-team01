@@ -66,9 +66,31 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   weights->attn_sinks =
     new Tensor({(size_t)p->n_layers, (size_t)p->n_attn_heads}, w->attn_sinks, stream);
 
-  weights->w_router = new Tensor({(size_t)p->n_layers, (size_t)p->n_experts, (size_t)p->hidden_dim},
-                                 w->w_router, stream);
-  weights->b_router = new Tensor({(size_t)p->n_layers, (size_t)p->n_experts}, w->b_router, stream);
+  // weights->w_router = new Tensor({(size_t)p->n_layers, (size_t)p->n_experts, (size_t)p->hidden_dim},
+  //                                w->w_router, stream);
+  {
+    size_t n_layers = p->n_layers;
+    size_t n_experts = p->n_experts;
+    size_t hidden_dim = p->hidden_dim;
+
+    weights->w_router = new Tensor({n_layers, hidden_dim, n_experts}, stream, DType::BF16);
+
+    for (size_t l = 0; l < n_layers; l++) {
+      float *src_ptr = w->w_router + 1ll * l * n_experts * hidden_dim;
+      float *dst_ptr = weights->w_router->buf + 1ll * l * hidden_dim * n_experts;
+
+      for (size_t e = 0; e < n_experts; e++) {
+        for (size_t h = 0; h < hidden_dim; h++) {
+          dst_ptr[h * n_experts + e] = src_ptr[e * hidden_dim + h];
+        }
+      }
+    }
+
+    weights->w_router->to_device(stream);
+  }
+
+  weights->b_router =
+    new Tensor({(size_t)p->n_layers, (size_t)p->n_experts}, w->b_router, stream, DType::BF16);
 
   {
     printf("Starting alloc mlp1\n");
@@ -180,9 +202,10 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   CHECK_HIP(hipSetDevice(device_id));
 
   rs->x = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
+  rs->x_quantize = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream, DType::BF16);
 
-  rs->t = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
-  rs->tb = new Tensor({BATCH_SIZE, (size_t)p->head_dim * p->n_attn_heads}, stream);
+  rs->t = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream, DType::BF16);
+  rs->tb = new Tensor({BATCH_SIZE, (size_t)p->head_dim * p->n_attn_heads}, stream, DType::BF16);
   rs->tb2 = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
 
   rs->tb3 = new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->hidden_dim}, stream);
@@ -193,8 +216,8 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
 
   rs->mlp1_out =
     new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, 2 * (size_t)p->intermediate_dim}, stream);
-  rs->gate_up =
-    new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
+  rs->gate_up = new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim},
+                           stream, DType::BF16);
 
   rs->e_agg = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
 
@@ -240,8 +263,8 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   // MoE buffer
   rs->sorted_pair_ids = new TensorI32({(size_t)BATCH_SIZE * p->experts_per_token}, stream);
   rs->expert_offsets = new TensorI32({(size_t)(p->n_experts + 1)}, stream);
-  rs->x_packed =
-    new Tensor({(size_t)BATCH_SIZE * p->experts_per_token, (size_t)p->hidden_dim}, stream);
+  rs->x_packed = new Tensor({(size_t)BATCH_SIZE * p->experts_per_token, (size_t)p->hidden_dim},
+                            stream, DType::BF16);
 
   rs->tokens_buf = new TensorI32({(size_t)BATCH_SIZE}, stream);
   CHECK_HIP(hipMalloc(&rs->max_rows, sizeof(int)));
@@ -863,13 +886,18 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
 
   // Create Tensor wrappers for state buffers
   rs->x = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
+  rs->x_quantize = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream, DType::BF16);
 
-  rs->t = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
-  rs->tb = new Tensor({BATCH_SIZE, (size_t)p->head_dim * p->n_attn_heads / TP}, stream);
+  rs->t = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream, DType::BF16);
+  rs->tb =
+    new Tensor({BATCH_SIZE, (size_t)p->head_dim * p->n_attn_heads / TP}, stream, DType::BF16);
   // rs->tb_buf = new Tensor({BATCH_SIZE, (size_t)p->head_dim * p->n_attn_heads / TP}, stream);
 
   rs->tb2 = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
   rs->tb2_quantize = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream, DType::FP8);
+  // rs->tb2_half = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / (TP / 4)}, stream, DType::FP8);
+  // rs->tb2_quad = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / (TP / 2)}, stream, DType::FP8);
+  // rs->tb2_oct = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / (TP / 1)}, stream, DType::FP8);
 #if TP == 4
   // rs->tb2_recv = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / TP}, stream);
   rs->tb2_buf = new Tensor({TP / 2, BATCH_SIZE, (size_t)p->hidden_dim}, stream);
@@ -892,8 +920,8 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   // rs->up =
   //   new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
 
-  rs->gate_up =
-    new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
+  rs->gate_up = new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim},
+                           stream, DType::BF16);
 
   rs->e_agg = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
   rs->e_agg_quantize = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream, DType::FP8);
@@ -955,12 +983,12 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   // MoE buffers
   rs->sorted_pair_ids = new TensorI32({(size_t)BATCH_SIZE * p->experts_per_token}, stream);
   rs->expert_offsets = new TensorI32({(size_t)(p->n_experts + 1)}, stream);
-  rs->x_packed =
-    new Tensor({(size_t)BATCH_SIZE * p->experts_per_token, (size_t)p->hidden_dim}, stream);
+  rs->x_packed = new Tensor({(size_t)BATCH_SIZE * p->experts_per_token, (size_t)p->hidden_dim},
+                            stream, DType::BF16);
 
 #ifdef RUN_EP
-  rs->x_packed_local =
-    new Tensor({(size_t)BATCH_SIZE * p->experts_per_token, (size_t)p->hidden_dim}, stream);
+  rs->x_packed_local = new Tensor(
+    {(size_t)BATCH_SIZE * p->experts_per_token, (size_t)p->hidden_dim}, stream, DType::BF16);
   rs->expert_offsets_local = new TensorI32({(size_t)(p->n_experts / TP + 1)}, stream);
 #endif
 

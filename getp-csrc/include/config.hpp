@@ -8,17 +8,17 @@
 // #include "config_run.hpp"
 #include "pipeline.hpp"
 
-#define BATCH_SIZE 896
+#define BATCH_SIZE 6500
 #define PP_SLOT 1
 #define KV16
 // #define PRINT_LOGITS
 #define TIME_GPU
 // #define DEBUG
-#define RUN_20B
+// #define RUN_20B
 #define RUN_EP
 
 #ifdef RUN_20B
-#define DP 1
+#define DP 8
 #define PP 1
 #define TP 1
 #else
@@ -71,7 +71,8 @@ typedef struct {
   Tensor *sin_tensor;
 
   // current wave of activations
-  Tensor *x;   // activation at current time stamp (hidden_dim, )
+  Tensor *x;  // activation at current time stamp (hidden_dim, )
+  Tensor *x_quantize;
   Tensor *t;   // same, but inside a residual branch (hidden_dim, )
   Tensor *tb;  // (head_dim * n_attn_heads, )
   // Tensor *tb_buf;
@@ -79,6 +80,9 @@ typedef struct {
   Tensor *tb2_buf;
   Tensor *tb2_recv;
   Tensor *tb2_quantize;
+  Tensor *tb2_half;
+  Tensor *tb2_quad;
+  Tensor *tb2_oct;
   Tensor *tb3;  // (BATCH_SIZE, experts_per_token)
   Tensor *tb3_buf;
   Tensor *tb3_recv;

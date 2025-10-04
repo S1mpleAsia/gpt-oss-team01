@@ -30,6 +30,12 @@ static inline void moe_pack_inputs(
   Tensor *x_packed,            // [batch_size * experts_per_token, hidden_dim]
   int batch_size, int hidden_dim, int experts_per_token, hipStream_t stream);
 
+static inline void moe_pack_inputs_bf16(
+  Tensor *x_in,                // [batch_size, hidden_dim]
+  TensorI32 *sorted_pair_ids,  // [batch_size * experts_per_token]
+  Tensor *x_packed,            // [batch_size * experts_per_token, hidden_dim]
+  int batch_size, int hidden_dim, int experts_per_token, hipStream_t stream);
+
 // 3) lấy max số hàng trên mỗi expert từ offsets
 static inline int moe_get_max_rows_per_expert(TensorI32 *expert_offsets, int *d_max_rows,
                                               int n_experts, hipStream_t stream);
@@ -45,11 +51,24 @@ static inline void moe_mlp1_forward(Tensor *x_packed,  // [total_pairs, hidden_d
                                     int inter_dim, int max_rows_per_expert, int total_pairs,
                                     hipStream_t stream);
 
+static inline void moe_mlp1_forward_bf16(Tensor *x_packed,  // [total_pairs, hidden_dim]
+                                         Tensor *w_mlp1, Tensor *b_mlp1,
+                                         TensorI32 *expert_offsets,  // [n_experts+1]
+                                         Tensor *mlp1_out,           // [total_pairs, 2*inter_dim]
+                                         long long layer_offset, int n_experts, int hidden_dim,
+                                         int inter_dim, int max_rows_per_expert, int total_pairs,
+                                         hipStream_t stream);
+
 // 5) SwiGLU (interleaved) & clamp
 static inline void moe_swiglu(Tensor *mlp1_out,  // [total_pairs, 2*inter_dim]
                               Tensor *gate_up,   // [total_pairs, inter_dim]
                               int batch_size, int experts_per_token, int inter_dim,
                               float clamp_limit, hipStream_t stream);
+
+static inline void moe_swiglu_bf16(Tensor *mlp1_out,  // [total_pairs, 2*inter_dim]
+                                   Tensor *gate_up,   // [total_pairs, inter_dim]
+                                   int batch_size, int experts_per_token, int inter_dim,
+                                   float clamp_limit, hipStream_t stream);
 
 static inline void moe_mlp1_swiglu_fused(
   Tensor *x_packed,           // [total_pairs, hidden_dim]
@@ -71,6 +90,14 @@ static inline void moe_mlp2_forward(Tensor *gate_up,  // [total_pairs, inter_dim
                                     bool has_bias, long long layer_offset, int n_experts,
                                     int inter_dim, int hidden_dim, int max_rows_per_expert,
                                     int total_pairs, hipStream_t stream);
+
+static inline void moe_mlp2_forward_bf16(Tensor *gate_up,  // [total_pairs, inter_dim]
+                                         Tensor *w_mlp2, Tensor *b_mlp2,
+                                         TensorI32 *expert_offsets,  // [n_experts+1]
+                                         Tensor *tb3,                // [total_pairs, hidden_dim]
+                                         bool has_bias, long long layer_offset, int n_experts,
+                                         int inter_dim, int hidden_dim, int max_rows_per_expert,
+                                         int total_pairs, hipStream_t stream);
 
 // 7) scatter-add có scale theo topk_v -> e_agg
 static inline void moe_scatter_aggregate(

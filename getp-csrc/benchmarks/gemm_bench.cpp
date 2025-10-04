@@ -99,7 +99,188 @@ __global__ void bf16_to_fp32_kernel(const bf16 *__restrict__ bf16_in, float *__r
     fp32_out[i] = (float)bf16_in[i];
 }
 
+#define RUN_BF16
+
+#ifdef RUN_BF16
 // ----------------- Bench: your custom kernel -----------------
+static float bench_custom(const bf16 *dA_bf16, const bf16 *dB_bf16, float *dC, int M, int N, int K,
+                          hipStream_t stream, int iters) {
+  CHECK_HIP(hipMemsetAsync(dC, 0, sizeof(float) * (size_t)M * N, stream));
+  // warmup
+  for (int i = 0; i < 3; ++i)
+    launch_gemm_mfma_v2_bf16(dA_bf16, dB_bf16, dC, M, N, K, stream);
+  CHECK_HIP(hipStreamSynchronize(stream));
+  // timed
+  hipEvent_t start, stop;
+  CHECK_HIP(hipEventCreate(&start));
+  CHECK_HIP(hipEventCreate(&stop));
+  CHECK_HIP(hipEventRecord(start, stream));
+  for (int i = 0; i < iters; ++i)
+    launch_gemm_mfma_v2_bf16(dA_bf16, dB_bf16, dC, M, N, K, stream);
+  CHECK_HIP(hipEventRecord(stop, stream));
+  CHECK_HIP(hipEventSynchronize(stop));
+  float ms = 0.f;
+  CHECK_HIP(hipEventElapsedTime(&ms, start, stop));
+  CHECK_HIP(hipEventDestroy(start));
+  CHECK_HIP(hipEventDestroy(stop));
+  return ms / (float)iters;
+}
+
+#if WITH_ROCBLAS
+// ----------------- Bench: rocBLAS BF16 GEMM (A=BF16, B=BF16, C=FP32) -----------------
+static float bench_rocblas_bf16_rowmajor(const bf16 *dA_r_bf16, const bf16 *dB_r_bf16, float *dC_r,
+                                         int M, int N, int K, hipStream_t stream,
+                                         rocblas_handle handle, int iters) {
+  CHECK_HIP(hipMemsetAsync(dC_r, 0, sizeof(float) * (size_t)M * N, stream));
+
+  // THAY ĐỔI: Không cần chuyển đổi A trên device nữa vì nó đã là bf16
+  const float alpha = 1.f, beta = 0.f;
+
+  // BF16 GEMM: C[FP32] = A[BF16] * B[BF16]
+  auto bf16_gemm_nn = [&]() {
+    return rocblas_gemm_ex(handle, rocblas_operation_none, rocblas_operation_none,
+                           /*m=*/N, /*n=*/M, /*k=*/K, &alpha,
+                           /*A=*/dB_r_bf16, rocblas_datatype_bf16_r, /*lda=*/N,
+                           /*B=*/dA_r_bf16, rocblas_datatype_bf16_r,
+                           /*ldb=*/K,  // THAY ĐỔI: Sử dụng trực tiếp dA_r_bf16
+                           &beta,
+                           /*C=*/dC_r, rocblas_datatype_f32_r, /*ldc=*/N,
+                           /*D=*/dC_r, rocblas_datatype_f32_r, /*ldd=*/N, rocblas_datatype_f32_r,
+                           rocblas_gemm_algo_standard, 0, 0);
+  };
+
+  // warmup
+  for (int i = 0; i < 3; ++i)
+    CHECK_ROCBLAS(bf16_gemm_nn());
+  CHECK_HIP(hipStreamSynchronize(stream));
+
+  // timed
+  hipEvent_t start, stop;
+  CHECK_HIP(hipEventCreate(&start));
+  CHECK_HIP(hipEventCreate(&stop));
+  CHECK_HIP(hipEventRecord(start, stream));
+  for (int i = 0; i < iters; ++i)
+    CHECK_ROCBLAS(bf16_gemm_nn());
+  CHECK_HIP(hipEventRecord(stop, stream));
+  CHECK_HIP(hipEventSynchronize(stop));
+  float ms = 0.f;
+  CHECK_HIP(hipEventElapsedTime(&ms, start, stop));
+
+  CHECK_HIP(hipEventDestroy(start));
+  CHECK_HIP(hipEventDestroy(stop));
+  return ms / (float)iters;
+}
+#endif
+
+// ----------------- main -----------------
+int main(int argc, char **argv) {
+  hipStream_t stream = nullptr;
+  CHECK_HIP(hipStreamCreate(&stream));
+
+#if WITH_ROCBLAS
+  rocblas_handle handle = nullptr;
+  CHECK_ROCBLAS(rocblas_create_handle(&handle));
+  CHECK_ROCBLAS(rocblas_set_stream(handle, stream));
+#endif
+
+  std::vector<GemmProblem> problems;
+  if ((argc - 1) % 3 != 0) {
+    std::cerr << "Usage: " << argv[0] << " [M N K]...\n"
+              << "  Default: 2048 5760 2880\n";
+    return EXIT_FAILURE;
+  }
+  if (argc == 1)
+    problems.push_back({2048, 5760, 2880});
+  else {
+    for (int i = 1; i < argc; i += 3) {
+      GemmProblem p{std::atoi(argv[i]), std::atoi(argv[i + 1]), std::atoi(argv[i + 2])};
+      if (p.M <= 0 || p.N <= 0 || p.K <= 0) {
+        std::cerr << "Invalid dims\n";
+        return EXIT_FAILURE;
+      }
+      problems.push_back(p);
+    }
+  }
+
+  const int iters = 1000;
+
+  for (auto &pb : problems) {
+    const int M = pb.M, N = pb.N, K = pb.K;
+    const size_t sizeA = (size_t)M * K, sizeB = (size_t)K * N, sizeC = (size_t)M * N;
+
+    std::cout << "Problem M=" << M << ", N=" << N << ", K=" << K << "\n";
+
+    // Host
+    // THAY ĐỔI: Tạo hA_bf16 để chứa dữ liệu A ở định dạng bf16 trên host
+    std::vector<float> hA_f32(sizeA), hB_f32(sizeB);
+    std::vector<bf16> hA_bf16(sizeA), hB_bf16(sizeB);
+    fill_random_normal(hA_f32, 0.0f, 1.0f);
+    fill_random_normal(hB_f32, 0.0f, 1.0f);
+    for (size_t i = 0; i < sizeA; ++i)
+      hA_bf16[i] = f32_to_bf16(hA_f32[i]);
+    for (size_t i = 0; i < sizeB; ++i)
+      hB_bf16[i] = f32_to_bf16(hB_f32[i]);
+
+    // Device
+    // THAY ĐỔI: dA bây giờ là bf16*, không còn là float*
+    bf16 *dA = nullptr, *dB = nullptr;
+    float *dC_custom = nullptr, *dC_rocblas = nullptr;
+    CHECK_HIP(hipMalloc(&dA, sizeof(bf16) * sizeA));  // THAY ĐỔI: sizeof(bf16)
+    CHECK_HIP(hipMalloc(&dB, sizeof(bf16) * sizeB));
+    CHECK_HIP(hipMalloc(&dC_custom, sizeof(float) * sizeC));
+    CHECK_HIP(hipMalloc(&dC_rocblas, sizeof(float) * sizeC));
+    // THAY ĐỔI: Sao chép dữ liệu hA_bf16 lên device
+    CHECK_HIP(
+      hipMemcpyAsync(dA, hA_bf16.data(), sizeof(bf16) * sizeA, hipMemcpyHostToDevice, stream));
+    CHECK_HIP(
+      hipMemcpyAsync(dB, hB_bf16.data(), sizeof(bf16) * sizeB, hipMemcpyHostToDevice, stream));
+    CHECK_HIP(hipStreamSynchronize(stream));
+
+    // --- custom
+    float ms_custom = bench_custom(dA, dB, dC_custom, M, N, K, stream, iters);
+
+    // --- rocBLAS (BF16×BF16→FP32)
+    float ms_rocblas = NAN;
+#if WITH_ROCBLAS
+    // THAY ĐỔI: rocBLAS bây giờ cũng nhận dA là bf16
+    ms_rocblas = bench_rocblas_bf16_rowmajor(dA, dB, dC_rocblas, M, N, K, stream, handle, iters);
+#endif
+
+    // Copy back & compare
+    std::vector<float> hC_custom(sizeC), hC_rocblas(sizeC);
+    CHECK_HIP(hipMemcpy(hC_custom.data(), dC_custom, sizeof(float) * sizeC, hipMemcpyDeviceToHost));
+#if WITH_ROCBLAS
+    CHECK_HIP(
+      hipMemcpy(hC_rocblas.data(), dC_rocblas, sizeof(float) * sizeC, hipMemcpyDeviceToHost));
+#endif
+
+    const double gflops = (2.0 * (double)M * N * K) * 1e-6;
+    // THAY ĐỔI: Cập nhật chuỗi in ra
+    std::cout << "  gemm_mfma_v2 (A=BF16,B=BF16): " << ms_custom << " ms  (" << (gflops / ms_custom)
+              << " GFLOP/s)\n";
+#if WITH_ROCBLAS
+    std::cout << "  rocBLAS (BF16×BF16→FP32)    : " << ms_rocblas << " ms  ("
+              << (gflops / ms_rocblas) << " GFLOP/s)\n";
+    std::cout << "  diff custom vs rocBLAS      : max|diff|=" << max_abs_diff(hC_custom, hC_rocblas)
+              << ", rel L2=" << rel_l2_err(hC_custom, hC_rocblas) << "\n";
+#else
+    std::cout << "  rocBLAS                     : disabled (compile WITH_ROCBLAS=1)\n";
+#endif
+    std::cout << std::string(60, '-') << "\n";
+
+    CHECK_HIP(hipFree(dA));
+    CHECK_HIP(hipFree(dB));
+    CHECK_HIP(hipFree(dC_custom));
+    CHECK_HIP(hipFree(dC_rocblas));
+  }
+
+#if WITH_ROCBLAS
+  CHECK_ROCBLAS(rocblas_destroy_handle(handle));
+#endif
+  CHECK_HIP(hipStreamDestroy(stream));
+  return EXIT_SUCCESS;
+}
+#else
 static float bench_custom(const float *dA_f32, const bf16 *dB_bf16, float *dC, int M, int N, int K,
                           hipStream_t stream, int iters) {
   CHECK_HIP(hipMemsetAsync(dC, 0, sizeof(float) * (size_t)M * N, stream));
@@ -281,3 +462,4 @@ int main(int argc, char **argv) {
   CHECK_HIP(hipStreamDestroy(stream));
   return EXIT_SUCCESS;
 }
+#endif

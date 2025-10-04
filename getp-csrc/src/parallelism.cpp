@@ -12,6 +12,18 @@ __global__ void extract_local_tokens_kernel(const float *x_packed, float *x_pack
   }
 }
 
+__global__ void extract_local_tokens_kernel_bf16(const bf16 *x_packed, bf16 *x_packed_local,
+                                                 size_t local_num_tokens, size_t start_offset,
+                                                 size_t hidden_dim) {
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t total_elems = local_num_tokens * hidden_dim;
+
+  if (idx < total_elems) {
+    size_t global_idx = start_offset * hidden_dim + idx;
+    x_packed_local[idx] = x_packed[global_idx];
+  }
+}
+
 __global__ void build_local_expert_offsets_kernel(const int *expert_offsets, int *local_offsets,
                                                   int tp_rank, int experts_per_gpu) {
   int i = threadIdx.x;
@@ -35,6 +47,23 @@ __global__ void add_vector_kernel_bf16(bf16 *y, const bf16 *b, int len) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < len) {
     y[i] += b[i];
+  }
+}
+
+__device__ __forceinline__ fp8 add_fp8_num(fp8 a, fp8 b, __hip_fp8_interpretation_t interpret,
+                                           __hip_saturation_t sat) {
+  __half a_half = __hip_cvt_fp8_to_halfraw(a, interpret);
+  __half b_half = __hip_cvt_fp8_to_halfraw(b, interpret);
+
+  __half sum_half = a_half + b_half;
+  fp8 result = __hip_cvt_halfraw_to_fp8(sum_half, sat, interpret);
+  return result;
+}
+
+__global__ void add_vector_kernel_fp8(fp8 *y, const fp8 *b, int len) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < len) {
+    y[i] = add_fp8_num(y[i], b[i], __HIP_E5M2_FNUZ, __HIP_SATFINITE);
   }
 }
 
@@ -141,7 +170,7 @@ void all_gather_x_new(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, 
 void all_gather_x_full_tp(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
                           int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream,
                           hipEvent_t tp_ready, hipEvent_t tp_finish) {
-  // GpuTimer timer("all_gather_x_full");
+  // GpuTimer timer("all_gather_x_full", stream);
 
   // Phase 1: 0-1 | 2-3 | 4-5 | 6-7
   int reduce_group = tp_rank / 2;
@@ -530,10 +559,338 @@ void reduce_tb2(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cu
   pthread_barrier_wait(tp_barrier);
 }
 
+/*
+void reduce_tb2_recursive_doubling(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank,
+                                   int cur_device, int cur_batch_size,
+                                   pthread_barrier_t *tp_barrier, hipStream_t stream,
+                                   hipEvent_t tp_ready, hipEvent_t tp_finish) {
+  // GpuTimer timer("reduce_tb2_recursive", stream);
+
+  // Reduce phase
+  // Phase 1: 0-1 | 2-3 | 4-5 | 6-7
+  int reduce_group = tp_rank / 2;
+  int p = 0;
+  int mask = 1 << p;
+  int partner = tp_rank ^ mask;
+  int partner_offset = partner - tp_rank;
+  size_t active_elems = (size_t)cur_batch_size * rs_now->tb2_half->shape[1];
+  size_t active_num_bytes = active_elems * rs_now->tb2_quantize->get_dtype_size();
+
+  size_t recv_offset = (tp_rank < partner) ? 0 : active_elems;
+  fp8 *tb2_ptr = (fp8 *)rs_now->tb2_quantize->d_buf + recv_offset;
+  fp8 *local_ptr = (fp8 *)rs_now->tb2_half->d_buf;
+  fp8 *tb2_partner_ptr = (fp8 *)(rs_now + partner_offset)->tb2_quantize->d_buf + recv_offset;
+
+  int block_size = 256;
+  int grid_size = (active_elems + block_size - 1) / block_size;
+
+  CHECK_HIP(hipEventRecord(tp_ready, stream));
+  pthread_barrier_wait(tp_barrier + reduce_group + 1);
+
+  hipEvent_t tp_ready_partner_p1 = total_events->tp_ready[cur_device + partner_offset];
+  CHECK_HIP(hipStreamWaitEvent(stream, tp_ready_partner_p1));
+
+  CHECK_HIP(hipMemcpyPeerAsync(local_ptr, cur_device, tb2_partner_ptr, cur_device + partner_offset,
+                               active_num_bytes, stream));
+
+  add_vector_kernel_fp8<<<grid_size, block_size, 0, stream>>>(tb2_ptr, local_ptr, active_elems);
+  CHECK_HIP(hipEventRecord(tp_finish, stream));
+
+  // Phase 2: 0-2 | 1-3 | 4-6 | 5-7
+  // pthread_barrier_wait(tp_barrier);
+  if (tp_rank == 0 || tp_rank == 2)
+    pthread_barrier_wait(tp_barrier + 5);
+  else if (tp_rank == 1 || tp_rank == 3)
+    pthread_barrier_wait(tp_barrier + 6);
+  else if (tp_rank == 4 || tp_rank == 6)
+    pthread_barrier_wait(tp_barrier + 7);
+  else if (tp_rank == 5 || tp_rank == 7)
+    pthread_barrier_wait(tp_barrier + 8);
+
+  p = 1;
+  mask = 1 << p;
+  partner = tp_rank ^ mask;
+  partner_offset = partner - tp_rank;
+  active_elems = (size_t)cur_batch_size * rs_now->tb2_quad->shape[1];
+  active_num_bytes = active_elems * rs_now->tb2_quantize->get_dtype_size();
+
+  size_t base_offset = (tp_rank % 2 == 0) ? 0 : active_elems * 2;
+  recv_offset = (tp_rank < partner) ? 0 : active_elems;
+  tb2_ptr = (fp8 *)rs_now->tb2_quantize->d_buf + base_offset + recv_offset;
+  local_ptr = (fp8 *)rs_now->tb2_quad->d_buf;
+  tb2_partner_ptr =
+    (fp8 *)(rs_now + partner_offset)->tb2_quantize->d_buf + base_offset + recv_offset;
+
+  block_size = 256;
+  grid_size = (active_elems + block_size - 1) / block_size;
+
+  hipEvent_t tp_finish_partner_p2 = total_events->tp_finish[cur_device + partner_offset];
+  CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_partner_p2));
+
+  CHECK_HIP(hipMemcpyPeerAsync(local_ptr, cur_device, tb2_partner_ptr, cur_device + partner_offset,
+                               active_num_bytes, stream));
+  add_vector_kernel_fp8<<<grid_size, block_size, 0, stream>>>(tb2_ptr, local_ptr, active_elems);
+  CHECK_HIP(hipEventRecord(tp_finish, stream));
+
+  // Phase 3: 0-4 | 2-6 | 1-5 | 3-7
+  // pthread_barrier_wait(tp_barrier);
+  if (tp_rank == 0 || tp_rank == 4)
+    pthread_barrier_wait(tp_barrier + 9);
+  if (tp_rank == 2 || tp_rank == 6)
+    pthread_barrier_wait(tp_barrier + 10);
+  if (tp_rank == 1 || tp_rank == 5)
+    pthread_barrier_wait(tp_barrier + 11);
+  if (tp_rank == 3 || tp_rank == 7)
+    pthread_barrier_wait(tp_barrier + 12);
+
+  p = 2;
+  mask = 1 << p;
+  partner = tp_rank ^ mask;
+  partner_offset = partner - tp_rank;
+  active_elems = (size_t)cur_batch_size * rs_now->tb2_oct->shape[1];
+  active_num_bytes = active_elems * rs_now->tb2_quantize->get_dtype_size();
+
+  base_offset = 0;
+  if (tp_rank == 0 || tp_rank == 4)
+    base_offset = 0;
+  else if (tp_rank == 2 || tp_rank == 6)
+    base_offset = active_elems * 2;
+  else if (tp_rank == 1 || tp_rank == 5)
+    base_offset = active_elems * 4;
+  else if (tp_rank == 3 || tp_rank == 7)
+    base_offset = active_elems * 6;
+
+  recv_offset = (tp_rank < partner) ? 0 : active_elems;
+  tb2_ptr = (fp8 *)rs_now->tb2_quantize->d_buf + base_offset + recv_offset;
+  local_ptr = (fp8 *)rs_now->tb2_oct->d_buf;
+  tb2_partner_ptr =
+    (fp8 *)(rs_now + partner_offset)->tb2_quantize->d_buf + base_offset + recv_offset;
+
+  block_size = 256;
+  grid_size = (active_elems + block_size - 1) / block_size;
+
+  hipEvent_t tp_finish_partner_p3 = total_events->tp_finish[cur_device + partner_offset];
+  CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_partner_p3));
+
+  CHECK_HIP(hipMemcpyPeerAsync(local_ptr, cur_device, tb2_partner_ptr, cur_device + partner_offset,
+                               active_num_bytes, stream));
+  add_vector_kernel_fp8<<<grid_size, block_size, 0, stream>>>(tb2_ptr, local_ptr, active_elems);
+  // CHECK_HIP(hipEventRecord(tp_finish, stream));
+
+  // Broadcast phase
+  size_t offset[TP] = {0,
+                       4 * active_elems,
+                       2 * active_elems,
+                       6 * active_elems,
+                       active_elems,
+                       5 * active_elems,
+                       3 * active_elems,
+                       7 * active_elems};
+
+  fp8 *src_ptr = (fp8 *)rs_now->tb2_quantize->d_buf + offset[tp_rank];
+
+  for (int i = 0; i < TP; i++) {
+    if (i == tp_rank)
+      continue;
+
+    fp8 *dst_ptr = (fp8 *)(rs_leader + i)->tb2_quantize->d_buf + offset[tp_rank];
+    CHECK_HIP(hipMemcpyPeerAsync(dst_ptr, i, src_ptr, cur_device, active_num_bytes, stream));
+  }
+
+  pthread_barrier_wait(tp_barrier);
+}
+
+void reduce_tb2_recursive_doubling_new(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank,
+                                       int cur_device, int cur_batch_size,
+                                       pthread_barrier_t *tp_barrier, hipStream_t stream,
+                                       hipEvent_t tp_ready, hipEvent_t tp_finish) {
+  // GpuTimer timer("reduce_tb2_recursive", stream);
+
+  // Reduce phase
+  // Phase 1: 0-1 | 2-3 | 4-5 | 6-7
+  int reduce_group = tp_rank / 2;
+  int p = 0;
+  int mask = 1 << p;
+  int partner = tp_rank ^ mask;
+  int partner_offset = partner - tp_rank;
+  size_t active_elems = (size_t)cur_batch_size * rs_now->tb2_half->shape[1];
+  size_t active_num_bytes = active_elems * rs_now->tb2_quantize->get_dtype_size();
+
+  size_t recv_offset = (tp_rank < partner) ? 0 : active_elems;
+  fp8 *tb2_ptr = (fp8 *)rs_now->tb2_quantize->d_buf + recv_offset;
+  fp8 *local_ptr = (fp8 *)rs_now->tb2_half->d_buf;
+  fp8 *tb2_partner_ptr = (fp8 *)(rs_now + partner_offset)->tb2_quantize->d_buf + recv_offset;
+
+  int block_size = 256;
+  int grid_size = (active_elems + block_size - 1) / block_size;
+
+  CHECK_HIP(hipEventRecord(tp_ready, stream));
+  pthread_barrier_wait(tp_barrier + reduce_group + 1);
+
+  hipEvent_t tp_ready_partner_p1 = total_events->tp_ready[cur_device + partner_offset];
+  CHECK_HIP(hipStreamWaitEvent(stream, tp_ready_partner_p1));
+
+  CHECK_HIP(hipMemcpyPeerAsync(local_ptr, cur_device, tb2_partner_ptr, cur_device + partner_offset,
+                               active_num_bytes, stream));
+
+  add_vector_kernel_fp8<<<grid_size, block_size, 0, stream>>>(tb2_ptr, local_ptr, active_elems);
+  CHECK_HIP(hipEventRecord(tp_finish, stream));
+
+  // Phase 2: 0-2 | 1-3 | 4-6 | 5-7
+  // pthread_barrier_wait(tp_barrier);
+  if (tp_rank == 0 || tp_rank == 2)
+    pthread_barrier_wait(tp_barrier + 5);
+  else if (tp_rank == 1 || tp_rank == 3)
+    pthread_barrier_wait(tp_barrier + 6);
+  else if (tp_rank == 4 || tp_rank == 6)
+    pthread_barrier_wait(tp_barrier + 7);
+  else if (tp_rank == 5 || tp_rank == 7)
+    pthread_barrier_wait(tp_barrier + 8);
+
+  p = 1;
+  mask = 1 << p;
+  partner = tp_rank ^ mask;
+  partner_offset = partner - tp_rank;
+  active_elems = (size_t)cur_batch_size * rs_now->tb2_quad->shape[1];
+  active_num_bytes = active_elems * rs_now->tb2_quantize->get_dtype_size();
+
+  size_t base_offset = (tp_rank % 2 == 0) ? 0 : active_elems * 2;
+  recv_offset = (tp_rank < partner) ? 0 : active_elems;
+  tb2_ptr = (fp8 *)rs_now->tb2_quantize->d_buf + base_offset + recv_offset;
+  local_ptr = (fp8 *)rs_now->tb2_quad->d_buf;
+  tb2_partner_ptr =
+    (fp8 *)(rs_now + partner_offset)->tb2_quantize->d_buf + base_offset + recv_offset;
+
+  block_size = 256;
+  grid_size = (active_elems + block_size - 1) / block_size;
+
+  hipEvent_t tp_finish_partner_p2 = total_events->tp_finish[cur_device + partner_offset];
+  CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_partner_p2));
+
+  CHECK_HIP(hipMemcpyPeerAsync(local_ptr, cur_device, tb2_partner_ptr, cur_device + partner_offset,
+                               active_num_bytes, stream));
+  add_vector_kernel_fp8<<<grid_size, block_size, 0, stream>>>(tb2_ptr, local_ptr, active_elems);
+  CHECK_HIP(hipEventRecord(tp_finish, stream));
+
+  // Phase 3: 0-4 | 2-6 | 1-5 | 3-7
+  // pthread_barrier_wait(tp_barrier);
+  if (tp_rank == 0 || tp_rank == 4)
+    pthread_barrier_wait(tp_barrier + 9);
+  if (tp_rank == 2 || tp_rank == 6)
+    pthread_barrier_wait(tp_barrier + 10);
+  if (tp_rank == 1 || tp_rank == 5)
+    pthread_barrier_wait(tp_barrier + 11);
+  if (tp_rank == 3 || tp_rank == 7)
+    pthread_barrier_wait(tp_barrier + 12);
+
+  p = 2;
+  mask = 1 << p;
+  partner = tp_rank ^ mask;
+  partner_offset = partner - tp_rank;
+  active_elems = (size_t)cur_batch_size * rs_now->tb2_oct->shape[1];
+  active_num_bytes = active_elems * rs_now->tb2_quantize->get_dtype_size();
+
+  base_offset = 0;
+  if (tp_rank == 0 || tp_rank == 4)
+    base_offset = 0;
+  else if (tp_rank == 2 || tp_rank == 6)
+    base_offset = active_elems * 2;
+  else if (tp_rank == 1 || tp_rank == 5)
+    base_offset = active_elems * 4;
+  else if (tp_rank == 3 || tp_rank == 7)
+    base_offset = active_elems * 6;
+
+  recv_offset = (tp_rank < partner) ? 0 : active_elems;
+  tb2_ptr = (fp8 *)rs_now->tb2_quantize->d_buf + base_offset + recv_offset;
+  local_ptr = (fp8 *)rs_now->tb2_oct->d_buf;
+  tb2_partner_ptr =
+    (fp8 *)(rs_now + partner_offset)->tb2_quantize->d_buf + base_offset + recv_offset;
+
+  block_size = 256;
+  grid_size = (active_elems + block_size - 1) / block_size;
+
+  hipEvent_t tp_finish_partner_p3 = total_events->tp_finish[cur_device + partner_offset];
+  CHECK_HIP(hipStreamWaitEvent(stream, tp_finish_partner_p3));
+
+  CHECK_HIP(hipMemcpyPeerAsync(local_ptr, cur_device, tb2_partner_ptr, cur_device + partner_offset,
+                               active_num_bytes, stream));
+  add_vector_kernel_fp8<<<grid_size, block_size, 0, stream>>>(tb2_ptr, local_ptr, active_elems);
+  // CHECK_HIP(hipEventRecord(tp_finish, stream));
+
+  // Broadcast phase
+  // Phase 1: 0-4 | 2-6 | 1-5 | 3-7
+  std::array<size_t, TP> offset = {0,
+                                   4 * active_elems,
+                                   2 * active_elems,
+                                   6 * active_elems,
+                                   active_elems,
+                                   5 * active_elems,
+                                   3 * active_elems,
+                                   7 * active_elems};
+
+  p = 2;
+  mask = 1 << p;
+  partner = tp_rank ^ mask;
+  partner_offset = partner - tp_rank;
+  active_elems = (size_t)cur_batch_size * rs_now->tb2_oct->shape[1];
+  active_num_bytes = active_elems * rs_now->tb2_quantize->get_dtype_size();
+
+  fp8 *src_ptr = (fp8 *)rs_now->tb2_quantize->d_buf + offset[tp_rank];
+  fp8 *dst_ptr = (fp8 *)(rs_now + partner_offset)->tb2_quantize->d_buf + offset[tp_rank];
+
+  CHECK_HIP(hipMemcpyPeerAsync(dst_ptr, cur_device + partner_offset, src_ptr, cur_device,
+                               active_num_bytes, stream));
+  CHECK_HIP(hipEventRecord(tp_finish, stream));
+
+  pthread_barrier_wait(tp_barrier);
+
+  // Phase 2: 0-2 | 1-3 | 4-6 | 5-7
+  CHECK_HIP(hipStreamWaitEvent(stream, total_events->tp_finish[partner]));
+  p = 1;
+  mask = 1 << p;
+  partner = tp_rank ^ mask;
+  partner_offset = partner - tp_rank;
+  active_elems = (size_t)cur_batch_size * rs_now->tb2_quad->shape[1];
+  active_num_bytes = active_elems * rs_now->tb2_quantize->get_dtype_size();
+
+  offset = {0, 2 * active_elems, active_elems, 3 * active_elems,
+            0, 2 * active_elems, active_elems, 3 * active_elems};
+
+  src_ptr = (fp8 *)rs_now->tb2_quantize->d_buf + offset[tp_rank];
+  dst_ptr = (fp8 *)(rs_now + partner_offset)->tb2_quantize->d_buf + offset[tp_rank];
+
+  CHECK_HIP(hipMemcpyPeerAsync(dst_ptr, cur_device + partner_offset, src_ptr, cur_device,
+                               active_num_bytes, stream));
+  CHECK_HIP(hipEventRecord(tp_finish, stream));
+  pthread_barrier_wait(tp_barrier);
+
+  // Phase 3: 0-1 | 2-3 | 4-5 | 6-7
+  CHECK_HIP(hipStreamWaitEvent(stream, total_events->tp_finish[partner]));
+  p = 0;
+  mask = 1 << p;
+  partner = tp_rank ^ mask;
+  partner_offset = partner - tp_rank;
+  active_elems = (size_t)cur_batch_size * rs_now->tb2_half->shape[1];
+  active_num_bytes = active_elems * rs_now->tb2_quantize->get_dtype_size();
+
+  offset = {0, active_elems, 0, active_elems, 0, active_elems, 0, active_elems};
+
+  src_ptr = (fp8 *)rs_now->tb2_quantize->d_buf + offset[tp_rank];
+  dst_ptr = (fp8 *)(rs_now + partner_offset)->tb2_quantize->d_buf + offset[tp_rank];
+
+  CHECK_HIP(hipMemcpyPeerAsync(dst_ptr, cur_device + partner_offset, src_ptr, cur_device,
+                               active_num_bytes, stream));
+  CHECK_HIP(hipEventRecord(tp_finish, stream));
+  pthread_barrier_wait(tp_barrier);
+
+  CHECK_HIP(hipStreamWaitEvent(stream, total_events->tp_finish[partner]));
+}
+*/
+
 void reduce_tb2_full_tp(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
                         int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream,
                         hipEvent_t tp_ready, hipEvent_t tp_finish) {
-  // GpuTimer timer("reduce_tb2_full");
+  // GpuTimer timer("reduce_tb2_full", stream);
 
   // Phase 1: 0-1 | 2-3 | 4-5 | 6-7
   int reduce_group = tp_rank / 2;
@@ -835,23 +1192,6 @@ void ring_all_reduce_tb2_quantize(OurRunState *rs_now, OurRunState *rs_leader, i
   }
 }
 
-__device__ fp8 add_fp8_num(fp8 a, fp8 b, __hip_fp8_interpretation_t interpret,
-                           __hip_saturation_t sat) {
-  __half a_half = __hip_cvt_fp8_to_halfraw(a, interpret);
-  __half b_half = __hip_cvt_fp8_to_halfraw(b, interpret);
-
-  __half sum_half = a_half + b_half;
-  fp8 result = __hip_cvt_halfraw_to_fp8(sum_half, sat, interpret);
-  return result;
-}
-
-__global__ void add_vector_kernel_fp8(fp8 *y, const fp8 *b, int len) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < len) {
-    y[i] = add_fp8_num(y[i], b[i], __HIP_E5M2_FNUZ, __HIP_SATFINITE);
-  }
-}
-
 void ring_all_reduce_tb2_quantize_fp8(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank,
                                       int cur_device, int cur_batch_size,
                                       pthread_barrier_t *tp_barrier, hipStream_t stream) {
@@ -887,10 +1227,13 @@ void ring_all_reduce_tb2_quantize_fp8(OurRunState *rs_now, OurRunState *rs_leade
     const fp8 *left_src_ptr = (const fp8 *)rs_left->tb2_quantize->d_buf + chunk_offset;
     fp8 *dst_local_ptr = d_buf_now + chunk_offset;
 
-    CHECK_HIP(
-      hipMemcpyPeerAsync(tmp_ptr, cur_device, left_src_ptr, left_device, chunk_bytes, stream));
+    // CHECK_HIP(
+    //   hipMemcpyPeerAsync(tmp_ptr, cur_device, left_src_ptr, left_device, chunk_bytes, stream));
 
-    add_vector_kernel_fp8<<<grid_size, block_size, 0, stream>>>(dst_local_ptr, (const fp8 *)tmp_ptr,
+    // add_vector_kernel_fp8<<<grid_size, block_size, 0, stream>>>(dst_local_ptr, (const fp8 *)tmp_ptr,
+    //                                                             chunk_elems);
+
+    add_vector_kernel_fp8<<<grid_size, block_size, 0, stream>>>(dst_local_ptr, left_src_ptr,
                                                                 chunk_elems);
 
     // CHECK_HIP(hipStreamSynchronize(stream));
@@ -984,7 +1327,7 @@ void all_gather_classifier_v2(OurRunState *rs_now, OurRunState *rs_leader, int t
 void all_gather_logits_id(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
                           int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream,
                           hipEvent_t tp_ready, hipEvent_t tp_finish) {
-  // GpuTimer timer("all_gather_logits");
+  // GpuTimer timer("all_gather_logits", stream);
   const float *src_max_buf = (const float *)rs_now->logits_max->d_buf;
   size_t dst_max_offset = 1ll * tp_rank * rs_leader->logits_max_total->shape[1];
   float *dst_max_buf = (float *)rs_leader->logits_max_total->d_buf + dst_max_offset;
@@ -1294,10 +1637,13 @@ void ring_reduce_agg_quantize_fp8(OurRunState *rs_now, OurRunState *rs_leader, i
     const fp8 *left_src_ptr = (const fp8 *)rs_left->e_agg_quantize->d_buf + chunk_offset;
     fp8 *dst_local_ptr = d_buf_now + chunk_offset;
 
-    CHECK_HIP(
-      hipMemcpyPeerAsync(tmp_ptr, cur_device, left_src_ptr, left_device, chunk_bytes, stream));
+    // CHECK_HIP(
+    //   hipMemcpyPeerAsync(tmp_ptr, cur_device, left_src_ptr, left_device, chunk_bytes, stream));
 
-    add_vector_kernel_fp8<<<grid_size, block_size, 0, stream>>>(dst_local_ptr, (const fp8 *)tmp_ptr,
+    // add_vector_kernel_fp8<<<grid_size, block_size, 0, stream>>>(dst_local_ptr, (const fp8 *)tmp_ptr,
+    //                                                             chunk_elems);
+
+    add_vector_kernel_fp8<<<grid_size, block_size, 0, stream>>>(dst_local_ptr, left_src_ptr,
                                                                 chunk_elems);
 
     // CHECK_HIP(hipStreamSynchronize(stream));
@@ -1326,7 +1672,7 @@ void ring_reduce_agg_quantize_fp8(OurRunState *rs_now, OurRunState *rs_leader, i
 void reduce_agg_full_tp(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank, int cur_device,
                         int cur_batch_size, pthread_barrier_t *tp_barrier, hipStream_t stream,
                         hipEvent_t tp_ready, hipEvent_t tp_finish) {
-  // GpuTimer timer("reduce_agg_full");
+  // GpuTimer timer("reduce_agg_full", stream);
 
   // Phase 1: 0-1 | 2-3 | 4-5 | 6-7
   int reduce_group = tp_rank / 2;
@@ -1511,8 +1857,8 @@ void moe_build_local_ep_data(OurRunState *rs_now, OurRunState *rs_leader, int tp
   if (local_num_tokens > 0) {
     dim3 block_size(256);
     dim3 grid_size((local_num_tokens * p->hidden_dim + 255) / 256);
-    extract_local_tokens_kernel<<<grid_size, block_size, 0, stream>>>(
-      (const float *)rs_now->x_packed->d_buf, (float *)rs_now->x_packed_local->d_buf,
+    extract_local_tokens_kernel_bf16<<<grid_size, block_size, 0, stream>>>(
+      (const bf16 *)rs_now->x_packed->d_buf, (bf16 *)rs_now->x_packed_local->d_buf,
       local_num_tokens, start_offset, p->hidden_dim);
   }
 
