@@ -8,11 +8,29 @@
 // #include "config_run.hpp"
 #include "pipeline.hpp"
 
-#define BATCH_SIZE 6500
+/* This config use for submit version */
+#define SUBMIT
+
+#ifdef SUBMIT
+bool RUN_MODEL_20B = true;
+#define BATCH_SIZE_20B 896
+#define DP_20B 8
+#define PP_20B 1
+#define TP_20B 1
+
+#define BATCH_SIZE_120B 6528
+#define DP_120B 1
+#define PP_120B 1
+#define TP_120B 8
+
+#define TOTAL_PIPELINES_120B ((PP_120B) * (TP_120B))
+#endif
+
+#define BATCH_SIZE 6528
 #define PP_SLOT 1
 #define KV16
 // #define PRINT_LOGITS
-#define TIME_GPU
+// #define TIME_GPU
 // #define DEBUG
 // #define RUN_20B
 #define RUN_EP

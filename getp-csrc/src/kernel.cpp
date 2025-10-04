@@ -886,31 +886,30 @@ static inline void moe_pack_inputs(
   TensorI32 *sorted_pair_ids,  // [batch_size * experts_per_token]
   Tensor *x_packed,            // [batch_size * experts_per_token, hidden_dim]
   int batch_size, int hidden_dim, int experts_per_token, hipStream_t stream) {
-#ifdef RUN_20B
-  const float *x_ptr = (const float *)x_in->d_buf;
+  if (RUN_MODEL_20B) {
+    const float *x_ptr = (const float *)x_in->d_buf;
 
-  const int total_pairs = batch_size * experts_per_token;
-  dim3 block_size(256, 1);
-  dim3 grid_size((hidden_dim + block_size.x - 1) / block_size.x, total_pairs);
+    const int total_pairs = batch_size * experts_per_token;
+    dim3 block_size(256, 1);
+    dim3 grid_size((hidden_dim + block_size.x - 1) / block_size.x, total_pairs);
 
-  gather_inputs_by_sorted_kernel<<<grid_size, block_size, 0, stream>>>(
-    x_ptr, sorted_pair_ids->d_buf, (float *)x_packed->d_buf, batch_size, hidden_dim,
-    experts_per_token);
-#else
-  const int vec_hidden_dim = hidden_dim / 4;
-  const int total_pairs = batch_size * experts_per_token;
+    gather_inputs_by_sorted_kernel<<<grid_size, block_size, 0, stream>>>(
+      x_ptr, sorted_pair_ids->d_buf, (float *)x_packed->d_buf, batch_size, hidden_dim,
+      experts_per_token);
+  } else {
+    const int vec_hidden_dim = hidden_dim / 4;
+    const int total_pairs = batch_size * experts_per_token;
 
-  dim3 block_size(64, 8);
-  dim3 grid_size((vec_hidden_dim + block_size.x - 1) / block_size.x,
-                 (total_pairs + block_size.y - 1) / block_size.y);
+    dim3 block_size(64, 8);
+    dim3 grid_size((vec_hidden_dim + block_size.x - 1) / block_size.x,
+                   (total_pairs + block_size.y - 1) / block_size.y);
 
-  // size_t shmem = block_size.y * sizeof(int);
+    // size_t shmem = block_size.y * sizeof(int);
 
-  gather_inputs_vectorized_kernel<<<grid_size, block_size, 0, stream>>>(
-    (const float4 *)x_in->d_buf, sorted_pair_ids->d_buf, (float4 *)x_packed->d_buf, vec_hidden_dim,
-    total_pairs, experts_per_token);
-
-#endif
+    gather_inputs_vectorized_kernel<<<grid_size, block_size, 0, stream>>>(
+      (const float4 *)x_in->d_buf, sorted_pair_ids->d_buf, (float4 *)x_packed->d_buf,
+      vec_hidden_dim, total_pairs, experts_per_token);
+  }
 }
 
 // 3) lấy max số hàng trên mỗi expert từ offsets

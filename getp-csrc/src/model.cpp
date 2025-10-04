@@ -3,8 +3,6 @@
 #include <cmath>
 #include <cstring>
 
-#ifdef RUN_20B
-
 int *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flow_id) {
   Config *p = public_config;
 
@@ -152,13 +150,11 @@ int *forward_gpu_20b_batched(int *tokens, int pos, int cur_batch_size, int flow_
   return rs_now->logits_id->buf;
 }
 
-#else
-
 // two events are needed
 int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow_id, int tp_rank,
                               int pp_rank, pthread_barrier_t *tp_barrier) {
   Config *p = public_config;
-  int cur_device = flow_id * TOTAL_PIPELINES + pp_rank * TP + tp_rank;
+  int cur_device = flow_id * TOTAL_PIPELINES_120B + pp_rank * TP_120B + tp_rank;
 
   OurTransformerWeights *weights_now = &weights[cur_device];
   OurRunState *rs_now = &rs[cur_device];
@@ -201,7 +197,7 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
   long long loff_one = 1ll * p->seq_len * kv_dim;
   long long loff_one_batch = 1ll * p->n_layers * loff_one;
 
-  for (int l = 0; l < p->n_layers / PP; l++) {
+  for (int l = 0; l < p->n_layers / PP_120B; l++) {
 #ifdef DEBUG
     if (flag) {
       printf("Layer l=%d running...\n", l);
@@ -239,8 +235,8 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
 
     // // Separate q, k, v + RoPE + Store k, v in cache
     qkv_split_rope_fused(rs_now->qkv, rs_now->q, key_cache, value_cache, rs_now->cos_tensor,
-                         rs_now->sin_tensor, cur_batch_size, p->head_dim, p->n_attn_heads / TP,
-                         p->n_kv_heads / TP, pos, l, stream);
+                         rs_now->sin_tensor, cur_batch_size, p->head_dim, p->n_attn_heads / TP_120B,
+                         p->n_kv_heads / TP_120B, pos, l, stream);
 
 #ifdef DEBUG
     if (flag) {
@@ -257,8 +253,8 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
     single_query_attn_flash_batched_quantize(
       rs_now->q, key_cache, value_cache, rs_now->mask, weights_now->attn_sinks, rs_now->tb,
       rs_now->g_fa_pmax, rs_now->g_fa_psum, rs_now->g_fa_pnum, cur_batch_size, p->head_dim,
-      p->n_attn_heads / TP, kv_mul, kv_dim / TP, p->seq_len, p->sliding_window, pos, 1ll * l, false,
-      false, false, false, false, stream);
+      p->n_attn_heads / TP_120B, kv_mul, kv_dim / TP_120B, p->seq_len, p->sliding_window, pos,
+      1ll * l, false, false, false, false, false, stream);
 
     // all_gather_tb(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream,
     //               tp_ready, tp_finish);
@@ -355,7 +351,7 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
 
 #ifdef RUN_EP
     int max_rows = moe_get_max_rows_per_expert_hip(rs_now->expert_offsets_local, rs_now->max_rows,
-                                                   p->n_experts / TP, stream);
+                                                   p->n_experts / TP_120B, stream);
     // moe_mlp1_forward_hip(rs_now->x_packed_local, weights_now->w_mlp1, weights_now->b_mlp1,
     //                      rs_now->expert_offsets_local, rs_now->mlp1_out, 1ll * l, p->n_experts / TP,
     //                      p->hidden_dim, p->intermediate_dim, max_rows, total_pairs, stream);
@@ -365,7 +361,7 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
 
     moe_mlp1_swiglu_fused_hip(rs_now->x_packed_local, weights_now->w_mlp1, weights_now->b_mlp1,
                               rs_now->expert_offsets_local, rs_now->gate_up, 1ll * l,
-                              p->n_experts / TP, p->hidden_dim, p->intermediate_dim,
+                              p->n_experts / TP_120B, p->hidden_dim, p->intermediate_dim,
                               p->swiglu_limit, max_rows, total_pairs, stream);
 
 #else
@@ -387,7 +383,7 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
 #ifdef RUN_EP
     moe_mlp2_forward_hip(rs_now->gate_up, weights_now->w_mlp2, weights_now->b_mlp2,
                          rs_now->expert_offsets_local, rs_now->tb3, true, 1ll * l,
-                         p->n_experts / TP, p->intermediate_dim, p->hidden_dim, max_rows,
+                         p->n_experts / TP_120B, p->intermediate_dim, p->hidden_dim, max_rows,
                          total_pairs, stream);
 #else
     moe_mlp2_forward_hip(rs_now->gate_up, weights_now->w_mlp2, weights_now->b_mlp2,
@@ -409,7 +405,7 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
     // max_rows = moe_get_max_rows_per_expert_hip(rs_now->expert_offsets, rs_now->max_rows,
     //                                            p->n_experts, stream);
 
-    int experts_per_gpu = p->n_experts / TP;
+    int experts_per_gpu = p->n_experts / TP_120B;
     int start_expert_offset = rs_now->expert_offsets->buf[tp_rank * experts_per_gpu];
     int end_expert_offset = rs_now->expert_offsets->buf[(tp_rank + 1) * experts_per_gpu];
     moe_scatter_aggregate_ep_hip(rs_now->tb3, rs_now->sorted_pair_ids, rs_now->topk_v,
@@ -454,7 +450,7 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
 #endif
   }
 
-  if ((pp_rank + 1) % PP == 0) {
+  if ((pp_rank + 1) % PP_120B == 0) {
     // final rmsnorm
     rmsnorm_batched_quantize(rs_now->x, weights_now->rms_out_w, rs_now->x_quantize, cur_batch_size,
                              0ll, false, false, 1e-5f, stream);
@@ -476,7 +472,7 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
     // pthread_barrier_wait(tp_barrier);
 
     if (tp_rank == 0) {
-      for (int i = 1; i < TP; i++) {
+      for (int i = 1; i < TP_120B; i++) {
         hipEvent_t tp_ready_each = total_events->tp_ready[cur_device + i];
         CHECK_HIP(hipStreamWaitEvent(stream, tp_ready_each));
       }
@@ -490,12 +486,10 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
     return nullptr;
   } else {
     CHECK_HIP(hipEventRecord(pp_sync, stream));
-    OurRunState *rs_new = &rs[cur_device + TP];
-    hipStream_t stream_new = total_streams[cur_device + TP];
+    OurRunState *rs_new = &rs[cur_device + TP_120B];
+    hipStream_t stream_new = total_streams[cur_device + TP_120B];
     rs_new->pipeline_each->enqueueElem(rs_now->x, cur_device, pp_sync, stream_new);
 
     return nullptr;
   }
 }
-
-#endif
