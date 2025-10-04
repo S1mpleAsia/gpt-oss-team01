@@ -8,13 +8,14 @@
 // #include "config_run.hpp"
 #include "pipeline.hpp"
 
-#define BATCH_SIZE 896
+#define BATCH_SIZE 6656
 #define PP_SLOT 1
 #define KV16
 // #define PRINT_LOGITS
-#define TIME_GPU
+// #define TIME_GPU
 // #define DEBUG
-#define RUN_20B
+#define DEBUG_NEW
+// #define RUN_20B
 #define RUN_EP
 
 #ifdef RUN_20B
@@ -78,6 +79,7 @@ typedef struct {
   Tensor *tb2;  // (hidden_dim, )
   Tensor *tb2_buf;
   Tensor *tb2_recv;
+  Tensor *tb2_recv_2;
   Tensor *tb2_quantize;
   Tensor *tb3;  // (BATCH_SIZE, experts_per_token)
   Tensor *tb3_buf;
@@ -105,10 +107,10 @@ typedef struct {
   // kv cache
   Tensor *key_cache;    // (layer, seq_len, kv_dim)
   Tensor *value_cache;  // (layer, seq_len, kv_dim)
-  Tensor *key_cache_odd;
-  Tensor *value_cache_odd;
-  Tensor *key_cache_even;
-  Tensor *value_cache_even;
+  Tensor *key_cache_odd;    // (layer, seq_len, kv_dim)
+  Tensor *value_cache_odd;  // (layer, seq_len, kv_dim)
+  Tensor *key_cache_even;    // (layer, seq_len, kv_dim)
+  Tensor *value_cache_even;  // (layer, seq_len, kv_dim)
   Tensor *mask;
 
   // MoE buffer
@@ -176,3 +178,40 @@ Requests *public_requests;
 
 hipStream_t *total_streams;
 hipTotalEvents_t *total_events;
+hipStream_t *reduce_streams;
+hipEvent_t *reduce_events;
+
+static int COMM_LINKS[8][3] = {
+  {1, 2, 6}, // rank 0
+  {0, 3, 5}, // rank 1
+  {3, 0, 4}, // rank 2
+  {2, 1, 7}, // rank 3
+  {5, 6, 2}, // rank 4
+  {4, 7, 1}, // rank 5
+  {7, 4, 0}, // rank 6
+  {6, 5, 3}  // rank 7
+};
+
+static int SEND_COMM_DBL_RINGS[8][4] = {
+  {6, 4, 2, 5}, // rank 0
+  {0, 2, 5, 7}, // rank 1
+  {4, 5, 3, 7}, // rank 2
+  {1, 6, 7, 4}, // rank 3
+  {6, 0, 2, 1}, // rank 4
+  {1, 3, 4, 6}, // rank 5
+  {0, 1, 7, 3}, // rank 6
+  {5, 0, 3, 2} // rank 7
+};
+
+/*
+  {6, 4, 5, 7}, // rank 0
+  {2, 4, 0, 6}, // rank 1
+  {0, 1, 3, 7}, // rank 2
+  {1, 5, 7, 6}, // rank 3
+  {6, 0, 7, 3}, // rank 4
+  {2, 0, 4, 2}, // rank 5
+  {1, 3, 4, 5}, // rank 6
+  {5, 1, 3, 2} // rank 7
+*/
+
+static int TP_ORDER[8] = {0, 1, 3, 2, 4, 5, 7, 6};

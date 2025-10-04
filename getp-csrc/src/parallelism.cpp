@@ -31,10 +31,42 @@ __global__ void add_vector_kernel_direct(float *c, const float *a, const float *
   }
 }
 
+__global__ void add_two_vectors_separate_kernel_float(
+  float *y1, const float *b1, float *y2, const float *b2, int len
+) {
+  // Total global thread ID
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  
+  // Check if the thread is within the boundary of 2 * len
+  if (i < len) {
+    y1[i] += b1[i];
+  } else if (i < 2 * len) {
+    // Subtract 'len' to get the correct index for y2/b2 vectors
+    int j = i - len;
+    y2[j] += b2[j];
+  }
+}
+
 __global__ void add_vector_kernel_bf16(bf16 *y, const bf16 *b, int len) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < len) {
     y[i] += b[i];
+  }
+}
+
+__global__ void add_two_vectors_separate_kernel_bf16(
+  bf16 *y1, const bf16 *b1,  bf16 *y2, const bf16 *b2,  int len
+) {
+  // Total global thread ID
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  
+  // Check if the thread is within the boundary of 2 * len
+  if (i < len) {
+    y1[i] += b1[i];
+  } else if (i < 2 * len) {
+    // Subtract 'len' to get the correct index for y2/b2 vectors
+    int j = i - len;
+    y2[j] += b2[j];
   }
 }
 
@@ -771,6 +803,187 @@ void ring_all_reduce_tb2(OurRunState *rs_now, OurRunState *rs_leader, int tp_ran
   }
 }
 
+void ring_all_reduce_tb2_new_v2(
+  OurRunState *rs_now, OurRunState *rs_leader, int tp_rank,
+  int cur_device, int cur_batch_size, pthread_barrier_t *tp_barrier,
+  hipEvent_t tp_ready, hipStream_t stream
+) {
+  // GpuTimer timer("ring_all_reduce_tb2_new_v2", stream);
+  
+  CHECK_HIP(hipEventRecord(tp_ready, stream));
+  int tp_orig_pos = TP_ORDER[tp_rank];
+  
+  if (TP_ORDER[tp_orig_pos] != tp_rank) {
+    fprintf(stderr, "False starting tp_rank");
+    abort();
+  }
+
+  float *d_buf_now = (float *)rs_now->tb2->d_buf;
+  size_t hidden_dim = rs_now->tb2->shape[1];
+  size_t total_elems = cur_batch_size * hidden_dim;
+  size_t chunk_elems = total_elems / TP;
+  size_t chunk_bytes = chunk_elems * rs_now->tb2->get_dtype_size();
+
+  int left_orig_pos = (tp_orig_pos - 1 + TP) % TP;
+  int left_peer_rank = TP_ORDER[left_orig_pos];
+  OurRunState *rs_left = &rs_leader[left_peer_rank];
+  int left_device = cur_device - tp_rank + left_peer_rank;
+  hipEvent_t left_tp_ready = total_events->tp_ready[left_device];
+
+  int right_orig_pos = (tp_orig_pos + 1) % TP;
+  int right_peer_rank = TP_ORDER[right_orig_pos];
+  OurRunState *rs_right = &rs_leader[right_peer_rank];
+  int right_device = cur_device - tp_rank + right_peer_rank;
+  hipEvent_t right_tp_ready = total_events->tp_ready[right_device];
+
+  void *tmp_ptr_left = rs_now->tb2_recv->d_buf;
+  float *tmp_ptr_right = (float *)rs_now->tb2_recv->d_buf + chunk_elems;
+
+  int total_work_size = 2 * chunk_elems;
+  const int block_size = 256; 
+  const int grid_size = (total_work_size + block_size - 1) / block_size;
+
+  pthread_barrier_wait(tp_barrier);
+
+  // reduce
+  for (int i = 0; i < TP / 2; ++i) {
+    // Calculate the position of the chunk being received (i+1 steps back in reordered ring)
+    int left_recv_chunk_pos = (tp_orig_pos - i + 2 + TP) % TP; 
+    
+    // Look up the original rank that owns this chunk
+    int left_chunk_idx = TP_ORDER[left_recv_chunk_pos]; // <-- EDITED
+    size_t left_chunk_offset = left_chunk_idx * chunk_elems;
+
+    const float *left_src_ptr = (const float *)rs_left->tb2->d_buf + left_chunk_offset;
+    float *dst_left_local_ptr = d_buf_now + left_chunk_offset;
+    
+    hipStream_t cur_left_stream = reduce_streams[tp_rank * DP * TP + left_chunk_idx];
+    hipEvent_t cur_left_tp_ready = reduce_events[tp_rank * DP * TP + left_chunk_idx];
+
+    int right_recv_chunk_pos = (tp_orig_pos + i - 3 + TP) % TP; 
+    
+    // Look up the original rank that owns this chunk
+    int right_chunk_idx = TP_ORDER[right_recv_chunk_pos]; // <-- EDITED
+    size_t right_chunk_offset = right_chunk_idx * chunk_elems;
+
+    const float *right_src_ptr = (const float *)rs_right->tb2->d_buf + right_chunk_offset;
+    float *dst_right_local_ptr = d_buf_now + right_chunk_offset;
+    
+    hipStream_t cur_right_stream = reduce_streams[tp_rank * DP * TP + right_chunk_idx];
+    hipEvent_t cur_right_tp_ready = reduce_events[tp_rank * DP * TP + right_chunk_idx];
+  
+    CHECK_HIP(hipStreamWaitEvent(cur_left_stream, left_tp_ready));
+    CHECK_HIP(hipStreamWaitEvent(cur_right_stream, right_tp_ready));
+
+    CHECK_HIP(
+      hipMemcpyPeerAsync(tmp_ptr_left, cur_device, left_src_ptr, left_device, chunk_bytes, cur_left_stream));
+
+    CHECK_HIP(hipEventRecord(cur_left_tp_ready, cur_left_stream));
+
+    CHECK_HIP(
+      hipMemcpyPeerAsync(tmp_ptr_right, cur_device, right_src_ptr, right_device, chunk_bytes, cur_right_stream));
+
+    CHECK_HIP(hipEventRecord(cur_right_tp_ready, cur_right_stream));
+
+    CHECK_HIP(hipStreamWaitEvent(stream, cur_left_tp_ready));
+    CHECK_HIP(hipStreamWaitEvent(stream, cur_right_tp_ready));
+
+    add_two_vectors_separate_kernel_float<<<grid_size, block_size, 0, stream>>>(
+      dst_left_local_ptr, (const float *)tmp_ptr_left, 
+      dst_right_local_ptr, (const float *)tmp_ptr_right, 
+      chunk_elems
+    ); // chunk_elems is still the 'len' for each vector
+
+    CHECK_HIP(hipEventRecord(tp_ready, stream));
+
+    pthread_barrier_wait(tp_barrier);
+  }
+  
+  // scatter
+  // ROUND 1
+  int left_send_chunk_idx = tp_rank;
+  int right_send_chunk_idx = TP_ORDER[left_orig_pos];
+  for (int i = 0; i < 3; i++) {
+    int left_send_rank = COMM_LINKS[tp_rank][i];
+    if (left_send_rank == right_peer_rank) continue;
+
+    size_t chunk_offset = left_send_chunk_idx * chunk_elems;
+
+    int device_scatter = cur_device - tp_rank + left_send_rank;
+    OurRunState *rs_scatter = &rs[device_scatter];
+
+    hipStream_t left_stream = reduce_streams[left_send_rank * DP * TP + left_send_chunk_idx];
+    hipEvent_t left_tp_ready = reduce_events[left_send_rank * DP * TP + left_send_chunk_idx];
+
+    float *left_src_ptr = (float *)rs_scatter->tb2->d_buf + chunk_offset;
+    const float *dst_local_ptr = d_buf_now + chunk_offset;
+
+    CHECK_HIP(hipStreamWaitEvent(left_stream, tp_ready));
+
+    CHECK_HIP(hipMemcpyPeerAsync(left_src_ptr, device_scatter, dst_local_ptr, cur_device, chunk_bytes, left_stream));
+
+    CHECK_HIP(hipEventRecord(left_tp_ready, left_stream));
+  }
+
+  for (int i = 0; i < 3; i++) {
+    int right_send_rank = COMM_LINKS[tp_rank][i];
+    if (right_send_rank == left_peer_rank) continue;
+
+    size_t chunk_offset = right_send_chunk_idx * chunk_elems;
+
+    int device_scatter = cur_device - tp_rank + right_send_rank;
+    OurRunState *rs_scatter = &rs[device_scatter];
+
+    hipStream_t right_stream = reduce_streams[right_send_rank * DP * TP + right_send_chunk_idx];
+    hipEvent_t right_tp_ready = reduce_events[right_send_rank * DP * TP + right_send_chunk_idx];
+
+    float *right_src_ptr = (float *)rs_scatter->tb2->d_buf + chunk_offset;
+    const float *dst_local_ptr = d_buf_now + chunk_offset;
+
+    CHECK_HIP(hipStreamWaitEvent(right_stream, tp_ready));
+
+    CHECK_HIP(hipMemcpyPeerAsync(right_src_ptr, device_scatter, dst_local_ptr, cur_device, chunk_bytes, right_stream));
+
+    CHECK_HIP(hipEventRecord(right_tp_ready, right_stream));
+  }
+
+  CHECK_HIP(hipStreamSynchronize(stream));
+  pthread_barrier_wait(tp_barrier);
+
+  // ROUND 2
+  for (int i = 0; i < 2; i++) {
+    int send_rank = SEND_COMM_DBL_RINGS[tp_rank][i * 2]; // logic here
+    int chunk_idx = SEND_COMM_DBL_RINGS[tp_rank][i * 2 + 1]; // logic_here;
+
+    size_t chunk_offset = chunk_idx * chunk_elems;
+
+    int send_device = cur_device - tp_rank + send_rank;
+
+    OurRunState *rs_send = &rs[send_device];
+
+    hipStream_t recv_stream = reduce_streams[tp_rank * DP * TP + chunk_idx];
+    hipEvent_t send_tp_ready = reduce_events[send_rank * DP * TP + chunk_idx];
+    hipEvent_t recv_tp_ready = reduce_events[tp_rank * DP * TP + chunk_idx];
+
+    float *recv_ptr = d_buf_now + chunk_offset;
+    const float *send_ptr = (float *)rs_send->tb2->d_buf + chunk_offset;
+
+    CHECK_HIP(hipStreamWaitEvent(recv_stream, send_tp_ready));
+
+    CHECK_HIP(hipMemcpyPeerAsync(recv_ptr, cur_device, send_ptr, send_device, chunk_bytes, recv_stream));
+
+    CHECK_HIP(hipEventRecord(recv_tp_ready, recv_stream));
+  }
+
+  for (int i = 0; i < TP; i++) {
+    if (i == tp_rank || i == left_peer_rank) continue;
+    hipEvent_t sync_evnt = reduce_events[tp_rank * DP * TP + i];
+    CHECK_HIP(hipStreamWaitEvent(stream, sync_evnt));
+  }
+
+  CHECK_HIP(hipStreamSynchronize(stream));
+}
+
 void ring_all_reduce_tb2_quantize(OurRunState *rs_now, OurRunState *rs_leader, int tp_rank,
                                   int cur_device, int cur_batch_size, pthread_barrier_t *tp_barrier,
                                   hipStream_t stream) {
@@ -835,6 +1048,185 @@ void ring_all_reduce_tb2_quantize(OurRunState *rs_now, OurRunState *rs_leader, i
   }
 }
 
+void ring_all_reduce_tb2_quantize_new_v2(
+  OurRunState *rs_now, OurRunState *rs_leader, int tp_rank,
+  int cur_device, int cur_batch_size, pthread_barrier_t *tp_barrier,
+  hipEvent_t tp_ready, hipStream_t stream
+) {
+  // GpuTimer timer("ring_all_reduce_tb2_new_v2", stream);
+  
+  CHECK_HIP(hipEventRecord(tp_ready, stream));
+  int tp_orig_pos = TP_ORDER[tp_rank];
+  
+  if (TP_ORDER[tp_orig_pos] != tp_rank) {
+    fprintf(stderr, "False starting tp_rank");
+    abort();
+  }
+
+  bf16 *d_buf_now = (bf16 *)rs_now->tb2_quantize->d_buf;
+  size_t hidden_dim = rs_now->tb2_quantize->shape[1];
+  size_t total_elems = cur_batch_size * hidden_dim;
+  size_t chunk_elems = total_elems / TP;
+  size_t chunk_bytes = chunk_elems * rs_now->tb2_quantize->get_dtype_size();
+
+  int left_orig_pos = (tp_orig_pos - 1 + TP) % TP;
+  int left_peer_rank = TP_ORDER[left_orig_pos];
+  OurRunState *rs_left = &rs_leader[left_peer_rank];
+  int left_device = cur_device - tp_rank + left_peer_rank;
+  hipEvent_t left_tp_ready = total_events->tp_ready[left_device];
+
+  int right_orig_pos = (tp_orig_pos + 1) % TP;
+  int right_peer_rank = TP_ORDER[right_orig_pos];
+  OurRunState *rs_right = &rs_leader[right_peer_rank];
+  int right_device = cur_device - tp_rank + right_peer_rank;
+  hipEvent_t right_tp_ready = total_events->tp_ready[right_device];
+
+  void *tmp_ptr_left = rs_now->tb2_recv->d_buf;
+  bf16 *tmp_ptr_right = (bf16 *)rs_now->tb2_recv->d_buf + chunk_elems;
+
+  int total_work_size = 2 * chunk_elems;
+  const int block_size = 256; 
+  const int grid_size = (total_work_size + block_size - 1) / block_size;
+
+  pthread_barrier_wait(tp_barrier);
+
+  // reduce
+  for (int i = 0; i < TP / 2; ++i) {
+    // Calculate the position of the chunk being received (i+1 steps back in reordered ring)
+    int left_recv_chunk_pos = (tp_orig_pos - i - 6 + TP * 2) % TP; 
+    
+    // Look up the original rank that owns this chunk
+    int left_chunk_idx = TP_ORDER[left_recv_chunk_pos]; // <-- EDITED
+    size_t left_chunk_offset = left_chunk_idx * chunk_elems;
+
+    const bf16 *left_src_ptr = (const bf16 *)rs_left->tb2_quantize->d_buf + left_chunk_offset;
+    bf16 *dst_left_local_ptr = d_buf_now + left_chunk_offset;
+    
+    hipStream_t cur_left_stream = reduce_streams[tp_rank * DP * TP + left_chunk_idx];
+    hipEvent_t cur_left_tp_ready = reduce_events[tp_rank * DP * TP + left_chunk_idx];
+
+    int right_recv_chunk_pos = (tp_orig_pos + i - 3 + TP) % TP; 
+    
+    // Look up the original rank that owns this chunk
+    int right_chunk_idx = TP_ORDER[right_recv_chunk_pos]; // <-- EDITED
+    size_t right_chunk_offset = right_chunk_idx * chunk_elems;
+
+    const bf16 *right_src_ptr = (const bf16 *)rs_right->tb2_quantize->d_buf + right_chunk_offset;
+    bf16 *dst_right_local_ptr = d_buf_now + right_chunk_offset;
+    
+    hipStream_t cur_right_stream = reduce_streams[tp_rank * DP * TP + right_chunk_idx];
+    hipEvent_t cur_right_tp_ready = reduce_events[tp_rank * DP * TP + right_chunk_idx];
+  
+    CHECK_HIP(hipStreamWaitEvent(cur_left_stream, left_tp_ready));
+    CHECK_HIP(hipStreamWaitEvent(cur_right_stream, right_tp_ready));
+
+    CHECK_HIP(
+      hipMemcpyPeerAsync(tmp_ptr_left, cur_device, left_src_ptr, left_device, chunk_bytes, cur_left_stream));
+
+    CHECK_HIP(hipEventRecord(cur_left_tp_ready, cur_left_stream));
+
+    CHECK_HIP(
+      hipMemcpyPeerAsync(tmp_ptr_right, cur_device, right_src_ptr, right_device, chunk_bytes, cur_right_stream));
+
+    CHECK_HIP(hipEventRecord(cur_right_tp_ready, cur_right_stream));
+
+    CHECK_HIP(hipStreamWaitEvent(stream, cur_left_tp_ready));
+    CHECK_HIP(hipStreamWaitEvent(stream, cur_right_tp_ready));
+
+    add_two_vectors_separate_kernel_bf16<<<grid_size, block_size, 0, stream>>>(
+      dst_left_local_ptr, (const bf16 *)tmp_ptr_left, 
+      dst_right_local_ptr, (const bf16 *)tmp_ptr_right, 
+      chunk_elems
+    ); // chunk_elems is still the 'len' for each vector
+
+    CHECK_HIP(hipEventRecord(tp_ready, stream));
+
+    pthread_barrier_wait(tp_barrier);
+  }
+  
+  pthread_barrier_wait(tp_barrier);
+  // scatter
+  // ROUND 1
+  int left_send_chunk_idx = tp_rank;
+  int right_send_chunk_idx = TP_ORDER[left_orig_pos];
+  for (int i = 0; i < 3; i++) {
+    int left_send_rank = COMM_LINKS[tp_rank][i];
+    if (left_send_rank == right_peer_rank) continue;
+
+    size_t chunk_offset = left_send_chunk_idx * chunk_elems;
+
+    int device_scatter = cur_device - tp_rank + left_send_rank;
+    OurRunState *rs_scatter = &rs[device_scatter];
+
+    hipStream_t left_stream = reduce_streams[left_send_rank * DP * TP + left_send_chunk_idx];
+    hipEvent_t left_tp_ready = reduce_events[left_send_rank * DP * TP + left_send_chunk_idx];
+
+    bf16 *left_src_ptr = (bf16 *)rs_scatter->tb2_quantize->d_buf + chunk_offset;
+    const bf16 *dst_local_ptr = d_buf_now + chunk_offset;
+
+    CHECK_HIP(hipStreamWaitEvent(left_stream, tp_ready));
+
+    CHECK_HIP(hipMemcpyPeerAsync(left_src_ptr, device_scatter, dst_local_ptr, cur_device, chunk_bytes, left_stream));
+
+    CHECK_HIP(hipEventRecord(left_tp_ready, left_stream));
+  }
+
+  for (int i = 0; i < 3; i++) {
+    int right_send_rank = COMM_LINKS[tp_rank][i];
+    if (right_send_rank == left_peer_rank) continue;
+
+    size_t chunk_offset = right_send_chunk_idx * chunk_elems;
+
+    int device_scatter = cur_device - tp_rank + right_send_rank;
+    OurRunState *rs_scatter = &rs[device_scatter];
+
+    hipStream_t right_stream = reduce_streams[right_send_rank * DP * TP + right_send_chunk_idx];
+    hipEvent_t right_tp_ready = reduce_events[right_send_rank * DP * TP + right_send_chunk_idx];
+
+    bf16 *right_src_ptr = (bf16 *)rs_scatter->tb2_quantize->d_buf + chunk_offset;
+    const bf16 *dst_local_ptr = d_buf_now + chunk_offset;
+
+    CHECK_HIP(hipStreamWaitEvent(right_stream, tp_ready));
+
+    CHECK_HIP(hipMemcpyPeerAsync(right_src_ptr, device_scatter, dst_local_ptr, cur_device, chunk_bytes, right_stream));
+
+    CHECK_HIP(hipEventRecord(right_tp_ready, right_stream));
+  }
+
+  pthread_barrier_wait(tp_barrier);
+
+  // ROUND 2
+  for (int i = 0; i < 2; i++) {
+    int send_rank = SEND_COMM_DBL_RINGS[tp_rank][i * 2]; // logic here
+    int chunk_idx = SEND_COMM_DBL_RINGS[tp_rank][i * 2 + 1]; // logic_here;
+
+    size_t chunk_offset = chunk_idx * chunk_elems;
+
+    int send_device = cur_device - tp_rank + send_rank;
+
+    OurRunState *rs_send = &rs[send_device];
+
+    hipStream_t recv_stream = reduce_streams[tp_rank * DP * TP + chunk_idx];
+    hipEvent_t send_tp_ready = reduce_events[send_rank * DP * TP + chunk_idx];
+    hipEvent_t recv_tp_ready = reduce_events[tp_rank * DP * TP + chunk_idx];
+
+    bf16 *recv_ptr = d_buf_now + chunk_offset;
+    const bf16 *send_ptr = (bf16 *)rs_send->tb2_quantize->d_buf + chunk_offset;
+
+    CHECK_HIP(hipStreamWaitEvent(recv_stream, send_tp_ready));
+
+    CHECK_HIP(hipMemcpyPeerAsync(recv_ptr, cur_device, send_ptr, send_device, chunk_bytes, recv_stream));
+
+    CHECK_HIP(hipEventRecord(recv_tp_ready, recv_stream));
+  }
+
+  for (int i = 0; i < TP; i++) {
+    if (i == tp_rank || i == left_peer_rank) continue;
+    hipEvent_t sync_evnt = reduce_events[tp_rank * DP * TP + i];
+    CHECK_HIP(hipStreamWaitEvent(stream, sync_evnt));
+  }
+}
+
 __device__ fp8 add_fp8_num(fp8 a, fp8 b, __hip_fp8_interpretation_t interpret,
                            __hip_saturation_t sat) {
   __half a_half = __hip_cvt_fp8_to_halfraw(a, interpret);
@@ -849,6 +1241,22 @@ __global__ void add_vector_kernel_fp8(fp8 *y, const fp8 *b, int len) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < len) {
     y[i] = add_fp8_num(y[i], b[i], __HIP_E5M2_FNUZ, __HIP_SATFINITE);
+  }
+}
+
+__global__ void add_two_vectors_separate_kernel_fp8(
+  fp8 *y1, const fp8 *b1, fp8 *y2, const fp8 *b2, int len
+) {
+  // Total global thread ID
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  
+  // Check if the thread is within the boundary of 2 * len
+  if (i < len) {
+    y1[i] = add_fp8_num(y1[i], b1[i], __HIP_E5M2_FNUZ, __HIP_SATFINITE);
+  } else if (i < 2 * len) {
+    // Subtract 'len' to get the correct index for y2/b2 vectors
+    int j = i - len;
+    y2[j] = add_fp8_num(y2[j], b2[j], __HIP_E5M2_FNUZ, __HIP_SATFINITE);
   }
 }
 
@@ -913,6 +1321,185 @@ void ring_all_reduce_tb2_quantize_fp8(OurRunState *rs_now, OurRunState *rs_leade
     // CHECK_HIP(hipStreamSynchronize(stream));
     CHECK_HIP(hipEventRecord(total_events->tp_finish[cur_device], stream));
     pthread_barrier_wait(tp_barrier);
+  }
+}
+
+void ring_all_reduce_tb2_quantize_fp8_v2(
+  OurRunState *rs_now, OurRunState *rs_leader, int tp_rank,
+  int cur_device, int cur_batch_size, pthread_barrier_t *tp_barrier,
+  hipEvent_t tp_ready, hipStream_t stream
+) {
+  // GpuTimer timer("ring_all_reduce_tb2_new_v2", stream);
+  
+  CHECK_HIP(hipEventRecord(tp_ready, stream));
+  int tp_orig_pos = TP_ORDER[tp_rank];
+  
+  if (TP_ORDER[tp_orig_pos] != tp_rank) {
+    fprintf(stderr, "False starting tp_rank");
+    abort();
+  }
+
+  fp8 *d_buf_now = (fp8 *)rs_now->tb2_quantize->d_buf;
+  size_t hidden_dim = rs_now->tb2_quantize->shape[1];
+  size_t total_elems = cur_batch_size * hidden_dim;
+  size_t chunk_elems = total_elems / TP;
+  size_t chunk_bytes = chunk_elems * rs_now->tb2_quantize->get_dtype_size();
+
+  int left_orig_pos = (tp_orig_pos - 1 + TP) % TP;
+  int left_peer_rank = TP_ORDER[left_orig_pos];
+  OurRunState *rs_left = &rs_leader[left_peer_rank];
+  int left_device = cur_device - tp_rank + left_peer_rank;
+  hipEvent_t left_tp_ready = total_events->tp_ready[left_device];
+
+  int right_orig_pos = (tp_orig_pos + 1) % TP;
+  int right_peer_rank = TP_ORDER[right_orig_pos];
+  OurRunState *rs_right = &rs_leader[right_peer_rank];
+  int right_device = cur_device - tp_rank + right_peer_rank;
+  hipEvent_t right_tp_ready = total_events->tp_ready[right_device];
+
+  void *tmp_ptr_left = rs_now->tb2_recv->d_buf;
+  fp8 *tmp_ptr_right = (fp8 *)rs_now->tb2_recv->d_buf + chunk_elems;
+
+  int total_work_size = 2 * chunk_elems;
+  const int block_size = 256; 
+  const int grid_size = (total_work_size + block_size - 1) / block_size;
+
+  pthread_barrier_wait(tp_barrier);
+
+  // reduce
+  for (int i = 0; i < TP / 2; ++i) {
+    // Calculate the position of the chunk being received (i+1 steps back in reordered ring)
+    int left_recv_chunk_pos = (tp_orig_pos - i - 6 + TP * 2) % TP; 
+    
+    // Look up the original rank that owns this chunk
+    int left_chunk_idx = TP_ORDER[left_recv_chunk_pos]; // <-- EDITED
+    size_t left_chunk_offset = left_chunk_idx * chunk_elems;
+
+    const fp8 *left_src_ptr = (const fp8 *)rs_left->tb2_quantize->d_buf + left_chunk_offset;
+    fp8 *dst_left_local_ptr = d_buf_now + left_chunk_offset;
+    
+    hipStream_t cur_left_stream = reduce_streams[tp_rank * DP * TP + left_chunk_idx];
+    hipEvent_t cur_left_tp_ready = reduce_events[tp_rank * DP * TP + left_chunk_idx];
+
+    int right_recv_chunk_pos = (tp_orig_pos + i - 3 + TP) % TP; 
+    
+    // Look up the original rank that owns this chunk
+    int right_chunk_idx = TP_ORDER[right_recv_chunk_pos]; // <-- EDITED
+    size_t right_chunk_offset = right_chunk_idx * chunk_elems;
+
+    const fp8 *right_src_ptr = (const fp8 *)rs_right->tb2_quantize->d_buf + right_chunk_offset;
+    fp8 *dst_right_local_ptr = d_buf_now + right_chunk_offset;
+    
+    hipStream_t cur_right_stream = reduce_streams[tp_rank * DP * TP + right_chunk_idx];
+    hipEvent_t cur_right_tp_ready = reduce_events[tp_rank * DP * TP + right_chunk_idx];
+  
+    CHECK_HIP(hipStreamWaitEvent(cur_left_stream, left_tp_ready));
+    CHECK_HIP(hipStreamWaitEvent(cur_right_stream, right_tp_ready));
+
+    CHECK_HIP(
+      hipMemcpyPeerAsync(tmp_ptr_left, cur_device, left_src_ptr, left_device, chunk_bytes, cur_left_stream));
+
+    CHECK_HIP(hipEventRecord(cur_left_tp_ready, cur_left_stream));
+
+    CHECK_HIP(
+      hipMemcpyPeerAsync(tmp_ptr_right, cur_device, right_src_ptr, right_device, chunk_bytes, cur_right_stream));
+
+    CHECK_HIP(hipEventRecord(cur_right_tp_ready, cur_right_stream));
+
+    CHECK_HIP(hipStreamWaitEvent(stream, cur_left_tp_ready));
+    CHECK_HIP(hipStreamWaitEvent(stream, cur_right_tp_ready));
+
+    add_two_vectors_separate_kernel_fp8<<<grid_size, block_size, 0, stream>>>(
+      dst_left_local_ptr, (const fp8 *)tmp_ptr_left, 
+      dst_right_local_ptr, (const fp8 *)tmp_ptr_right, 
+      chunk_elems
+    ); // chunk_elems is still the 'len' for each vector
+
+    CHECK_HIP(hipEventRecord(tp_ready, stream));
+
+    pthread_barrier_wait(tp_barrier);
+  }
+  
+  pthread_barrier_wait(tp_barrier);
+  // scatter
+  // ROUND 1
+  int left_send_chunk_idx = tp_rank;
+  int right_send_chunk_idx = TP_ORDER[left_orig_pos];
+  for (int i = 0; i < 3; i++) {
+    int left_send_rank = COMM_LINKS[tp_rank][i];
+    if (left_send_rank == right_peer_rank) continue;
+
+    size_t chunk_offset = left_send_chunk_idx * chunk_elems;
+
+    int device_scatter = cur_device - tp_rank + left_send_rank;
+    OurRunState *rs_scatter = &rs[device_scatter];
+
+    hipStream_t left_stream = reduce_streams[left_send_rank * DP * TP + left_send_chunk_idx];
+    hipEvent_t left_tp_ready = reduce_events[left_send_rank * DP * TP + left_send_chunk_idx];
+
+    fp8 *left_src_ptr = (fp8 *)rs_scatter->tb2_quantize->d_buf + chunk_offset;
+    const fp8 *dst_local_ptr = d_buf_now + chunk_offset;
+
+    CHECK_HIP(hipStreamWaitEvent(left_stream, tp_ready));
+
+    CHECK_HIP(hipMemcpyPeerAsync(left_src_ptr, device_scatter, dst_local_ptr, cur_device, chunk_bytes, left_stream));
+
+    CHECK_HIP(hipEventRecord(left_tp_ready, left_stream));
+  }
+
+  for (int i = 0; i < 3; i++) {
+    int right_send_rank = COMM_LINKS[tp_rank][i];
+    if (right_send_rank == left_peer_rank) continue;
+
+    size_t chunk_offset = right_send_chunk_idx * chunk_elems;
+
+    int device_scatter = cur_device - tp_rank + right_send_rank;
+    OurRunState *rs_scatter = &rs[device_scatter];
+
+    hipStream_t right_stream = reduce_streams[right_send_rank * DP * TP + right_send_chunk_idx];
+    hipEvent_t right_tp_ready = reduce_events[right_send_rank * DP * TP + right_send_chunk_idx];
+
+    fp8 *right_src_ptr = (fp8 *)rs_scatter->tb2_quantize->d_buf + chunk_offset;
+    const fp8 *dst_local_ptr = d_buf_now + chunk_offset;
+
+    CHECK_HIP(hipStreamWaitEvent(right_stream, tp_ready));
+
+    CHECK_HIP(hipMemcpyPeerAsync(right_src_ptr, device_scatter, dst_local_ptr, cur_device, chunk_bytes, right_stream));
+
+    CHECK_HIP(hipEventRecord(right_tp_ready, right_stream));
+  }
+
+  pthread_barrier_wait(tp_barrier);
+
+  // ROUND 2
+  for (int i = 0; i < 2; i++) {
+    int send_rank = SEND_COMM_DBL_RINGS[tp_rank][i * 2]; // logic here
+    int chunk_idx = SEND_COMM_DBL_RINGS[tp_rank][i * 2 + 1]; // logic_here;
+
+    size_t chunk_offset = chunk_idx * chunk_elems;
+
+    int send_device = cur_device - tp_rank + send_rank;
+
+    OurRunState *rs_send = &rs[send_device];
+
+    hipStream_t recv_stream = reduce_streams[tp_rank * DP * TP + chunk_idx];
+    hipEvent_t send_tp_ready = reduce_events[send_rank * DP * TP + chunk_idx];
+    hipEvent_t recv_tp_ready = reduce_events[tp_rank * DP * TP + chunk_idx];
+
+    fp8 *recv_ptr = d_buf_now + chunk_offset;
+    const fp8 *send_ptr = (fp8 *)rs_send->tb2_quantize->d_buf + chunk_offset;
+
+    CHECK_HIP(hipStreamWaitEvent(recv_stream, send_tp_ready));
+
+    CHECK_HIP(hipMemcpyPeerAsync(recv_ptr, cur_device, send_ptr, send_device, chunk_bytes, recv_stream));
+
+    CHECK_HIP(hipEventRecord(recv_tp_ready, recv_stream));
+  }
+
+  for (int i = 0; i < TP; i++) {
+    if (i == tp_rank || i == left_peer_rank) continue;
+    hipEvent_t sync_evnt = reduce_events[tp_rank * DP * TP + i];
+    CHECK_HIP(hipStreamWaitEvent(stream, sync_evnt));
   }
 }
 

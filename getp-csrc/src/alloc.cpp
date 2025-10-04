@@ -203,34 +203,41 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   rs->q = new Tensor({BATCH_SIZE, (size_t)p->n_attn_heads * p->head_dim}, stream);
   rs->logits = new Tensor({BATCH_SIZE, (size_t)p->vocab_size}, stream);
 
+  int start_layer = 0;
+  int end_layer = p->n_layers - 1;
+  int total_layers = end_layer - start_layer + 1;
+  int even_layers = (total_layers + (start_layer % 2 != 0)) / 2;
+  int odd_layers = total_layers - even_layers;
+  printf("odd_layers: %d, even_layers: %d, BATCH_SIZE: %d\n", odd_layers, even_layers, BATCH_SIZE);
+  rs->key_cache = nullptr;
+  rs->value_cache = nullptr;
 #ifdef KV16
-  printf("using BF16 KV cache\n");
-  // rs->key_cache = new Tensor(
-  //   {BATCH_SIZE, (size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
-  //   stream, DType::BF16);
-  // rs->value_cache = new Tensor(
-  //   {BATCH_SIZE, (size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
-  //   stream, DType::BF16);
-
+  // printf("using BF16 KV cache\n");
   rs->key_cache_odd = new Tensor(
-    {BATCH_SIZE, (size_t)p->n_layers / 2, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
+    {BATCH_SIZE, (size_t)odd_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
     stream, DType::BF16);
   rs->value_cache_odd = new Tensor(
-    {BATCH_SIZE, (size_t)p->n_layers / 2, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
+    {BATCH_SIZE, (size_t)odd_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
     stream, DType::BF16);
-  rs->key_cache_even = new Tensor({BATCH_SIZE, (size_t)p->n_layers / 2, (size_t)p->sliding_window,
-                                   (size_t)p->n_kv_heads * p->head_dim},
-                                  stream, DType::BF16);
-  rs->value_cache_even = new Tensor({BATCH_SIZE, (size_t)p->n_layers / 2, (size_t)p->sliding_window,
-                                     (size_t)p->n_kv_heads * p->head_dim},
-                                    stream, DType::BF16);
+  rs->key_cache_even = new Tensor(
+    {BATCH_SIZE, (size_t)even_layers, (size_t)p->sliding_window, (size_t)p->n_kv_heads * p->head_dim},
+    stream, DType::BF16);
+  rs->value_cache_even = new Tensor(
+    {BATCH_SIZE, (size_t)even_layers, (size_t)p->sliding_window, (size_t)p->n_kv_heads * p->head_dim},
+    stream, DType::BF16);
 #else
   printf("using FP32 KV cache\n");
-  rs->key_cache = new Tensor(
-    {BATCH_SIZE, (size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
+  rs->key_cache_odd = new Tensor(
+    {BATCH_SIZE, (size_t)odd_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
     stream);
-  rs->value_cache = new Tensor(
-    {BATCH_SIZE, (size_t)p->n_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
+  rs->value_cache_odd = new Tensor(
+    {BATCH_SIZE, (size_t)odd_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim},
+    stream);
+  rs->key_cache_even = new Tensor(
+    {BATCH_SIZE, (size_t)even_layers, (size_t)p->sliding_window, (size_t)p->n_kv_heads * p->head_dim},
+    stream);
+  rs->value_cache_even = new Tensor(
+    {BATCH_SIZE, (size_t)even_layers, (size_t)p->sliding_window, (size_t)p->n_kv_heads * p->head_dim},
     stream);
 #endif
 
@@ -288,12 +295,14 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   int shard_inter_dim = p->intermediate_dim / TP;
 
   // Create Tensor wrappers for weight matrices
-  // if (pp_rank == 0) {
-  //   weights->token_embedding_table = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim},
-  //                                               w->token_embedding_table, stream, DType::BF16);
-  // } else {
-  //   weights->token_embedding_table = nullptr;
-  // }
+  /*
+  if (pp_rank == 0) {
+    weights->token_embedding_table = new Tensor({(size_t)p->vocab_size, (size_t)p->hidden_dim},
+                                                w->token_embedding_table, stream, DType::BF16);
+  } else {
+    weights->token_embedding_table = nullptr;
+  }
+  */
   if (pp_rank == 0) {
     printf("Starting alloc token_embedding_table...\n");
     fflush(stdout);
@@ -869,12 +878,16 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   // rs->tb_buf = new Tensor({BATCH_SIZE, (size_t)p->head_dim * p->n_attn_heads / TP}, stream);
 
   rs->tb2 = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
-  rs->tb2_quantize = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream, DType::FP8);
+  rs->tb2_quantize = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream, DType::BF16);
 #if TP == 4
   // rs->tb2_recv = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / TP}, stream);
   rs->tb2_buf = new Tensor({TP / 2, BATCH_SIZE, (size_t)p->hidden_dim}, stream);
+  rs->tb2_recv = nullptr;
+  rs->tb2_recv_2 = nullptr;
 #else
-  rs->tb2_recv = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / TP}, stream, DType::FP8);
+  rs->tb2_buf = nullptr;
+  rs->tb2_recv = new Tensor({2, BATCH_SIZE, (size_t)p->hidden_dim / TP}, stream); //, DType::BF16);
+  rs->tb2_recv_2 = nullptr;
 // rs->tb2_buf = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
 #endif
 
@@ -896,12 +909,14 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
     new Tensor({BATCH_SIZE, (size_t)p->experts_per_token, (size_t)p->intermediate_dim}, stream);
 
   rs->e_agg = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
-  rs->e_agg_quantize = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream, DType::FP8);
+  rs->e_agg_quantize = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream, DType::BF16);
   // rs->e_agg_recv = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / TP}, stream, DType::BF16);
 
 #if TP == 8
   // rs->e_agg_buf = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim}, stream);
-  rs->e_agg_recv = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / TP}, stream, DType::FP8);
+  rs->e_agg_recv = new Tensor({BATCH_SIZE, (size_t)p->hidden_dim / TP}, stream, DType::BF16);
+#else
+  rs->e_agg_recv = nullptr;
 #endif
 
   rs->qkv = new Tensor(
@@ -915,37 +930,42 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
   // rs->logits = new Tensor({BATCH_SIZE, (size_t)p->vocab_size}, stream);
   rs->tmp_logits = new Tensor({BATCH_SIZE, (size_t)p->vocab_size / TP}, stream);
 
+  int start_layer = pp_rank * (p->n_layers / PP);
+  int end_layer = (pp_rank + 1) * (p->n_layers / PP) - 1;
+  int total_layers = end_layer - start_layer + 1;
+  int even_layers = (total_layers + (start_layer % 2 != 0)) / 2;
+  int odd_layers = total_layers - even_layers;
+  printf("odd_layers 120b: %d, even_layers 120b: %d, BATCH_SIZE: %d\n", odd_layers, even_layers, BATCH_SIZE);
+  rs->key_cache = nullptr;
+  rs->value_cache = nullptr;
 #ifdef KV16
-  printf("using BF16 KV cache\n");
-  // rs->key_cache = new Tensor({BATCH_SIZE * PP_SLOT, ((size_t)p->n_layers / PP), (size_t)p->seq_len,
-  //                             (size_t)p->n_kv_heads * p->head_dim / TP},
-  //                            stream, DType::BF16);
-  // rs->value_cache = new Tensor({BATCH_SIZE * PP_SLOT, ((size_t)p->n_layers / PP),
-  //                               (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim / TP},
-  //                              stream, DType::BF16);
-
-  rs->key_cache_odd = new Tensor({BATCH_SIZE * PP_SLOT, (size_t)p->n_layers / PP / 2,
-                                  (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim / TP},
-                                 stream, DType::BF16);
-  rs->value_cache_odd = new Tensor({BATCH_SIZE * PP_SLOT, (size_t)p->n_layers / PP / 2,
-                                    (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim / TP},
-                                   stream, DType::BF16);
-  rs->key_cache_even =
-    new Tensor({BATCH_SIZE * PP_SLOT, (size_t)p->n_layers / PP / 2, (size_t)p->sliding_window,
-                (size_t)p->n_kv_heads * p->head_dim / TP},
-               stream, DType::BF16);
-  rs->value_cache_even =
-    new Tensor({BATCH_SIZE * PP_SLOT, (size_t)p->n_layers / PP / 2, (size_t)p->sliding_window,
-                (size_t)p->n_kv_heads * p->head_dim / TP},
-               stream, DType::BF16);
+  // printf("using BF16 KV cache\n");
+  rs->key_cache_odd = new Tensor(
+    {BATCH_SIZE, (size_t)odd_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim / TP},
+    stream, DType::BF16);
+  rs->value_cache_odd = new Tensor(
+    {BATCH_SIZE, (size_t)odd_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim / TP},
+    stream, DType::BF16);
+  rs->key_cache_even = new Tensor(
+    {BATCH_SIZE, (size_t)even_layers, (size_t)p->sliding_window, (size_t)p->n_kv_heads * p->head_dim / TP},
+    stream, DType::BF16);
+  rs->value_cache_even = new Tensor(
+    {BATCH_SIZE, (size_t)even_layers, (size_t)p->sliding_window, (size_t)p->n_kv_heads * p->head_dim / TP},
+    stream, DType::BF16);
 #else
   printf("using FP32 KV cache\n");
-  rs->key_cache = new Tensor({BATCH_SIZE, ((size_t)p->n_layers / PP), (size_t)p->seq_len,
-                              (size_t)p->n_kv_heads * p->head_dim / TP},
-                             stream);
-  rs->value_cache = new Tensor({BATCH_SIZE, ((size_t)p->n_layers / PP), (size_t)p->seq_len,
-                                (size_t)p->n_kv_heads * p->head_dim / TP},
-                               stream);
+  rs->key_cache_odd = new Tensor(
+    {BATCH_SIZE, (size_t)odd_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim / TP},
+    stream);
+  rs->value_cache_odd = new Tensor(
+    {BATCH_SIZE, (size_t)odd_layers, (size_t)p->seq_len, (size_t)p->n_kv_heads * p->head_dim / TP},
+    stream);
+  rs->key_cache_even = new Tensor(
+    {BATCH_SIZE, (size_t)even_layers, (size_t)p->sliding_window, (size_t)p->n_kv_heads * p->head_dim / TP},
+    stream);
+  rs->value_cache_even = new Tensor(
+    {BATCH_SIZE, (size_t)even_layers, (size_t)p->sliding_window, (size_t)p->n_kv_heads * p->head_dim / TP},
+    stream);
 #endif
 
   // mask needs to be batch because they are not zero_allocated
@@ -1004,7 +1024,7 @@ void our_init_run_state(RunState *s, Config *p, OurRunState *rs, int device_id,
 #endif
 
 void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunState *rs,
-              hipStream_t *total_streams, hipTotalEvents_t *total_events) {
+              hipStream_t *total_streams, hipTotalEvents_t *total_events, hipStream_t *reduce_streams, hipEvent_t *reduce_events) {
   Config *p = &transformer->config;
   TransformerWeights *w = &transformer->weights;
   RunState *s = &transformer->state;
@@ -1013,6 +1033,16 @@ void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunSt
   total_events->tp_ready = new hipEvent_t[TOTAL_GPUS_NEEDED];
   total_events->tp_finish = new hipEvent_t[TOTAL_GPUS_NEEDED];
   total_events->pp_sync = new hipEvent_t[TOTAL_GPUS_NEEDED];
+
+  if (TP > 1) {
+    for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
+      CHECK_HIP(hipSetDevice(i));
+      for (int j = 0; j < TP; j++) {
+        CHECK_HIP(hipStreamCreate(&reduce_streams[i * TP + j]));
+        CHECK_HIP(hipEventCreate(&reduce_events[i * TP + j]));
+      } 
+    }
+  }
 
   // #ifndef RUN_20B
   // #ifndef RUN_EP
@@ -1041,8 +1071,11 @@ void our_init(Transformer *transformer, OurTransformerWeights *weights, OurRunSt
     if (PP > 1) {
       CHECK_HIP(hipEventCreate(&(total_events->pp_sync[i])));
     }
+    check_gpu_memory();
     our_init_weights(w, p, &weights[i], i, total_streams[i]);
+    check_gpu_memory();
     our_init_run_state(s, p, &rs[i], i, total_streams[i]);
+    check_gpu_memory();
 #endif
   }
 }
@@ -1112,6 +1145,14 @@ void our_free_each(OurTransformerWeights *weights, OurRunState *rs) {
     delete rs->key_cache;
   if (rs->value_cache)
     delete rs->value_cache;
+  if (rs->key_cache_odd)
+    delete rs->key_cache_odd;
+  if (rs->value_cache_odd)
+    delete rs->value_cache_odd;
+  if (rs->key_cache_even)
+    delete rs->key_cache_even;
+  if (rs->value_cache_even)
+    delete rs->value_cache_even;
   if (rs->mask)
     delete rs->mask;
 
@@ -1165,7 +1206,18 @@ void our_free_each(OurTransformerWeights *weights, OurRunState *rs) {
 }
 
 void our_free(OurTransformerWeights *weights, OurRunState *rs, hipStream_t *total_streams,
-              hipTotalEvents_t *total_events) {
+              hipTotalEvents_t *total_events, hipStream_t *reduce_streams, hipEvent_t *reduce_events) {
+  
+  if (TP > 1) {
+    for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
+      CHECK_HIP(hipSetDevice(i));
+      for (int j = 0; j < TP; j++) {
+        CHECK_HIP(hipStreamDestroy(reduce_streams[i * TP + j]));
+        CHECK_HIP(hipEventDestroy(reduce_events[i * TP + j]));
+      } 
+    }
+  }
+
   for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
     fprintf(stderr, "Freeing weights and run state of id %d\n", i);
 

@@ -31,13 +31,6 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     exit(1);
   }
 
-#ifdef RUN_20B
-  if (TP != 1 || PP != 1) {
-    fprintf(stderr, "Error: TP and PP must be equal to 1 in 20B mode\n");
-    exit(1);
-  }
-#endif
-
   for (int i = 0; i < TOTAL_GPUS_NEEDED; i++) {
     for (int j = 0; j < TOTAL_GPUS_NEEDED; j++) {
       CHECK_HIP(hipSetDevice(i));
@@ -51,8 +44,12 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   rs = new OurRunState[TOTAL_GPUS_NEEDED];
   total_streams = new hipStream_t[TOTAL_GPUS_NEEDED];
   total_events = new hipTotalEvents_t;
+  if (TP > 1) {
+    reduce_streams = new hipStream_t[TOTAL_GPUS_NEEDED * TP];
+    reduce_events = new hipEvent_t[TOTAL_GPUS_NEEDED * TP];
+  }
 
-  our_init(transformer, weights, rs, total_streams, total_events);
+  our_init(transformer, weights, rs, total_streams, total_events, reduce_streams, reduce_events);
 
   public_config = &transformer->config;
   public_transformer = transformer;
@@ -71,11 +68,12 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
   // - Memory deallocation
   // - Unload model
   // - ...
-  our_free(weights, rs, total_streams, total_events);
+  our_free(weights, rs, total_streams, total_events, reduce_streams, reduce_events);
   delete weights;
   delete rs;
   delete total_streams;
   delete total_events;
+  delete reduce_streams;
 }
 
 #ifndef RUN_20B
@@ -109,7 +107,8 @@ void *thread_handler(void *arg) {
   int id = args->id;
   int max_seq_len = public_requests->max_seq_len;
   int end_idx = args->end_idx;
-  args->tp_barrier = new pthread_barrier_t[PP * 13];
+  int total_barriers_each = 15;
+  args->tp_barrier = new pthread_barrier_t[PP * total_barriers_each];
 
 #ifdef RUN_20B
   CHECK_HIP(hipSetDevice(id));
@@ -123,20 +122,17 @@ void *thread_handler(void *arg) {
 
   // barrier for different pipeline stages
   for (int i = 0; i < PP; i++) {
-    int base_idx = i * 13;
+    int base_idx = i * total_barriers_each;
     pthread_barrier_init(&(args->tp_barrier[base_idx]), NULL, TP);
-    pthread_barrier_init(&(args->tp_barrier[base_idx + 1]), NULL, 2);
-    pthread_barrier_init(&(args->tp_barrier[base_idx + 2]), NULL, 2);
-    pthread_barrier_init(&(args->tp_barrier[base_idx + 3]), NULL, 2);
-    pthread_barrier_init(&(args->tp_barrier[base_idx + 4]), NULL, 2);
-    pthread_barrier_init(&(args->tp_barrier[base_idx + 5]), NULL, 2);
-    pthread_barrier_init(&(args->tp_barrier[base_idx + 6]), NULL, 2);
-    pthread_barrier_init(&(args->tp_barrier[base_idx + 7]), NULL, 2);
-    pthread_barrier_init(&(args->tp_barrier[base_idx + 8]), NULL, 2);
-    pthread_barrier_init(&(args->tp_barrier[base_idx + 9]), NULL, 2);
-    pthread_barrier_init(&(args->tp_barrier[base_idx + 10]), NULL, 2);
-    pthread_barrier_init(&(args->tp_barrier[base_idx + 11]), NULL, 2);
-    pthread_barrier_init(&(args->tp_barrier[base_idx + 12]), NULL, 2);
+    // for tree reduce
+    for (int j = 0; j < 12; j++) {
+      pthread_barrier_init(&(args->tp_barrier[base_idx + 1 + j]), NULL, 2);
+    }
+
+    // for ring reduce
+    for (int j = 0; j < 2; j++) {
+      pthread_barrier_init(&(args->tp_barrier[base_idx + 13 + j]), NULL, 4);
+    }
   }
 
   int shared_pos = 0;
@@ -145,7 +141,7 @@ void *thread_handler(void *arg) {
   for (int i = 0; i < TOTAL_PIPELINES; i++) {
     inside_args[i].tp_rank = (i % TP);
     inside_args[i].pp_rank = (i % TOTAL_PIPELINES) / TP;
-    inside_args[i].tp_barrier = &(args->tp_barrier[inside_args[i].pp_rank * 13]);
+    inside_args[i].tp_barrier = &(args->tp_barrier[inside_args[i].pp_rank * total_barriers_each]);
     inside_args[i].id = id;
     inside_args[i].pos_ptr = &shared_pos;
     inside_args[i].finished_ptr = &finished;
@@ -285,7 +281,7 @@ void *thread_handler(void *arg) {
   pthread_barrier_destroy(&start_barrier);
   pthread_barrier_destroy(&end_barrier);
 
-  for (int i = 0; i < PP * 13; i++) {
+  for (int i = 0; i < PP * total_barriers_each; i++) {
     pthread_barrier_destroy(&(args->tp_barrier[i]));
   }
 #endif

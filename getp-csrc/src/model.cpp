@@ -275,17 +275,38 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
     reduce_tb2_new(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream,
                    tp_ready, tp_finish);
 #else
-    tensor_quantize_fp8(rs_now->tb2, rs_now->tb2_quantize, stream);
-    ring_all_reduce_tb2_quantize_fp8(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size,
-                                     tp_barrier, stream);
-    tensor_dequantize_fp8(rs_now->tb2, rs_now->tb2_quantize, stream);
-    // reduce_tb2_full_tp(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream,
-    //                    tp_ready, tp_finish);
+
+    // pthread_barrier_wait(tp_barrier);
+
+    {
+      // GpuTimer timer("ring new", stream);
+      // tensor_quantize(rs_now->tb2, rs_now->tb2_quantize, stream);
+      // ring_all_reduce_tb2_quantize_fp8(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream);
+      ring_all_reduce_tb2_new_v2(
+        rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier,
+        tp_ready, stream
+      );
+      // tensor_dequantize(rs_now->tb2, rs_now->tb2_quantize, stream);
+      // reduce_tb2_full_tp(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream,
+      //                    tp_ready, tp_finish);
+    }
+
+    // pthread_barrier_wait(tp_barrier);
+
+    /*
+    {
+      // GpuTimer timer("fp8 new", stream);
+      tensor_quantize_fp8(rs_now->tb2, rs_now->tb2_quantize, stream);
+      ring_all_reduce_tb2_quantize_fp8_v2(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, tp_ready, stream);
+      tensor_dequantize_fp8(rs_now->tb2, rs_now->tb2_quantize, stream);
+      // reduce_tb2_full_tp(rs_now, rs_leader, tp_rank, cur_device, cur_batch_size, tp_barrier, stream,
+      //                    tp_ready, tp_finish);
+    }
+    */
 #endif
 
-#ifdef DEBUG
-    if (flag)
-      rs_now->tb2->printDebug("rs_now->tb2", tp_rank, 0, stream);
+#ifdef DEBUG_NEW
+    rs_now->tb2->printDebug("rs_now->tb2", tp_rank, 0, stream);
 #endif
 
     // residual connection back into x + ffn rmsnorm
@@ -479,6 +500,8 @@ int *forward_gpu_120b_batched(int *tokens, int pos, int cur_batch_size, int flow
 
       reduce_logits_batched(rs_now->logits_max_total, rs_now->logits_id_total, rs_now->logits_max,
                             rs_now->logits_id, cur_batch_size, false, false, false, true, stream);
+
+      // abort();
 
       return rs_now->logits_id->buf;
     }

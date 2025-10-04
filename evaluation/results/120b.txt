@@ -1,0 +1,22 @@
+parsing args...
+loading tiktoken encoding: o200k_harmony
+reading submission: submission/output_120b_token_ids.txt
+decoding file: submission/output_120b_token_ids.txt
+decoded lines: 6656 from submission/output_120b_token_ids.txt
+reading references: references/output_120b_token_ids.txt
+decoding file: references/output_120b_token_ids.txt
+decoded lines: 8192 from references/output_120b_token_ids.txt
+computing METEOR...
+ensuring nltk resources...
+nltk resource available: punkt
+downloading nltk resource: wordnet
+downloaded: wordnet
+downloading nltk resource: omw-1.4
+downloaded: omw-1.4
+aligning by index, items: 6656
+computing METEOR in parallel with 96 workers...
+meteor	0.220583
+computing BERTScore (roberta-large-mnli)...
+found local BERTScore model at /nfs/gpu_trainee/final-project/models/bs_model/roberta-large-mnli
+loading BERTScore model: /nfs/gpu_trainee/final-project/models/bs_model/roberta-large-mnli...
+BERTScore device: GPU (2 device(s))
