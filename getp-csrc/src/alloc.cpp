@@ -15,6 +15,46 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
     new Tensor({(size_t)p->n_layers * p->hidden_dim}, w->rms_attn_w, stream, DType::BF16);
   weights->rms_ffn_w = new Tensor({(size_t)p->n_layers * p->hidden_dim}, w->rms_ffn_w, stream);
 
+  // {
+  //   size_t n_layers = p->n_layers;
+  //   size_t n_heads = p->n_attn_heads + 2 * p->n_kv_heads;
+  //   size_t head_dim = p->head_dim;
+  //   size_t hidden_dim = p->hidden_dim;
+  //   size_t BK = 32;
+  //   size_t BN = 128;
+
+  //   weights->w_qkv =
+  //     new Tensor({n_layers, hidden_dim / BK, n_heads * head_dim / BN, BN, BK}, stream, DType::BF16);
+
+  //   for (size_t l = 0; l < n_layers; l++) {
+  //     float *dst_ptr = weights->w_qkv->buf + l * hidden_dim * n_heads * head_dim;
+  //     float *src_ptr = w->w_qkv + l * hidden_dim * n_heads * head_dim;
+  //     size_t dst_idx = 0;
+
+  //     for (size_t k_base = 0; k_base < hidden_dim; k_base += BK) {
+  //       for (size_t n_base = 0; n_base < n_heads * head_dim; n_base += BN) {
+  //         for (size_t n_tile = 0; n_tile < BN; n_tile++) {
+  //           for (size_t k_tile = 0; k_tile < BK; k_tile++) {
+  //             size_t k_global = k_base + k_tile;
+  //             size_t n_global = n_base + n_tile;
+
+  //             if (k_global < hidden_dim && n_global < n_heads * head_dim) {
+  //               size_t src_idx = n_global * hidden_dim + k_global;
+  //               dst_ptr[dst_idx] = src_ptr[src_idx];
+  //             } else {
+  //               dst_ptr[dst_idx] = 0.f;
+  //             }
+
+  //             dst_idx++;
+  //           }
+  //         }
+  //       }
+  //     }
+  //   }
+
+  //   weights->w_qkv->to_device(stream);
+  // }
+
   {
     size_t n_layers = p->n_layers;
     size_t n_heads = p->n_attn_heads + 2 * p->n_kv_heads;
@@ -92,6 +132,61 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   weights->b_router =
     new Tensor({(size_t)p->n_layers, (size_t)p->n_experts}, w->b_router, stream, DType::BF16);
 
+  // {
+  //   printf("Starting alloc mlp1\n");
+  //   fflush(stdout);
+  //   size_t n_layers = p->n_layers;
+  //   size_t n_experts = p->n_experts;
+  //   size_t hidden_dim = p->hidden_dim;
+  //   size_t inter_dim = p->intermediate_dim;
+  //   constexpr size_t BK = 64;
+  //   constexpr size_t BN = 128;
+
+  //   weights->w_mlp1 = new Tensor({n_layers, n_experts, hidden_dim / BK, 2 * inter_dim / BN, BN, BK},
+  //                                stream, DType::BF16);
+
+  //   size_t tmp_elems = hidden_dim * 2 * inter_dim;
+  //   bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
+
+  //   bf16 *d_buf = (bf16 *)(weights->w_mlp1->d_buf);
+
+  //   for (size_t l = 0; l < n_layers; l++) {
+  //     for (size_t e = 0; e < n_experts; e++) {
+  //       size_t base = l * n_experts * hidden_dim * 2 * inter_dim + e * hidden_dim * 2 * inter_dim;
+  //       size_t dst_idx = 0;
+
+  //       for (size_t k_base = 0; k_base < hidden_dim; k_base += BK) {
+  //         for (size_t n_base = 0; n_base < 2 * inter_dim; n_base += BN) {
+  //           for (size_t i = 0; i < BN; i++) {
+  //             for (size_t j = 0; j < BK; j++) {
+  //               float val = w->w_mlp1[base + (n_base + i) * hidden_dim + k_base + j];
+  //               tmp[dst_idx++] = bf16(val);
+  //             }
+  //           }
+  //         }
+  //       }
+
+  //       // for (size_t h = 0; h < hidden_dim; h++) {
+  //       //   for (size_t i = 0; i < 2 * inter_dim; i++) {
+  //       //     float value = w->w_mlp1[base + i * hidden_dim + h];
+  //       //     tmp[h * 2 * inter_dim + i] = bf16(value);
+  //       //   }
+  //       // }
+
+  //       size_t d_offset =
+  //         l * n_experts * hidden_dim * 2 * inter_dim + e * hidden_dim * 2 * inter_dim;
+  //       CHECK_HIP(hipMemcpyAsync(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16),
+  //                                hipMemcpyHostToDevice, stream));
+  //     }
+  //   }
+
+  //   CHECK_HIP(hipStreamSynchronize(stream));
+  //   free(tmp);
+
+  //   printf("End alloc mlp1\n");
+  //   fflush(stdout);
+  // }
+
   {
     printf("Starting alloc mlp1\n");
     fflush(stdout);
@@ -135,6 +230,61 @@ void our_init_weights(TransformerWeights *w, Config *p, OurTransformerWeights *w
   weights->b_mlp1 =
     new Tensor({(size_t)p->n_layers, (size_t)p->n_experts, 2 * (size_t)p->intermediate_dim},
                w->b_mlp1, stream, DType::BF16);
+
+  // {
+  //   printf("Starting alloc mlp2\n");
+  //   fflush(stdout);
+  //   size_t n_layers = p->n_layers;
+  //   size_t n_experts = p->n_experts;
+  //   size_t hidden_dim = p->hidden_dim;
+  //   size_t inter_dim = p->intermediate_dim;
+  //   constexpr size_t BK = 64;
+  //   constexpr size_t BN = 128;
+
+  //   weights->w_mlp2 = new Tensor({n_layers, n_experts, inter_dim / BK, hidden_dim / BN, BN, BK},
+  //                                stream, DType::BF16);
+
+  //   size_t tmp_elems = inter_dim * hidden_dim;
+  //   bf16 *tmp = (bf16 *)malloc(tmp_elems * sizeof(bf16));
+
+  //   bf16 *d_buf = (bf16 *)(weights->w_mlp2->d_buf);
+
+  //   for (size_t l = 0; l < n_layers; l++) {
+  //     for (size_t e = 0; e < n_experts; e++) {
+  //       size_t base = l * n_experts * hidden_dim * inter_dim + e * hidden_dim * inter_dim;
+  //       size_t dst_idx = 0;
+
+  //       for (size_t k_base = 0; k_base < inter_dim; k_base += BK) {
+  //         for (size_t n_base = 0; n_base < hidden_dim; n_base += BN) {
+  //           for (size_t i = 0; i < BN; i++) {
+  //             for (size_t j = 0; j < BK; j++) {
+  //               float val = w->w_mlp2[base + (n_base + i) * inter_dim + k_base + j];
+  //               tmp[dst_idx++] = bf16(val);
+  //             }
+  //           }
+  //         }
+  //       }
+
+  //       // for (size_t i = 0; i < inter_dim; i++) {
+  //       //   for (size_t h = 0; h < hidden_dim; h++) {
+  //       //     float value = w->w_mlp2[base + h * inter_dim + i];
+  //       //     tmp[i * hidden_dim + h] = bf16(value);
+  //       //   }
+  //       // }
+
+  //       size_t d_offset = l * n_experts * inter_dim * hidden_dim + e * inter_dim * hidden_dim;
+  //       CHECK_HIP(hipMemcpyAsync(d_buf + d_offset, tmp, tmp_elems * sizeof(bf16),
+  //                                hipMemcpyHostToDevice, stream));
+  //     }
+  //   }
+
+  //   CHECK_HIP(hipStreamSynchronize(stream));
+  //   free(tmp);
+
+  //   // weights->w_mlp2->to_device(0);
+  //   printf("End alloc mlp2\n");
+  //   fflush(stdout);
+  // }
 
   {
     printf("Starting alloc mlp2\n");

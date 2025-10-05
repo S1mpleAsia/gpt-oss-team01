@@ -975,6 +975,411 @@ __global__ __launch_bounds__(BLOCK_THREADS) void gemm_mfma_moe_v2_bf16(
 }
 
 template <int BM, int BN, int BK, int TM, int TN, int BLOCK_THREADS>
+__global__ __launch_bounds__(BLOCK_THREADS) void gemm_mfma_moe_v2_tiled(
+  const bf16 *__restrict__ A, const bf16 *__restrict__ B, float *__restrict__ C,
+  const bf16 *__restrict__ bias, const int *__restrict__ expert_offsets, int M_total, int N,
+  int K) {
+  constexpr int WM = 16, WN = 16, WK = 16;
+  constexpr int VEC_B_SIZE = 8;
+  constexpr int VEC_A_SIZE = 8;
+
+  const int expert_id = blockIdx.z;
+  const int row_begin = expert_offsets[expert_id];
+  const int row_end = expert_offsets[expert_id + 1];
+  const int M = (row_end - row_begin > 0) ? (row_end - row_begin) : 0;
+  if (M <= 0)
+    return;
+
+  const int Nt = N / BN;
+  const int Kt = K / BK;
+  const bf16 *__restrict__ B_ptr = B + (size_t)expert_id * N * K;
+  const bf16 *__restrict__ bias_ptr = bias ? (bias + (size_t)expert_id * N) : nullptr;
+
+  const int tid = threadIdx.x;
+  const int wave_id = tid >> 6;
+  const int lane_id = tid & 63;
+
+  const int block_row_local_start = blockIdx.y * BM;
+  const int block_col_start = blockIdx.x * BN;
+  if (block_row_local_start >= M)
+    return;
+
+  const int waves_per_block_m = BM / TM;
+  const int waves_per_block_n = BN / TN;
+  const int wave_row = wave_id / waves_per_block_n;
+  const int wave_col = wave_id % waves_per_block_n;
+
+  const int wave_row_start = block_row_local_start + wave_row * TM;
+  const int wave_col_start = block_col_start + wave_col * TN;
+
+  const int block_row_global_start = row_begin + block_row_local_start;
+
+  __shared__ __bf16 As[BM][BK + 2];
+  __shared__ __bf16 Bs[BN][BK + 2];
+
+  constexpr int M_TILES = TM / WM;
+  constexpr int N_TILES = TN / WN;
+  f32x4 acc[M_TILES][N_TILES];
+#pragma unroll
+  for (int i = 0; i < M_TILES; ++i)
+#pragma unroll
+    for (int j = 0; j < N_TILES; ++j)
+      acc[i][j] = {0.f, 0.f, 0.f, 0.f};
+
+  constexpr int A_ELEMS_TILE = BM * BK;
+  constexpr int B_ELEMS_TILE = BK * BN;
+  constexpr int A_VEC_PER_THR = (A_ELEMS_TILE / VEC_A_SIZE) / BLOCK_THREADS;
+  constexpr int B_VEC_PER_THR = (B_ELEMS_TILE / VEC_B_SIZE) / BLOCK_THREADS;
+
+  const int lx = lane_id & 15;
+  const int ly = lane_id >> 4;
+
+#pragma unroll
+  for (int i = 0; i < A_VEC_PER_THR; i++) {
+    const int vec_idx = tid + i * BLOCK_THREADS;
+    const int elem_idx = vec_idx * VEC_A_SIZE;
+    const int r_local = elem_idx / BK;
+    const int c = elem_idx % BK;
+    const int g_row_global = block_row_global_start + r_local;
+    const int g_col = 0 + c;
+
+    if ((block_row_local_start + r_local) < M && (g_col + VEC_A_SIZE - 1) < K) {
+      *reinterpret_cast<uint4 *>(&As[r_local][c]) =
+        *reinterpret_cast<const uint4 *>(&A[(size_t)g_row_global * K + g_col]);
+    } else {
+      uint4 z = {0, 0, 0, 0};
+      *reinterpret_cast<uint4 *>(&As[r_local][c]) = z;
+    }
+  }
+
+#pragma unroll
+  for (int i = 0; i < B_VEC_PER_THR; ++i) {
+    const int vec_idx = tid + i * BLOCK_THREADS;
+    const int elem_idx = vec_idx * VEC_B_SIZE;  // bước 8 phần tử (16B)
+    const int r_in = elem_idx % BK;             // offset theo K trong tile
+    const int c_in = elem_idx / BK;             // offset theo N trong tile
+
+    const int g_k = 0 + r_in;  // k_base = 0 lúc initial
+    const int g_n = block_col_start + c_in;
+
+    const int tile_k = g_k / BK;
+    const int tile_n = g_n / BN;
+    const int k_in = g_k % BK;  // BK trục nhanh
+    const int n_in = g_n % BN;
+
+    const size_t src = ((((size_t)tile_k * Nt) + tile_n) * BN + n_in) * BK + k_in;
+
+    *reinterpret_cast<uint4 *>(&Bs[c_in][r_in]) = *reinterpret_cast<const uint4 *>(&B_ptr[src]);
+  }
+  __syncthreads();
+
+  for (int k_base = 0; k_base < K; k_base += BK) {
+    uint4 regA[A_VEC_PER_THR];
+    uint4 regB[B_VEC_PER_THR];
+    const bool has_next = (k_base + BK) < K;
+
+    if (has_next) {
+#pragma unroll
+      for (int i = 0; i < A_VEC_PER_THR; i++) {
+        const int vec_idx = tid + i * BLOCK_THREADS;
+        const int elem_idx = vec_idx * VEC_A_SIZE;
+        const int r_local = elem_idx / BK;
+        const int c = elem_idx % BK;
+        const int g_row_global = block_row_global_start + r_local;
+        const int g_col = (k_base + BK) + c;
+
+        if ((block_row_local_start + r_local) < M && (g_col + VEC_A_SIZE - 1) < K) {
+          regA[i] = *reinterpret_cast<const uint4 *>(&A[(size_t)g_row_global * K + g_col]);
+        } else {
+          regA[i] = uint4{0, 0, 0, 0};
+        }
+      }
+
+#pragma unroll
+      for (int i = 0; i < B_VEC_PER_THR; ++i) {
+        const int vec_idx = tid + i * BLOCK_THREADS;
+        const int elem_idx = vec_idx * VEC_B_SIZE;
+        const int r_in = elem_idx % BK;
+        const int c_in = elem_idx / BK;
+
+        const int g_k = (k_base + BK) + r_in;
+        const int g_n = block_col_start + c_in;
+
+        const int tile_k = g_k / BK;
+        const int tile_n = g_n / BN;
+        const int k_in = g_k % BK;
+        const int n_in = g_n % BN;
+
+        const size_t src = ((((size_t)tile_k * Nt) + tile_n) * BN + n_in) * BK + k_in;
+        regB[i] = *reinterpret_cast<const uint4 *>(&B_ptr[src]);
+      }
+    }
+
+#pragma unroll
+    for (int kk = 0; kk < BK; kk += WK) {
+#pragma unroll
+      for (int mt = 0; mt < M_TILES; ++mt) {
+#pragma unroll
+        for (int nt = 0; nt < N_TILES; ++nt) {
+          const int a_row = wave_row * TM + mt * WM + lx;
+          const int b_col = wave_col * TN + nt * WN + lx;
+
+          bf16x4 a_vec = *reinterpret_cast<const bf16x4 *>(&As[a_row][kk + ly * 4]);
+          bf16x4 b_vec = *reinterpret_cast<const bf16x4 *>(&Bs[b_col][kk + ly * 4]);
+
+          // bf16x4 a_vec, b_vec;
+          // #pragma unroll
+          //           for (int i = 0; i < 4; ++i) {
+          //             const int kcol = i + ly * 4;
+          //             a_vec[i] = As[a_row][kk + kcol];
+          //             b_vec[i] = Bs[kk + kcol][b_col];
+          //           }
+          acc[mt][nt] = MFMA_BF16_16x16(a_vec, b_vec, acc[mt][nt]);
+        }
+      }
+    }
+    __syncthreads();
+
+    if (has_next) {
+#pragma unroll
+      for (int i = 0; i < A_VEC_PER_THR; i++) {
+        const int elem_idx = (tid + i * BLOCK_THREADS) * VEC_A_SIZE;
+        const int r_local = elem_idx / BK;
+        const int c = elem_idx % BK;
+        *reinterpret_cast<uint4 *>(&As[r_local][c]) = regA[i];
+      }
+
+#pragma unroll
+      for (int i = 0; i < B_VEC_PER_THR; ++i) {
+        const int elem_idx = (tid + i * BLOCK_THREADS) * VEC_B_SIZE;
+        const int r_in = elem_idx % BK;
+        const int c_in = elem_idx / BK;
+        *reinterpret_cast<uint4 *>(&Bs[c_in][r_in]) = regB[i];
+      }
+      __syncthreads();
+    }
+  }
+
+#pragma unroll
+  for (int mt = 0; mt < M_TILES; ++mt) {
+#pragma unroll
+    for (int nt = 0; nt < N_TILES; ++nt) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int row_local = wave_row_start + mt * WM + (i + 4 * ly);
+        const int row_global = row_begin + row_local;
+        const int col = wave_col_start + nt * WN + lx;
+        if (row_local < M && col < N) {
+          float out = acc[mt][nt][i];
+          if (bias_ptr)
+            out += (float)bias_ptr[col];
+          C[(size_t)row_global * N + col] = out;
+        }
+      }
+    }
+  }
+}
+
+template <int BM, int BN, int BK, int TM, int TN, int BLOCK_THREADS>
+__global__ __launch_bounds__(BLOCK_THREADS) void gemm_mfma_v2_tiled(const bf16 *__restrict__ A,
+                                                                    const bf16 *__restrict__ B,
+                                                                    float *__restrict__ C,
+                                                                    const bf16 *__restrict__ bias,
+                                                                    int M, int N, int K) {
+  constexpr int WM = 16, WN = 16, WK = 16;
+  constexpr int VEC_B_SIZE = 8;
+  constexpr int VEC_A_SIZE = 8;
+
+  const int tid = threadIdx.x;
+  const int wave_id = tid >> 6;
+  const int lane_id = tid & 63;
+
+  const int block_row_start = blockIdx.y * BM;
+  const int block_col_start = blockIdx.x * BN;
+
+  const int waves_per_block_m = BM / TM;
+  const int waves_per_block_n = BN / TN;
+  const int wave_row = wave_id / waves_per_block_n;
+  const int wave_col = wave_id % waves_per_block_n;
+
+  const int wave_row_start = block_row_start + wave_row * TM;
+  const int wave_col_start = block_col_start + wave_col * TN;
+
+  __shared__ __bf16 As[BM][BK + 2];
+  __shared__ __bf16 Bs[BN][BK + 2];
+
+  constexpr int M_TILES = TM / WM;
+  constexpr int N_TILES = TN / WN;
+  f32x4 acc[M_TILES][N_TILES];
+#pragma unroll
+  for (int i = 0; i < M_TILES; ++i)
+#pragma unroll
+    for (int j = 0; j < N_TILES; ++j)
+      acc[i][j] = {0.f, 0.f, 0.f, 0.f};
+
+  constexpr int A_ELEMS_TILE = BM * BK;
+  constexpr int B_ELEMS_TILE = BK * BN;
+  constexpr int A_VEC_PER_THR = (A_ELEMS_TILE / VEC_A_SIZE) / BLOCK_THREADS;
+  constexpr int B_VEC_PER_THR = (B_ELEMS_TILE / VEC_B_SIZE) / BLOCK_THREADS;
+
+  const int lx = lane_id & 15;
+  const int ly = lane_id >> 4;
+
+#pragma unroll
+  for (int i = 0; i < A_VEC_PER_THR; i++) {
+    const int vec_idx = tid + i * BLOCK_THREADS;
+    const int elem_idx = vec_idx * VEC_A_SIZE;
+    const int r = elem_idx / BK;
+    const int c = elem_idx % BK;
+    const int g_row = block_row_start + r;
+    const int g_col = 0 + c;
+
+    if (g_row < M && (g_col + VEC_A_SIZE - 1) < K) {
+      *reinterpret_cast<uint4 *>(&As[r][c]) =
+        *reinterpret_cast<const uint4 *>(&A[(size_t)g_row * K + g_col]);
+    } else {
+      uint4 z = {0, 0, 0, 0};
+      *reinterpret_cast<uint4 *>(&As[r][c]) = z;
+    }
+  }
+
+  const int Nt = N / BN;
+#pragma unroll
+  for (int i = 0; i < B_VEC_PER_THR; ++i) {
+    const int vec_idx = tid + i * BLOCK_THREADS;
+    const int elem_idx = vec_idx * VEC_B_SIZE;  // bước 8 phần tử (16B)
+    const int r_in = elem_idx % BK;             // offset theo K trong tile
+    const int c_in = elem_idx / BK;             // offset theo N trong tile
+
+    const int g_k = 0 + r_in;  // k_base = 0 ở initial
+    const int g_n = block_col_start + c_in;
+
+    // tile & in-tile
+    const int tile_k = g_k / BK;
+    const int tile_n = g_n / BN;
+    const int k_in = g_k % BK;  // BK là trục nhanh
+    const int n_in = g_n % BN;
+
+    // offset phẳng trong B_tiled: [Kt, Nt, BN, BK]
+    const size_t src = ((((size_t)tile_k * Nt) + tile_n) * BN + n_in) * BK + k_in;
+
+    // đọc 16B theo K và ghi transpose vào LDS: BsT[n_in][k_in]
+    *reinterpret_cast<uint4 *>(&Bs[c_in][r_in]) = *reinterpret_cast<const uint4 *>(&B[src]);
+  }
+  __syncthreads();
+
+  for (int k_base = 0; k_base < K; k_base += BK) {
+    uint4 regA[A_VEC_PER_THR];
+    uint4 regB[B_VEC_PER_THR];
+    const bool has_next = (k_base + BK) < K;
+
+    if (has_next) {
+#pragma unroll
+      for (int i = 0; i < A_VEC_PER_THR; i++) {
+        const int vec_idx = tid + i * BLOCK_THREADS;
+        const int elem_idx = vec_idx * VEC_A_SIZE;
+        const int r = elem_idx / BK;
+        const int c = elem_idx % BK;
+        const int g_row = block_row_start + r;
+        const int g_col = (k_base + BK) + c;
+
+        if (g_row < M && (g_col + VEC_A_SIZE - 1) < K) {
+          regA[i] = *reinterpret_cast<const uint4 *>(&A[(size_t)g_row * K + g_col]);
+        } else {
+          regA[i] = uint4{0, 0, 0, 0};
+        }
+      }
+
+#pragma unroll
+      for (int i = 0; i < B_VEC_PER_THR; ++i) {
+        const int vec_idx = tid + i * BLOCK_THREADS;
+        const int elem_idx = vec_idx * VEC_B_SIZE;
+        const int r_in = elem_idx % BK;
+        const int c_in = elem_idx / BK;
+
+        const int g_k = (k_base + BK) + r_in;
+        const int g_n = block_col_start + c_in;
+
+        const int tile_k = g_k / BK;
+        const int tile_n = g_n / BN;
+        const int k_in = g_k % BK;
+        const int n_in = g_n % BN;
+
+        const size_t src = ((((size_t)tile_k * Nt) + tile_n) * BN + n_in) * BK + k_in;
+
+        // regB là uint4 để ghi lại vào LDS sau sync
+        regB[i] = *reinterpret_cast<const uint4 *>(&B[src]);
+      }
+    }
+
+#pragma unroll
+    for (int kk = 0; kk < BK; kk += WK) {
+#pragma unroll
+      for (int mt = 0; mt < M_TILES; ++mt) {
+#pragma unroll
+        for (int nt = 0; nt < N_TILES; ++nt) {
+          const int a_row = wave_row * TM + mt * WM + lx;
+          const int b_col = wave_col * TN + nt * WN + lx;
+
+          bf16x4 a_vec = *reinterpret_cast<const bf16x4 *>(&As[a_row][kk + ly * 4]);
+          bf16x4 b_vec = *reinterpret_cast<const bf16x4 *>(&Bs[b_col][kk + ly * 4]);
+          // bf16x4 a_vec, b_vec;
+          // #pragma unroll
+          //           for (int i = 0; i < 4; ++i) {
+          //             const int kcol = i + ly * 4;
+          //             a_vec[i] = As[a_row][kk + kcol];
+          //             b_vec[i] = Bs[kk + kcol][b_col];
+          //           }
+          acc[mt][nt] = MFMA_BF16_16x16(a_vec, b_vec, acc[mt][nt]);
+        }
+      }
+    }
+
+    __syncthreads();
+
+    if (has_next) {
+#pragma unroll
+      for (int i = 0; i < A_VEC_PER_THR; i++) {
+        const int elem_idx = (tid + i * BLOCK_THREADS) * VEC_A_SIZE;
+        const int r = elem_idx / BK;
+        const int c = elem_idx % BK;
+        *reinterpret_cast<uint4 *>(&As[r][c]) = regA[i];
+      }
+
+#pragma unroll
+      for (int i = 0; i < B_VEC_PER_THR; ++i) {
+        const int vec_idx = tid + i * BLOCK_THREADS;
+        const int elem_idx = vec_idx * VEC_B_SIZE;
+        const int r_in = elem_idx % BK;
+        const int c_in = elem_idx / BK;
+
+        *reinterpret_cast<uint4 *>(&Bs[c_in][r_in]) = regB[i];
+      }
+
+      __syncthreads();
+    }
+  }
+
+#pragma unroll
+  for (int mt = 0; mt < M_TILES; ++mt) {
+#pragma unroll
+    for (int nt = 0; nt < N_TILES; ++nt) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int row = wave_row_start + mt * WM + (i + 4 * ly);
+        const int col = wave_col_start + nt * WN + lx;
+        if (row < M && col < N) {
+          float out = acc[mt][nt][i];
+          if (bias)
+            out += (float)bias[col];
+          C[(size_t)row * N + col] = out;
+        }
+      }
+    }
+  }
+}
+
+template <int BM, int BN, int BK, int TM, int TN, int BLOCK_THREADS>
 __global__ __launch_bounds__(BLOCK_THREADS) void gemm_mfma_moe_v2(
   const float *__restrict__ A, const bf16 *__restrict__ B, float *__restrict__ C,
   const bf16 *__restrict__ bias, const int *__restrict__ expert_offsets, int M_total, int N,

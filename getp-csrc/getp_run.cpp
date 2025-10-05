@@ -158,50 +158,59 @@ void *thread_handler(void *arg) {
   }
 #endif
 
+  vector<const char *> input_batch(BATCH_SIZE);
+  vector<int *> output_batch(BATCH_SIZE);
+
+  vector<vector<int>> batch_prompt_tokens(BATCH_SIZE);
+  vector<int> num_prompt_tokens(BATCH_SIZE);
+
+  std::vector<int> current_tokens(BATCH_SIZE);
+  std::vector<int> current_pos(BATCH_SIZE, 0);
+  std::vector<bool> active(BATCH_SIZE, true);
+
+  static thread_local std::vector<int> encode_buf;
+
   for (int cur_idx = args->start_idx; cur_idx < end_idx; cur_idx += BATCH_SIZE) {
     int current_size = min(BATCH_SIZE, end_idx - cur_idx);
 
     if (current_size == 0)
       continue;
 
-    vector<const char *> input_batch;
-    vector<int *> output_batch;
+    input_batch.clear();
+    output_batch.clear();
 
     for (int j = 0; j < current_size; j++) {
       input_batch.push_back(get_str_req_ptr(public_requests, cur_idx + j));
       output_batch.push_back(get_tok_gen_ptr(public_requests, cur_idx + j));
     }
 
-    vector<vector<int>> batch_prompt_tokens(current_size);
-    vector<int> num_prompt_tokens(current_size);
-
     for (int i = 0; i < current_size; i++) {
       const char *input_seq = input_batch[i] ? input_batch[i] : "";
-      int *prompt_tokens_buffer = (int *)malloc((strlen(input_seq) + 3) * sizeof(int));
+      size_t need = strlen(input_seq) + 3;  // biên an toàn cho encode()
+      if (encode_buf.size() < need)
+        encode_buf.resize(need);
+
       int count = 0;
-      encode(public_tokenizer, input_seq, -1, -1, prompt_tokens_buffer, &count,
+      encode(public_tokenizer, input_seq, -1, -1, encode_buf.data(), &count,
              public_config->initial_context_length);
 
       if (count < 1) {
         fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
         exit(EXIT_FAILURE);
-      } else {
-        batch_prompt_tokens[i] = vector<int>(prompt_tokens_buffer, prompt_tokens_buffer + count);
-        num_prompt_tokens[i] = count;
       }
-
-      free(prompt_tokens_buffer);
+      // Ghi lại vào slot i (không tạo vector mới)
+      auto &dst = batch_prompt_tokens[i];
+      dst.assign(encode_buf.data(), encode_buf.data() + count);
+      num_prompt_tokens[i] = count;
     }
 
-    vector<int> current_tokens(current_size);
-    vector<int> current_pos(current_size, 0);
-    vector<bool> active(current_size, true);
+    for (int i = 0; i < current_size; ++i) {
+      current_tokens[i] = batch_prompt_tokens[i][0];
+      current_pos[i] = 0;
+      active[i] = true;
+    }
     int active_count = current_size;
     long long total_generate_tokens = 0;
-
-    for (int i = 0; i < current_size; i++) {
-      current_tokens[i] = batch_prompt_tokens[i][0];
-    }
 
 #ifndef RUN_20B
     for (int i = 0; i < TOTAL_PIPELINES; i++) {
