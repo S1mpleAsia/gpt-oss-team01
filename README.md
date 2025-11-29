@@ -1,114 +1,43 @@
-# Environment Setup
+<div align="center">
 
-```bash
-# gpt-oss
-export GPT_OSS_REPO_ROOT="/nfs/gpu_trainee/user/gpt-oss" # TODO(user): change to your account name
-cd $GPT_OSS_REPO_ROOT
+# GPT-OSS from Scratch on AMD GPUs
 
-# Create and activate a Python 3.10 virtual environment
-python3.10 -m venv .venv
-source .venv/bin/activate
+</div>
 
-# Model paths
-export MODELS_ROOT="/nfs/gpu_trainee/final-project/models"
-export MODELBIN_ROOT="/nfs/gpu_trainee/final-project/modelbin"
-```
+## Overview
 
-# Main program
+This a pure C++ implementation of OpenAI’s GPT-OSS models designed to **maximize inference throughput on AMD GPUs without relying on external libraries**. Our goal is to explore end-to-end LLM optimization, from kernel-level improvements to system-level design, providing insights for researchers and developers interested in high-performance computing and model-level optimization.
 
-The main function at `run.cpp`
-Do not modify `run.cpp` `getp_csrc/getp_eval.cpp` `Makefile`
+Inspired by [llama2.c](https://github.com/karpathy/llama2.c), our implementation uses HIP (an AMD programming model equivalent to CUDA) and avoids dependencies such as rocBLAS, hipBLAS, RCCL, and MPI. We utilize multiple optimization strategies for the 20B and 120B models, including efficient model loading, batching, multi-streaming, multi-GPU communication, optimized CPU–GPU–SRAM memory access, FlashAttention, matrix-core–based GEMM, and load balancing for MoE routing.
 
-## Build
+Experiments on a single node with 8× AMD MI250 GPUs show that our implementation achieves about 40k TPS on the 20B model and around 13.6k TPS on the 120B model in custom benchmarks, demonstrating the effectiveness of our optimizations and the strong potential of AMD GPUs for large-scale LLM inference.
 
-```bash
-make run  # Default compilation, very slow
-make runfast  # Compiled with -O3 optimization
-make runomp # Compiled with -O3 and -fopenmp
-```
+---
 
-## Run
+## Experiments
 
-Example:
+| Model          | Throughput (TPS) | METEOR | BERTScore |
+| -------------- | ---------------- | ------ | --------- |
+| `gpt-oss-20b`  | 39996            | 0.48   | 0.97      |
+| `gpt-oss-120b` | 13610            | 0.34   | 0.97      |
 
-```bash
-./run "${MODELBIN_ROOT}/gpt-oss-20b.bin" -m getp -i data/input.txt -o data/output.txt
-./run "${MODELBIN_ROOT}/gpt-oss-20b.bin" -m chat
-./run "${MODELBIN_ROOT}/gpt-oss-20b.bin" -m generate -i "1+1="
-```
+<p align="center">
+  <table>
+    <tr>
+      <td align="center">
+        <img src="perf_20b.png" width="400"/><br/>
+        <b>Performance for 20B model</b>
+      </td>
+      <td align="center">
+        <img src="perf_120b.png" width="400"/><br/>
+        <b>Performance for 120B model</b>
+      </td>
+    </tr>
+  </table>
+</p>
 
-## Visualize `getp` mode output
+---
 
-For `getp` mode the output file contains list of output tokens index of each requests. To convert those indexes into text, you should build and run `decode.cpp`
+## Acknowledgments
 
-```bash
-make decode
-./decode -1 -i data/output.txt
-```
-
-# Tokenizer
-
-## Export Tokenizer
-
-```bash
-make tokenizer-bin
-```
-
-## Build & Run Tokenizer Test (C++)
-
-```bash
-make tokenizer-test
-./test_tokenizer -t tokenizer.bin -i "Hello world"
-# Expected output: 13225 2375
-```
-
-## Verify Compatibility with Tiktoken
-
-```bash
-python3 test_tokenizer.py \
-  --bin ./test_tokenizer \
-  --tok ./tokenizer.bin \
-  --verbose \
-  --prompt data/input.txt
-```
-
-### Example Results
-
-```
-PROMPT: 'ฉันรักทะเล'
-  C  encoded: [97797, 6560, 151737, 37899, 17758]
-  PY encoded: [97797, 6560, 151737, 37899, 17758]
-  C  decoded: 'ฉันรักทะเล'
-  PY decoded: 'ฉันรักทะเล'
-  [ENCODE MATCH] [DECODE MATCH]
-------------------------------------------------------------
-PROMPT: 'naïve façade — déjà vu'
-  C  encoded: [1503, 9954, 737, 114665, 2733, 21229, 12005]
-  PY encoded: [1503, 9954, 737, 114665, 2733, 21229, 12005]
-  C  decoded: 'naïve façade — déjà vu'
-  PY decoded: 'naïve façade — déjà vu'
-  [ENCODE MATCH] [DECODE MATCH]
-------------------------------------------------------------
-PROMPT: '🍣 sushi and 🍜 ramen'
-  C  encoded: [102415, 96, 85535, 326, 197348, 250, 90938]
-  PY encoded: [102415, 96, 85535, 326, 197348, 250, 90938]
-  C  decoded: '🍣 sushi and 🍜 ramen'
-  PY decoded: '🍣 sushi and 🍜 ramen'
-  [ENCODE MATCH] [DECODE MATCH]
-------------------------------------------------------------
-PROMPT: 'email: test@example.com'
-  C  encoded: [4261, 25, 1746, 81309, 1136]
-  PY encoded: [4261, 25, 1746, 81309, 1136]
-  C  decoded: 'email: test@example.com'
-  PY decoded: 'email: test@example.com'
-  [ENCODE MATCH] [DECODE MATCH]
-------------------------------------------------------------
-PROMPT: 'newlines:'
-  C  encoded: [1389, 10105, 25]
-  PY encoded: [1389, 10105, 25]
-  C  decoded: 'newlines:'
-  PY decoded: 'newlines:'
-  [ENCODE MATCH] [DECODE MATCH]
-```
-
-Small
+This project was part of the GPU Engineer Training Program, a collaboration between [Moreh](https://www.linkedin.com/company/moreh-inc) and [THUNDER Research Group](http://snuvm.snu.ac.kr/) (Seoul National University).
