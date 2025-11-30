@@ -18,25 +18,8 @@ Experiments on a single node with 8× AMD MI250 GPUs show that our implementatio
 
 | Model          | Throughput (TPS) | METEOR | BERTScore |
 | -------------- | ---------------- | ------ | --------- |
-| `gpt-oss-20b`  | 39996            | 0.48   | 0.97      |
-| `gpt-oss-120b` | 13610            | 0.34   | 0.97      |
-
-<p align="center">
-  <table>
-    <tr>
-      <td align="center">
-        <img src="perf_20b.jpg" width="400"/><br/>
-        <b>Performance for 20B model</b>
-      </td>
-    </tr>
-    <tr>
-      <td align="center">
-        <img src="perf_120b.jpg" width="400"/><br/>
-        <b>Performance for 120B model</b>
-      </td>
-    </tr>
-  </table>
-</p>
+| `gpt-oss-20b`  | 39120            | 0.48   | 0.97      |
+| `gpt-oss-120b` | 13663            | 0.34   | 0.97      |
 
 ---
 
