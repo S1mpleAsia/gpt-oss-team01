@@ -25,11 +25,13 @@ Experiments on a single node with 8× AMD MI250 GPUs show that our implementatio
   <table>
     <tr>
       <td align="center">
-        <img src="perf_20b.png" width="400"/><br/>
+        <img src="perf_20b.jpg" width="400"/><br/>
         <b>Performance for 20B model</b>
       </td>
+    </tr>
+    <tr>
       <td align="center">
-        <img src="perf_120b.png" width="400"/><br/>
+        <img src="perf_120b.jpg" width="400"/><br/>
         <b>Performance for 120B model</b>
       </td>
     </tr>
